@@ -78,6 +78,21 @@ class MaskSFT:
             np.random.shuffle(idx)
             retain_idx = idx[:retain_num]
             action[retain_idx, 0:7] = self._original_action[retain_idx, 0:7]
+        elif self.mask_type == 'random_mask':
+            # 保留retain_ratio比例的随机mask
+            if retain_ratio is None:
+                raise ValueError('random_mask类型需要retain_ratio参数')
+            n,m = action.shape
+            idx = []
+            retain_num = int(n * m * retain_ratio)
+            for x in range(n):
+                for y in range(m):
+                    idx.append((x,y))
+            np.random.shuffle(idx)
+            retain_idx = idx[:retain_num]
+            action[:, :] = -1
+            for (x,y) in retain_idx:
+                action[x,y] = self._original_action[x,y]
         return action
 
     def run(self):
@@ -91,7 +106,7 @@ class MaskSFT:
 
     def process(self, input_path=None):
         retain_ratio = None
-        if self.mask_type in ['pose_AnyGrasp', 'points', 'pose_motion_planning', 'local_planner']:
+        if self.mask_type in ['pose_AnyGrasp', 'points', 'pose_motion_planning', 'local_planner', 'random_mask']:
             retain_ratio = self.retain_ratio
         single_file_types = ['2D_video_trajectory', '2D_image_trajectory']
         num_files = 1 if self.mask_type in single_file_types else self.size
@@ -111,7 +126,7 @@ class MaskSFT:
                     for dset_key in grp_in:
                         data = grp_in[dset_key][()]
                         if dset_key == 'action':
-                            if self.mask_type in ['pose_AnyGrasp', 'points', 'pose_motion_planning', 'local_planner', 'auto_regressive']:
+                            if self.mask_type in ['pose_AnyGrasp', 'points', 'pose_motion_planning', 'local_planner', 'auto_regressive', 'random_mask']:
                                 self._original_action = data.copy()
                                 max_retry = 1000
                                 for _ in range(max_retry):
