@@ -28,6 +28,7 @@ bash run_mask_sft.sh
 - `pose_motion_planning`：随机保留retain_ratio比例的pose: x, y, z, dx, dy, dz, gripper，其余mask
 - `local_planner`：保留所有time，随机保留retain_ratio比例的x, y, z, dx, dy, dz, gripper
 - `auto_regressive`：随机选一个(i, j)，保留(i, j)前所有原始数据，其后全部mask
+- `random_mask`：随机保留retain_ratio比例的任意点数据，其余mask
 
 ---
 
