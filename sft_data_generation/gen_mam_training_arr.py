@@ -50,7 +50,7 @@ def validate_video_frames(h5_path, traj_key):
     
     Args:
         h5_path: .h5文件路径
-        traj_key: trajectory的key (如 'tra_0')
+        traj_key: trajectory的key (如 'traj_0')
     
     Returns:
         bool: 验证是否通过
@@ -173,12 +173,12 @@ def main(args):
     
     cprint(f"开始处理 {input_h5}", 'yellow')
     
-    # 存储所有数据
-    all_view0_frames = []  # 第一个视角的所有帧
-    all_view1_frames = []  # 第二个视角的所有帧
-    all_actions = []       # 所有action数据
-    episode_ends = []      # 每个episode的结束索引
-    all_traj_keys = []     # 存储每个帧对应的trajectory key
+    # 存储所有数据 - 按episode组织
+    all_episode_view0_frames = []  # 每个episode的第0帧
+    all_episode_view1_frames = []  # 每个episode的第0帧
+    all_episode_actions = []       # 每个episode的所有帧action数据
+    all_episode_states = []        # 每个episode的第0帧action数据
+    episode_ends = []              # 每个episode的结束索引（累积）
     
     total_count = 0
     
@@ -188,7 +188,7 @@ def main(args):
             trajectory_keys = [ traj_name for traj_name in trajectory_keys if "traj_" in traj_name]
             cprint(f"找到 {len(trajectory_keys)} 个trajectory", 'yellow')
             
-            for traj_key in trajectory_keys:  # 只处理前2个用于测试
+            for traj_key in trajectory_keys:  # 只处理前10个用于测试
                 cprint(f"处理 {traj_key}...", 'cyan')
                 
                 try:
@@ -201,17 +201,14 @@ def main(args):
                     # 获取trajectory数据
                     actions = traj_data['action']
                     
-                    # 添加到总数据中
-                    all_view0_frames.extend(view0_frames)
-                    all_view1_frames.extend(view1_frames)
-                    all_actions.extend([actions])
+                    # 添加到总数据中 - 按episode组织
+                    all_episode_view0_frames.append(view0_frames[0])  # 只取第0帧
+                    all_episode_view1_frames.append(view1_frames[0])  # 只取第0帧
+                    all_episode_actions.append(actions)              # 所有帧的action
+                    all_episode_states.append(actions[0, :7])       # 第0帧的action（前7列）
                     
-                    # 记录每个帧对应的trajectory key
-                    all_traj_keys.extend([traj_key] * len(view0_frames))
-                    
-                    # 更新episode结束位置
-                    total_count += len(view0_frames)
-                    episode_ends.append(total_count)
+                    # 记录每个episode的有效长度（没有padding部分的长度）
+                    episode_ends.append(len(view0_frames))
                     
                     cprint(f"✓ {traj_key} 处理完成，帧数: {len(view0_frames)}", 'green')
                     
@@ -221,7 +218,7 @@ def main(args):
                     cprint(f"详细错误信息: {traceback.format_exc()}", 'red')
                     continue
         
-        if not all_view0_frames:
+        if not all_episode_view0_frames:
             raise RuntimeError("没有成功处理任何trajectory")
         
         cprint(f"开始读取condition数据: {args.input_condition}", 'yellow')
@@ -258,76 +255,69 @@ def main(args):
         
         cprint(f"开始保存到zarr文件: {output_zarr}", 'yellow')
         
+        # 创建zarr文件
         zarr_root = zarr.group(output_zarr)
         zarr_data = zarr_root.create_group('data')
         zarr_meta = zarr_root.create_group('meta')
         
-        total_frames = len(all_view0_frames)
-        cprint(f"总帧数: {total_frames}", 'yellow')
-
-        img_height, img_width, img_channels = all_view0_frames[0].shape
+        # 计算episode数量
+        num_episodes = len(all_episode_view0_frames)
+        cprint(f"Episode数量: {num_episodes}", 'yellow')
         
-        # 1. 处理图像数据 - 直接拼接所有帧，维度为 (total_frames, channel, width, height)
-        img1_arrays = np.zeros((total_frames, img_channels, img_width, img_height), dtype=np.uint8)
-        img2_arrays = np.zeros((total_frames, img_channels, img_width, img_height), dtype=np.uint8)
+        # 获取图像尺寸
+        img_height, img_width, img_channels = all_episode_view0_frames[0].shape
+        
+        # 1. 处理图像数据 - 每个episode的第0帧，维度为 (num_episodes, channel, width, height)
+        img1_arrays = np.zeros((num_episodes, img_channels, img_width, img_height), dtype=np.uint8)
+        img2_arrays = np.zeros((num_episodes, img_channels, img_width, img_height), dtype=np.uint8)
         
         # 填充图像数据
-        for frame_idx in range(total_frames):
-            img1_arrays[frame_idx] = cv2.cvtColor(all_view0_frames[frame_idx], cv2.COLOR_BGR2RGB).transpose(2, 0, 1)
-            img2_arrays[frame_idx] = cv2.cvtColor(all_view1_frames[frame_idx], cv2.COLOR_BGR2RGB).transpose(2, 0, 1)
+        for ep_idx in range(num_episodes):
+            img1_arrays[ep_idx] = cv2.cvtColor(all_episode_view0_frames[ep_idx], cv2.COLOR_BGR2RGB).transpose(2, 0, 1)
+            img2_arrays[ep_idx] = cv2.cvtColor(all_episode_view1_frames[ep_idx], cv2.COLOR_BGR2RGB).transpose(2, 0, 1)
         
-        # 2. 处理state和action数据 - 直接拼接所有帧的action数据
-        # state_arrays: 当前帧的action，shape [total_frames, 7]
-        # action_arrays: 下一帧的action，shape [total_frames, 7]
-        state_arrays = np.zeros((total_frames, 7), dtype=np.float32)
-        action_arrays = np.zeros((total_frames, 7), dtype=np.float32)
+        # 2. 处理state数据 - 每个episode第0帧的action，shape [num_episodes, 7]
+        state_arrays = np.array(all_episode_states, dtype=np.float32)
         
-        frame_idx = 0
-        for traj_idx, actions in enumerate(all_actions):
-            T = actions.shape[0]  # 当前trajectory的帧数
+        # 3. 处理action数据 - 每个episode的所有帧的action，需要padding到max_length
+        # action_arrays shape: [num_episodes, max_length, 8]
+        action_arrays = np.full((num_episodes, max_length, 8), -1, dtype=np.float32)
+        
+        for ep_idx, actions in enumerate(all_episode_actions):
+            T = actions.shape[0]  # 当前episode的帧数
             
-            if actions.shape[1] >= 7:
-                # 填充state（当前帧action）
-                state_arrays[frame_idx:frame_idx+T] = actions[:, :7]
-                
-                # 填充action（下一帧action，最后一帧用自身填充）
-                if T > 1:
-                    action_arrays[frame_idx:frame_idx+T-1] = actions[1:, :7]
-                    action_arrays[frame_idx+T-1] = actions[T-1, :7]  # 最后一帧
-                else:
-                    action_arrays[frame_idx] = actions[0, :7]
+            if actions.shape[1] >= 8:
+                # 填充action数据，不足的部分用-1填充
+                action_arrays[ep_idx, :T, :8] = actions[:, :8]
             else:
-                raise RuntimeError("trajectory列数不足7. 请检查.h5原始数据文件")
-            
-            frame_idx += T
+                raise RuntimeError(f"Episode {ep_idx} 的action列数不足8. 请检查.h5原始数据文件")
         
-        # 3. 处理condition数据 - 为每一帧创建对应的condition
-        # condition_arrays shape: [total_frames, max_length, 8]
-        condition_arrays = np.zeros((total_frames, max_length, 8), dtype=np.float32)
+        # 4. 处理MAS数据 - 每个episode第0帧对应的condition
+        # MAS_arrays shape: [num_episodes, max_length, 8]
+        MAS_arrays = np.zeros((num_episodes, max_length, 8), dtype=np.float32)
         
-        for frame_idx in range(total_frames):
-            traj_key = all_traj_keys[frame_idx]
+        for ep_idx, traj_key in enumerate(trajectory_keys[:num_episodes]):
             if traj_key in condition_data:
-                condition_arrays[frame_idx] = condition_data[traj_key]
+                MAS_arrays[ep_idx] = condition_data[traj_key]
             else:
-                raise ValueError(f"找不到帧 {frame_idx} 对应的trajectory {traj_key} 的condition数据")
+                raise ValueError(f"找不到episode {ep_idx} 对应的trajectory {traj_key} 的condition数据")
         
+        # 设置压缩器
         compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=1)
         
         print(f"img1 shape: {img1_arrays.shape}")
         print(f"img2 shape: {img2_arrays.shape}")
         print(f"state shape: {state_arrays.shape}")
         print(f"action shape: {action_arrays.shape}")
-        print(f"condition shape: {condition_arrays.shape}")
+        print(f"MAS shape: {MAS_arrays.shape}")
         
         # 设置chunk大小
         img_chunk_size = (100, img_channels, img_width, img_height)
-        assert state_arrays.shape[1] == action_arrays.shape[1] == 7
-        state_chunk_size = (100, state_arrays.shape[1])
-        action_chunk_size = (100, action_arrays.shape[1])
-        condition_chunk_size = (100, max_length, 8)
+        state_chunk_size = (100, 7)
+        action_chunk_size = (100, max_length, 8)
+        MAS_chunk_size = (100, max_length, 8)
         
-        # 保存数据
+        # 保存数据到data组
         zarr_data.create_dataset('img1', data=img1_arrays, chunks=img_chunk_size, 
                                 dtype='uint8', overwrite=True, compressor=compressor)
         zarr_data.create_dataset('img2', data=img2_arrays, chunks=img_chunk_size, 
@@ -336,9 +326,11 @@ def main(args):
                                 dtype='float32', overwrite=True, compressor=compressor)
         zarr_data.create_dataset('action', data=action_arrays, chunks=action_chunk_size, 
                                 dtype='float32', overwrite=True, compressor=compressor)
-        zarr_data.create_dataset('condition', data=condition_arrays, chunks=condition_chunk_size, 
+        zarr_data.create_dataset('MAS', data=MAS_arrays, chunks=MAS_chunk_size, 
                                 dtype='float32', overwrite=True, compressor=compressor)
-
+        
+        # 保存episode信息到meta组
+        # episode_ends: 每个episode的有效长度（没有padding部分的长度）
         episode_ends_arrays = np.array(episode_ends)
         zarr_meta.create_dataset('episode_ends', data=episode_ends_arrays, 
                                 dtype='int64', overwrite=True, compressor=compressor)
@@ -348,8 +340,8 @@ def main(args):
         cprint(f'img2 shape: {img2_arrays.shape}, range: [{np.min(img2_arrays)}, {np.max(img2_arrays)}]', 'green')
         cprint(f'state shape: {state_arrays.shape}, range: [{np.min(state_arrays)}, {np.max(state_arrays)}]', 'green')
         cprint(f'action shape: {action_arrays.shape}, range: [{np.min(action_arrays)}, {np.max(action_arrays)}]', 'green')
-        cprint(f'condition shape: {condition_arrays.shape}, range: [{np.min(condition_arrays)}, {np.max(condition_arrays)}]', 'green')
-        cprint(f'episode_ends: {episode_ends_arrays}', 'green')
+        cprint(f'MAS shape: {MAS_arrays.shape}, range: [{np.min(MAS_arrays)}, {np.max(MAS_arrays)}]', 'green')
+        cprint(f'episode_ends (有效长度): {episode_ends_arrays}', 'green')
         cprint(f'成功保存zarr文件到 {output_zarr}', 'green')
         
     except Exception as e:
@@ -358,15 +350,15 @@ def main(args):
     
     finally:
         # 清理内存
-        if 'all_view0_frames' in locals():
-            del all_view0_frames, all_view1_frames, all_actions
+        if 'all_episode_view0_frames' in locals():
+            del all_episode_view0_frames, all_episode_view1_frames, all_episode_actions, all_episode_states
         if 'zarr_root' in locals():
             del zarr_root, zarr_data, zarr_meta
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--input', type=str, default="../demo_0828/PlugCharger-v1/motionplanning/action_normed.h5",  help='输入归一化后的原始.h5文件路径')
-    parser.add_argument('--output', type=str, default="./output_zarr/test.zarr", help='输出.zarr文件路径')
+    parser.add_argument('--output', type=str, default="./output_zarr/test_mam.zarr", help='输出.zarr文件路径')
     parser.add_argument('--input_condition', type=str, default="./output/0830_test_PlugCharger_local_planner_padding_1.h5",  help='输入mask action condition .h5文件')
     
     args = parser.parse_args()

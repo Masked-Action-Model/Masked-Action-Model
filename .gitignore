@@ -1,7 +1,7 @@
 # 数据
 se3_raw/*
 DROID/*
-demos/*
+demo*/
 
 # 输出
 *.h5

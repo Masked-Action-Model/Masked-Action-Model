@@ -1,7 +1,7 @@
 #!/bin/bash
 
-INPUT="/data1/tangjielong_2/mask_action_model/Masked-Action-Model/demos/PlugCharger-v1/motionplanning/20250716_192215_mask.h5"
-OUTPUT="./output/test_PlugCharger_local_planner.h5"
+INPUT="/data1/tangjielong_2/mask_action_model/Masked-Action-Model/demo_0828/PlugCharger-v1/motionplanning/action.h5"
+OUTPUT="./output/0830_test_PlugCharger_local_planner_padding.h5"
 MASK_TYPE="local_planner"
 RETAIN_RATIO=0.3
 SIZE=5
@@ -14,4 +14,5 @@ python mask_for_sft.py \
   --retain_ratio "$RETAIN_RATIO" \
   --size "$SIZE" \
   --mask_seq_len "$MASK_SEQ_LEN" \
-  --normalize
+  --normalize \
+  --enable_padding #是否padding

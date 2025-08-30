@@ -5,7 +5,7 @@ import os
 import json
 
 class MaskSFT:
-    def __init__(self, input_path, output_path, mask_type, retain_ratio=None, size=1, normalize=False, mask_seq_len=20):
+    def __init__(self, input_path, output_path, mask_type, retain_ratio=None, size=1, normalize=False, mask_seq_len=20, enable_padding=False):
         self.input_path = input_path
         self.output_path = output_path
         self.mask_type = mask_type
@@ -13,6 +13,7 @@ class MaskSFT:
         self.size = size
         self.normalize = normalize
         self.mask_seq_len = mask_seq_len
+        self.enable_padding = enable_padding
 
     def mask_action(self, action, retain_ratio=None):
         # action: shape (N, 8)
@@ -132,10 +133,16 @@ class MaskSFT:
             else:
                 base, ext = os.path.splitext(self.output_path)
                 output_path = f"{base}_{idx}{ext}"
-            with h5py.File(input_path, 'r') as f_in, h5py.File(output_path, 'w') as f_out:
-                for traj_key in f_in['trajectories']:
-                    grp_in = f_in['trajectories'][traj_key]
-                    grp_out = f_out.require_group(f'trajectories/{traj_key}')
+            
+            # 第一步：先处理所有mask，收集数据用于padding
+            processed_data = {}
+            max_length = 0
+            
+            with h5py.File(input_path, 'r') as f_in:
+                for traj_key in f_in:
+                    grp_in = f_in[traj_key]
+                    processed_data[traj_key] = {}
+                    
                     for dset_key in grp_in:
                         data = grp_in[dset_key][()]
                         if dset_key == 'action':
@@ -154,6 +161,7 @@ class MaskSFT:
                                     raise RuntimeError('无法生成足够多唯一的mask样本, 请减少size或调整retain_ratio')
                             else:
                                 data = self.mask_action(data)
+                            
                             if data.shape[1] > 7:
                                 # 将mask(-1)值放在最后面，其余按第七列（时间序列）从小到大排序
                                 mask_neg_one = data[:, 7] == -1
@@ -167,7 +175,35 @@ class MaskSFT:
                                 else:
                                     final_idx = np.arange(len(data))
                                 data = data[final_idx]
-                        grp_out.create_dataset(dset_key, data=data, compression="gzip")
+                            
+                            max_length = max(max_length, data.shape[0])
+                        
+                        processed_data[traj_key][dset_key] = data
+            
+            # 应用padding并保存到输出文件
+            with h5py.File(output_path, 'w') as f_out:
+                for traj_key in processed_data:
+                    grp_out = f_out.require_group(f'{traj_key}')
+                    
+                    for dset_key, data in processed_data[traj_key].items():
+                        if self.enable_padding:
+                            if data.shape[0] < max_length:
+                                padding_rows = max_length - data.shape[0]
+                                # 创建padding数据，所有列值置为-1
+                                padding_data = np.full((padding_rows, data.shape[1]), -1, dtype=data.dtype)
+                                padded_data = np.vstack([data, padding_data])
+                            else:
+                                padded_data = data
+                        else:
+                            padded_data = data
+                        
+                        grp_out.create_dataset(dset_key, data=padded_data, compression="gzip")
+                
+                # 保存最大长度信息到meta组
+                # if self.enable_padding:
+                #     meta_group = f_out.require_group('meta')
+                #     meta_group.create_dataset('max_length', data=max_length, dtype='int64')
+                #     meta_group.create_dataset('padding_value', data=-2, dtype='int64')
 
 
 def normalize_actions(input_path, output_path):
@@ -178,8 +214,8 @@ def normalize_actions(input_path, output_path):
     maxs = np.full(7, -np.inf)
     # 先统计全局min/max
     with h5py.File(input_path, 'r') as f:
-        for traj_key in f['trajectories']:
-            grp = f['trajectories'][traj_key]
+        for traj_key in f:
+            grp = f[traj_key]
             if 'action' in grp:
                 data = grp['action'][()]
                 mins = np.minimum(mins, data[:, :7].min(axis=0))
@@ -208,8 +244,8 @@ def normalize_actions_to_new_h5(input_path, output_path, json_path):
     mins = np.full(6, np.inf)
     maxs = np.full(6, -np.inf)
     with h5py.File(input_path, 'r') as f:
-        for traj_key in f['trajectories']:
-            grp = f['trajectories'][traj_key]
+        for traj_key in f:
+            grp = f[traj_key]
             if 'action' in grp:
                 data = grp['action'][()]
                 mins = np.minimum(mins, data[:, :6].min(axis=0))
@@ -219,9 +255,9 @@ def normalize_actions_to_new_h5(input_path, output_path, json_path):
         json.dump(norm_info, f, indent=2)
     # 写入归一化h5
     with h5py.File(input_path, 'r') as f_in, h5py.File(output_path, 'w') as f_out:
-        for traj_key in f_in['trajectories']:
-            grp_in = f_in['trajectories'][traj_key]
-            grp_out = f_out.require_group(f'trajectories/{traj_key}')
+        for traj_key in f_in:
+            grp_in = f_in[traj_key]
+            grp_out = f_out.require_group(f'{traj_key}')
             for dset_key in grp_in:
                 data = grp_in[dset_key][()]
                 if dset_key == 'action':
@@ -238,9 +274,10 @@ def main():
     parser.add_argument('--size', type=int, default=5, help='生成h5文件数量')
     parser.add_argument('--normalize', action='store_true', help='是否对原始h5归一化')
     parser.add_argument('--mask_seq_len', type=int, default=20, help='local_planner类型时连续mask序列长度')
+    parser.add_argument('--enable_padding', action='store_true', help='是否启用padding功能，将所有trajectory补长至最大长度')
     args = parser.parse_args()
 
-    masker = MaskSFT(args.input, args.output, args.mask_type, args.retain_ratio, args.size, args.normalize, args.mask_seq_len)
+    masker = MaskSFT(args.input, args.output, args.mask_type, args.retain_ratio, args.size, args.normalize, args.mask_seq_len, args.enable_padding)
     masker.run()
 
 if __name__ == '__main__':

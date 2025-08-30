@@ -41,6 +41,11 @@ bash run_mask_sft.sh
 
 ---
 
+## padding说明
+
+- 将所有traj添加padding（-1）至最大traj长度
+---
+
 ## 输出说明
 
 - 输出h5文件结构与原始一致，action等数据已mask、归一化、并按time step升序排列（mask部分放在序列最后面）
