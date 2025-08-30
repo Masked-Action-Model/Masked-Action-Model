@@ -7,18 +7,7 @@
 INPUT_H5="../demo_0828/PlugCharger-v1/motionplanning/action_normed.h5"
 OUTPUT_ZARR="./output_zarr/test_mam_gpu.zarr"
 INPUT_CONDITION="./output/0830_test_PlugCharger_local_planner_padding_1.h5"
-USE_GPU=true
-# 检查GPU支持
-if [[ "$USE_GPU" == "true" ]]; then
-    echo "检查GPU支持..."
-    if ! command -v ffmpeg &> /dev/null; then
-        echo "警告: 未找到ffmpeg，GPU加速可能不可用"
-    fi
-    
-    if ! nvidia-smi &> /dev/null; then
-        echo "警告: 未检测到NVIDIA GPU，GPU加速可能不可用"
-    fi
-fi
+USE_GPU=True
 
 # 创建输出目录
 OUTPUT_DIR=$(dirname "$OUTPUT_ZARR")
