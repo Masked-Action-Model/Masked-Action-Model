@@ -1,9 +1,12 @@
 # 数据
 se3_raw/*
 DROID/*
+demo*/
 
 # 输出
 *.h5
+sft_data_generation/output/*
+*.zarr
 
 # .pyc临时文件 
 *.pyc
