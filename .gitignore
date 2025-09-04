@@ -11,4 +11,4 @@ sft_data_generation/output/*
 *.pyc
 
 #本地文件
-dp/
+dp/*
