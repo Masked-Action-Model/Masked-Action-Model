@@ -8,6 +8,9 @@
 - 文件总览：MAM 相关核心文件列表
 
 ---
+
+# condition：我们的额外输入MAS 100*8  （100代表这个task数据集最大的步长，默认100）
+
 # 如把condition去掉，训练dp：
 仅需在 MAM.yaml 里把 condition 从 shape_meta 中删除/注释，模型就不会再把 condition 当作输入使用。
 
