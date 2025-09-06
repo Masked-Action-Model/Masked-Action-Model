@@ -1,0 +1,216 @@
+# 在文件开头添加 defaults 部分
+defaults:
+  - _self_
+  # 删除或注释掉这一行：- task: lift_image_abs
+
+_target_: diffusion_policy.workspace.MAM_train_diffusion_unet_image_workspace.MAMTrainDiffusionUnetImageWorkspace
+
+# 添加缺失的顶级配置
+name: train_diffusion_unet_image
+#train_diffusion_unet_MAM_policy
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+# checkpoint:
+#   save_last_ckpt: true
+#   save_last_snapshot: false
+#   topk:
+#     format_str: epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt
+#     k: 5
+#     mode: max
+#     monitor_key: test_mean_score
+dataloader:
+  batch_size: 64
+  num_workers: 8
+  persistent_workers: false
+  pin_memory: true
+  shuffle: true
+dataset_obs_steps: 2
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+exp_name: default
+horizon: 16
+keypoint_visible_rate: 1.0
+logging:
+  group: null
+  id: null
+  mode: online
+  name: 2023.01.16-20.20.06_train_diffusion_unet_hybrid_pusht_image
+  project: diffusion_policy_debug
+  resume: true
+  tags:
+  - train_diffusion_unet_hybrid
+  - pusht_image
+  - default
+multi_run:
+  run_dir: data/outputs/2023.01.16/20.20.06_train_diffusion_unet_hybrid_pusht_image
+  wandb_name_base: 2023.01.16-20.20.06_train_diffusion_unet_hybrid_pusht_image
+n_action_steps: 8
+n_latency_steps: 0
+n_obs_steps: 2
+# 删除这一行：name: train_diffusion_unet_hybrid
+obs_as_global_cond: true
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+  - 0.95
+  - 0.999
+  eps: 1.0e-08
+  lr: 0.0001
+  weight_decay: 1.0e-06
+past_action_visible: false
+policy:
+  _target_: diffusion_policy.policy.MAMdiffusion_unet_image_policy.MAMDiffusionUnetImagePolicy
+  shape_meta: ${shape_meta}
+  cond_predict_scale: true
+  # crop_shape:  # 注释掉这几行
+  # - 84
+  # - 84
+  diffusion_step_embed_dim: 128
+  down_dims:
+  - 512
+  - 1024
+  - 2048
+  #eval_fixed_crop: false # True
+  horizon: 16
+  kernel_size: 5
+  n_action_steps: 8
+  n_groups: 8
+  n_obs_steps: 2
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    beta_start: 0.0001
+    clip_sample: true
+    num_train_timesteps: 100
+    prediction_type: epsilon
+    variance_type: fixed_small
+  num_inference_steps: 100
+  obs_as_global_cond: true
+  obs_encoder_group_norm: true
+
+  obs_encoder:
+    _target_: diffusion_policy.model.vision.multi_image_obs_encoder.MultiImageObsEncoder
+    shape_meta: ${shape_meta}
+    rgb_model:
+      _target_: diffusion_policy.model.vision.model_getter.get_resnet
+      name: resnet18
+      weights: null
+    resize_shape: [128, 128]
+    #crop_shape: [76, 76]
+    random_crop: false
+    use_group_norm: true
+    share_rgb_model: false
+    imagenet_norm: true
+  
+# 删除从这里开始的重复 shape_meta 定义
+# shape_meta:
+#   action:
+#     shape:
+#     - 7
+#   obs:
+#     agent_pos:
+#       shape:
+#       - 7
+#       type: low_dim
+#     condition:
+#       shape:
+#       - 800
+#       type: low_dim
+#     image:
+#       shape:
+#       - 3
+#       - 512
+#       - 512 
+#       type: rgb
+task:
+  dataset:
+    _target_: diffusion_policy.dataset.MAM_pusht_image_dataset.MAMDataset
+    horizon: 16
+    max_train_episodes: 90
+    pad_after: 7
+    pad_before: 1
+    seed: 42
+    val_ratio: 0.02
+    zarr_path: data/custom_replay.zarr #diffusion_policy/data/custom_replay.zarr
+  env_runner:
+    _target_: diffusion_policy.env_runner.pusht_image_runner.PushTImageRunner
+    fps: 10
+    legacy_test: true
+    max_steps: 300
+    n_action_steps: 8
+    n_envs: null
+    n_obs_steps: 2
+    n_test: 50
+    n_test_vis: 4
+    n_train: 6
+    n_train_vis: 2
+    past_action: false
+    test_start_seed: 100000
+    train_start_seed: 0
+  image_0_shape:
+  - 3
+  - 128
+  - 128
+  image_1_shape:
+  - 3
+  - 128
+  - 128
+  name: MAM_maniskill
+  shape_meta:
+    action:
+      shape: [7]
+    obs:
+      agent_pos:
+        shape: [7]
+        type: low_dim
+      condition:
+        shape: [800]
+        type: low_dim
+      image_0:
+        shape: [3, 128, 128]
+        type: rgb
+      image_1:
+        shape: [3, 128, 128]
+        type: rgb
+# 删除这一行：task_name: MAM_maniskill
+# 在 training 部分添加缺失的配置项
+training:
+  checkpoint_every: 50
+  debug: false
+  device: cuda:0
+  freeze_encoder: false  # 添加这一行
+  gradient_accumulate_every: 1
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  max_train_steps: null
+  max_val_steps: null
+  num_epochs: 30
+  resume: true
+  rollout_every: 99999  # 修改这一行：从 5 改为 99999，关闭仿真rollout：每99999个epoch执行一次环境仿真评估
+  sample_every: 99999   # 修改这一行：从 5 改为 99999，关闭采样validation：每99999个epoch执行一次模型采样验证
+  seed: 42
+  tqdm_interval_sec: 1.0
+  use_ema: true
+  val_every: 9999  # 关validate 修改这一行：从 5 改为 999
+
+# 添加缺失的 hydra 配置
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
+val_dataloader:
+  batch_size: 64
+  num_workers: 8
+  persistent_workers: false
+  pin_memory: true
+  shuffle: false

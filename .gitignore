@@ -1,13 +1,14 @@
 # 数据
 se3_raw/*
 DROID/*
-demo*/
-
+Data_maniskill3/*
 # 输出
 *.h5
 sft_data_generation/output/*
 *.zarr
-
+*.zip
 # .pyc临时文件 
 *.pyc
 
+#本地文件
+dp/*
