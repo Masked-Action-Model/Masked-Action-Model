@@ -1,10 +1,10 @@
 #!/bin/bash
 
-INPUT="/data1/tangjielong_2/mask_action_model/Masked-Action-Model/demo_0828/PlugCharger-v1/motionplanning/action.h5"
-OUTPUT="./output/0830_test_PlugCharger_local_planner_padding.h5"
-MASK_TYPE="local_planner"
-RETAIN_RATIO=0.3
-SIZE=5
+INPUT="/data1/tangjielong_2/mask_action_model/Masked-Action-Model/demo_0828/PushCube-v1/motionplanning/action.h5"
+OUTPUT="./output/0901_PushCube_points_mask_w_padding.h5"
+MASK_TYPE="points"
+RETAIN_RATIO=0.1
+SIZE=1
 MASK_SEQ_LEN=20 #local_planner使用掩码的连续序列长度
 
 python mask_for_sft.py \

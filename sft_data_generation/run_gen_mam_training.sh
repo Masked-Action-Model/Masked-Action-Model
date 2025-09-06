@@ -4,9 +4,9 @@
 # 用于从.h5文件和对应.mp4视频生成.zarr格式的训练数据
 
 # 设置默认参数
-INPUT_H5="../demo_0828/PlugCharger-v1/motionplanning/action_normed.h5"
-OUTPUT_ZARR="./output_zarr/test_mam.zarr"
-INPUT_CONDITION="./output/0830_test_PlugCharger_local_planner_padding_1.h5"
+INPUT_H5="../demo_0828/PushCube-v1/motionplanning/action_normed.h5"
+OUTPUT_ZARR="./output_zarr/0901_PushCube_points_mask_mam.zarr"
+INPUT_CONDITION="./output/0901_PushCube_points_mask_w_padding.h5"
 
 # 创建输出目录
 OUTPUT_DIR=$(dirname "$OUTPUT_ZARR")

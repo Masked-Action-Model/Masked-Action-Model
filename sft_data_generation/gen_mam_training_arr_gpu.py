@@ -33,32 +33,45 @@ def extract_frame_from_video_gpu(video_path, frame_idx, use_gpu=True):
 
 def extract_frame_ffmpeg_gpu(video_path, frame_idx):
     """
-    使用FFmpeg GPU加速提取帧
+    使用FFmpeg硬件加速提取帧
     """
     # 创建临时文件
     with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
         temp_path = tmp_file.name
     
     try:
-        # 使用FFmpeg GPU加速提取帧
-        # -hwaccel cuda: 启用CUDA硬件加速
-        # -ss: 设置开始时间
-        # -vframes 1: 只提取1帧
-        # -vf: 视频滤镜
-        # -q:v 2: 高质量输出
+        # 检测可用的硬件加速
+        available_hwaccels = get_available_hwaccels()
         
-        cmd = [
-            'ffmpeg',
-            '-hwaccel', 'cuda',  # 使用CUDA加速
-            '-hwaccel_output_format', 'cuda',  # 输出格式为CUDA
-            '-ss', str(frame_idx),  # 跳转到指定帧
-            '-i', video_path,  # 输入文件
-            '-vframes', '1',  # 只提取1帧
-            '-vf', 'scale_cuda=1920:1080:format=yuv420p',  # GPU缩放
-            '-q:v', '2',  # 高质量
-            '-y',  # 覆盖输出文件
-            temp_path
-        ]
+        if 'cuvid' in available_hwaccels:
+            # 使用cuvid硬件加速
+            cmd = [
+                'ffmpeg',
+                '-hwaccel', 'cuvid',  # 使用cuvid加速
+                '-ss', str(frame_idx),  # 跳转到指定帧
+                '-i', video_path,  # 输入文件
+                '-vframes', '1',  # 只提取1帧
+                '-vf', 'scale_npp=1920:1080:format=yuv420p',  # 使用NPP缩放
+                '-q:v', '2',  # 高质量
+                '-y',  # 覆盖输出文件
+                temp_path
+            ]
+        elif 'vaapi' in available_hwaccels:
+            # 使用vaapi硬件加速
+            cmd = [
+                'ffmpeg',
+                '-hwaccel', 'vaapi',  # 使用vaapi加速
+                '-ss', str(frame_idx),  # 跳转到指定帧
+                '-i', video_path,  # 输入文件
+                '-vframes', '1',  # 只提取1帧
+                '-vf', 'scale_vaapi=1920:1080:format=nv12',  # 使用vaapi缩放
+                '-q:v', '2',  # 高质量
+                '-y',  # 覆盖输出文件
+                temp_path
+            ]
+        else:
+            # 回退到CPU模式
+            raise RuntimeError("没有可用的硬件加速支持")
         
         # 执行命令
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -77,6 +90,21 @@ def extract_frame_ffmpeg_gpu(video_path, frame_idx):
         # 清理临时文件
         if os.path.exists(temp_path):
             os.unlink(temp_path)
+
+def get_available_hwaccels():
+    """
+    获取系统支持的硬件加速类型
+    """
+    try:
+        result = subprocess.run(['ffmpeg', '-hwaccels'], capture_output=True, text=True)
+        if result.returncode == 0:
+            # 解析输出，跳过第一行"Hardware acceleration methods:"
+            lines = result.stdout.strip().split('\n')[1:]
+            return [line.strip() for line in lines if line.strip()]
+        else:
+            return []
+    except Exception:
+        return []
 
 def extract_frame_opencv(video_path, frame_idx):
     """
@@ -131,9 +159,25 @@ def extract_frames_batch_gpu(video_path, frame_indices, use_gpu=True, batch_size
 
 def extract_frames_ffmpeg_batch(video_path, frame_indices, batch_size=10):
     """
-    使用FFmpeg批量提取帧（GPU加速）
+    使用FFmpeg批量提取帧（硬件加速）
     """
     frames = []
+    
+    # 检测可用的硬件加速
+    available_hwaccels = get_available_hwaccels()
+    
+    if not available_hwaccels:
+        raise RuntimeError("没有可用的硬件加速支持")
+    
+    # 选择最佳硬件加速
+    if 'cuvid' in available_hwaccels:
+        hwaccel = 'cuvid'
+        scale_filter = 'scale_npp=1920:1080:format=yuv420p'
+    elif 'vaapi' in available_hwaccels:
+        hwaccel = 'vaapi'
+        scale_filter = 'scale_vaapi=1920:1080:format=nv12'
+    else:
+        raise RuntimeError("没有可用的硬件加速支持")
     
     # 分批处理
     for i in range(0, len(frame_indices), batch_size):
@@ -160,8 +204,7 @@ def extract_frames_ffmpeg_batch(video_path, frame_indices, batch_size=10):
             
             cmd = [
                 'ffmpeg',
-                '-hwaccel', 'cuda',
-                '-hwaccel_output_format', 'cuda',
+                '-hwaccel', hwaccel,
                 '-i', video_path,
                 '-filter_complex', filter_str,
                 '-y'

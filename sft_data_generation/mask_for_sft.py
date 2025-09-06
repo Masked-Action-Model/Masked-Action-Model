@@ -200,10 +200,10 @@ class MaskSFT:
                         grp_out.create_dataset(dset_key, data=padded_data, compression="gzip")
                 
                 # 保存最大长度信息到meta组
-                # if self.enable_padding:
-                #     meta_group = f_out.require_group('meta')
-                #     meta_group.create_dataset('max_length', data=max_length, dtype='int64')
-                #     meta_group.create_dataset('padding_value', data=-2, dtype='int64')
+                if self.enable_padding:
+                    meta_group = f_out.require_group('meta')
+                    meta_group.create_dataset('max_length', data=max_length, dtype='int64')
+                    meta_group.create_dataset('padding_value', data=-1, dtype='int64')
 
 
 def normalize_actions(input_path, output_path):
