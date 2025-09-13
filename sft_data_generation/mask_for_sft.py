@@ -27,6 +27,28 @@ class MaskSFT:
             mask = np.ones(action.shape[1], dtype=bool)
             mask[[0,1]] = False
             action[:, mask] = -1
+        elif self.mask_type == '2D_partial_trajectory':
+            # 保留任意一个连续mask_seq_len长度的x,y序列，其余部分mask
+            n = action.shape[0]
+            # 先mask所有数据
+            action[:, :] = -1
+            
+            # 容错机制：确保mask_seq_len在合理范围内
+            if self.mask_seq_len <= 0:
+                # 如果mask_seq_len <= 0，则mask所有数据
+                raise ValueError("mask_seq_len设置为负数，mask所有数据")
+            elif self.mask_seq_len >= n:
+                # 如果mask_seq_len >= 序列长度，则保留所有x,y数据
+                raise ValueError("mask_seq_len设置为大于等于序列长度，保留所有x,y数据")
+            else:
+                # 随机选择一个起始位置，保留连续长度为mask_seq_len的x,y子序列
+                max_start = n - self.mask_seq_len
+                start_idx = np.random.randint(0, max_start + 1)
+                end_idx = start_idx + self.mask_seq_len
+                # 确保范围在原始序列之内
+                start_idx = max(0, min(start_idx, n - self.mask_seq_len))
+                end_idx = start_idx + self.mask_seq_len
+                action[start_idx:end_idx, 0:2] = self._original_action[start_idx:end_idx, 0:2]
         elif self.mask_type == 'pose_AnyGrasp':
             # 保留任意一个的x,y,z,dx,dy,dz,gripper (0-6)
             n = action.shape[0]
@@ -77,12 +99,10 @@ class MaskSFT:
             # 容错机制：确保mask_seq_len在合理范围内
             if self.mask_seq_len <= 0:
                 # 如果mask_seq_len <= 0，则不mask任何数据
-                print("mask_seq_len设置为负数当前mask操作无效, 保留原始数据")
-                pass
+                raise ValueError("mask_seq_len设置为负数当前mask操作无效, 保留原始数据")
             elif self.mask_seq_len >= n:
                 # 如果mask_seq_len >= 序列长度，则mask所有0-6列数据
-                print("mask_seq_len设置为大于序列长度, 请设置小于序列长度的mask序列长度")
-                pass
+                raise ValueError("mask_seq_len设置为大于序列长度, 请设置小于序列长度的mask序列长度")
             else:
                 # 随机选择一个起始位置，mask掉连续长度为mask_seq_len的子序列
                 max_start = n - self.mask_seq_len
@@ -146,7 +166,7 @@ class MaskSFT:
                     for dset_key in grp_in:
                         data = grp_in[dset_key][()]
                         if dset_key == 'action':
-                            if self.mask_type in ['pose_AnyGrasp', 'points', 'pose_motion_planning', 'auto_regressive', 'random_mask', 'local_planner']:
+                            if self.mask_type in ['pose_AnyGrasp', 'points', 'pose_motion_planning', 'auto_regressive', 'random_mask', 'local_planner', '2D_partial_trajectory']:
                                 self._original_action = data.copy()
                                 max_retry = 1000
                                 for _ in range(max_retry):
@@ -163,17 +183,32 @@ class MaskSFT:
                                 data = self.mask_action(data)
                             
                             if data.shape[1] > 7:
-                                # 将mask(-1)值放在最后面，其余按第七列（时间序列）从小到大排序
-                                mask_neg_one = data[:, 7] == -1
-                                non_neg_one_idx = np.where(~mask_neg_one)[0]
-                                neg_one_idx = np.where(mask_neg_one)[0]
+                                # 检查第七列（时间）是否有非-1的值
+                                time_col = data[:, 7]
+                                has_valid_time = np.any(time_col != -1)
                                 
-                                if len(non_neg_one_idx) > 0:
-                                    sort_idx = np.argsort(data[non_neg_one_idx, 7])
-                                    non_neg_one_sorted = non_neg_one_idx[sort_idx]
-                                    final_idx = np.concatenate([non_neg_one_sorted, neg_one_idx])
+                                if has_valid_time:
+                                    # 如果第七列有非-1值，按第七列（时间序列）从小到大排序，mask(-1)值放在最后面
+                                    mask_neg_one = time_col == -1
+                                    non_neg_one_idx = np.where(~mask_neg_one)[0]
+                                    neg_one_idx = np.where(mask_neg_one)[0]
+                                    
+                                    if len(non_neg_one_idx) > 0:
+                                        sort_idx = np.argsort(time_col[non_neg_one_idx])
+                                        non_neg_one_sorted = non_neg_one_idx[sort_idx]
+                                        final_idx = np.concatenate([non_neg_one_sorted, neg_one_idx])
+                                    else:
+                                        final_idx = np.arange(len(data))
                                 else:
-                                    final_idx = np.arange(len(data))
+                                    # 如果第七列全是-1，按原始顺序保留非mask值，mask(-1)值放在最后面
+                                    # 检查哪些行不是全mask（即至少有一列不是-1）
+                                    is_fully_masked = np.all(data == -1, axis=1)
+                                    non_masked_idx = np.where(~is_fully_masked)[0]
+                                    masked_idx = np.where(is_fully_masked)[0]
+                                    
+                                    # 按原始顺序保留非mask值，mask值放最后
+                                    final_idx = np.concatenate([non_masked_idx, masked_idx])
+                                
                                 data = data[final_idx]
                             
                             max_length = max(max_length, data.shape[0])
