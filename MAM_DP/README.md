@@ -25,11 +25,11 @@
 1) 创建并激活 Conda 环境（优先使用项目自带环境文件）
 
 ```bash
-conda env create -f diffusion_policy/conda_environment.yaml -n robodiff
+conda env create -f diffusion_policy/conda_environment.yaml -n MAM
 ```
 
 ```bash
-conda activate robodiff
+conda activate MAM
 ```
 
 
