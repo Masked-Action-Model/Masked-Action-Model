@@ -1,7 +1,7 @@
 #!/bin/bash
 
-INPUT="/data1/tangjielong_2/mask_action_model/Masked-Action-Model/demo_0828/PushCube-v1/motionplanning/action.h5"
-OUTPUT="./output/0914_PushCube_points_mask_w_padding.h5"
+INPUT="/cephfs/shared/Yanbang/MAM/Masked-Action-Model/sft_data_generation/PickCube-v1/motionplanning/action.h5"
+OUTPUT="/cephfs/shared/Yanbang/MAM/Masked-Action-Model/sft_data_generation/output_PickCube_points_mask_w_padding.h5"
 MASK_TYPE="points"
 RETAIN_RATIO=0.1
 SIZE=1
