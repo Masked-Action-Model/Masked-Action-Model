@@ -282,7 +282,7 @@ def normalize_actions_to_new_h5(input_path, output_path, json_path):
         for traj_key in f:
             grp = f[traj_key]
             if 'action' in grp:
-                data = grp['action'][()]
+                data = grp['action'].astype(np.float64)[()]
                 mins = np.minimum(mins, data[:, :6].min(axis=0))
                 maxs = np.maximum(maxs, data[:, :6].max(axis=0))
     norm_info = {'min': mins.tolist(), 'max': maxs.tolist()}
@@ -294,7 +294,7 @@ def normalize_actions_to_new_h5(input_path, output_path, json_path):
             grp_in = f_in[traj_key]
             grp_out = f_out.require_group(f'{traj_key}')
             for dset_key in grp_in:
-                data = grp_in[dset_key][()]
+                data = grp_in[dset_key].astype(np.float64)[()]
                 if dset_key == 'action':
                     data = apply_normalize(data, mins, maxs)
                 grp_out.create_dataset(dset_key, data=data, compression="gzip")
