@@ -164,7 +164,10 @@ class MaskSFT:
                     processed_data[traj_key] = {}
                     
                     for dset_key in grp_in:
-                        data = grp_in[dset_key][()]
+                        # data = grp_in[dset_key][()]
+                        dset = grp_in[dset_key]
+                        data = np.empty(dset.shape, dtype=np.float64)
+                        dset.read_direct(data)
                         if dset_key == 'action':
                             if self.mask_type in ['pose_AnyGrasp', 'points', 'pose_motion_planning', 'auto_regressive', 'random_mask', 'local_planner', '2D_partial_trajectory']:
                                 self._original_action = data.copy()
