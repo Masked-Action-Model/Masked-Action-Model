@@ -282,23 +282,40 @@ def normalize_actions_to_new_h5(input_path, output_path, json_path):
         for traj_key in f:
             grp = f[traj_key]
             if 'action' in grp:
-                data = grp['action'].astype(np.float64)[()]
+                dset = grp['action']
+                data = np.empty(dset.shape, dtype=np.float64)
+                dset.read_direct(data)
                 mins = np.minimum(mins, data[:, :6].min(axis=0))
                 maxs = np.maximum(maxs, data[:, :6].max(axis=0))
+
+    # 保存归一化参数
     norm_info = {'min': mins.tolist(), 'max': maxs.tolist()}
     with open(json_path, 'w') as f:
         json.dump(norm_info, f, indent=2)
-    # 写入归一化h5
     with h5py.File(input_path, 'r') as f_in, h5py.File(output_path, 'w') as f_out:
         for traj_key in f_in:
             grp_in = f_in[traj_key]
-            grp_out = f_out.require_group(f'{traj_key}')
+            grp_out = f_out.require_group(traj_key)
             for dset_key in grp_in:
-                data = grp_in[dset_key].astype(np.float64)[()]
+                dset_in = grp_in[dset_key]
                 if dset_key == 'action':
+                    data = np.empty(dset_in.shape, dtype=np.float64)
+                    dset_in.read_direct(data)
                     data = apply_normalize(data, mins, maxs)
-                grp_out.create_dataset(dset_key, data=data, compression="gzip")
+                    grp_out.create_dataset(
+                        dset_key,
+                        data=data.astype(np.float32),
+                        compression="gzip"
+                    )
+                else:
+                    grp_out.create_dataset(
+                        dset_key,
+                        data=dset_in[()],
+                        dtype=dset_in.dtype,
+                        compression="gzip"
+                    )
     return mins, maxs
+
 
 def main():
     parser = argparse.ArgumentParser()
