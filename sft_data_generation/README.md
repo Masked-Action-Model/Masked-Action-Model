@@ -39,6 +39,13 @@ bash run_mask_sft.sh
 - 归一化参数会自动保存为`输入文件名_norm.json`
 - 若不需要归一化，可在shell脚本或命令行去掉`--normalize`参数
 
+action.h5 (原始数据)
+    ↓
+[mask_for_sft.py --normalize] （min_max_norm）
+    ↓
+action_norm.json (归一化参数) + action_norm.json (归一化数据)
+    ↓
+output_mask (生成的mask)
 ---
 
 ## padding说明
