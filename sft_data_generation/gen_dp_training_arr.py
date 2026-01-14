@@ -128,7 +128,10 @@ def extract_trajectory_frames(h5_path, traj_key):
         # 复制所有需要的数据，避免文件句柄关闭后引用失效
         traj_data_copy = {}
         for key in traj_data.keys():
-            traj_data_copy[key] = traj_data[key][()].copy()
+            dset = traj_data[key]
+            data = np.empty(dset.shape, dtype=np.float64)
+            dset.read_direct(data)
+            traj_data_copy[key] = data
     
     # 提取两个视角的所有帧
     view0_frames = []
@@ -236,7 +239,11 @@ def main(args):
                 if 'meta' not in f_cond or 'max_length' not in f_cond['meta']:
                     raise ValueError("在condition文件中找不到 'meta/max_length'")
                 
-                max_length = int(f_cond['meta']['max_length'][()])
+                # max_length = int(f_cond['meta']['max_length'][()])
+                dset = f_cond['meta']['max_length']
+                max_length = np.empty(dset.shape, dtype=np.float64)
+                dset.read_direct(max_length)
+                max_length = int(max_length)
                 cprint(f"Condition文件max_length: {max_length}", 'yellow')
                 
                 # 读取所有trajectory的condition数据
@@ -244,7 +251,9 @@ def main(args):
                     if traj_key.startswith('traj_'):
                         traj_data = f_cond[traj_key]
                         if 'action' in traj_data:
-                            action_data = traj_data['action'][()]
+                            dset = traj_data['action']
+                            action_data = np.empty(dset.shape, dtype=np.float64)
+                            dset.read_direct(action_data)
                             # 验证维度
                             if action_data.shape != (max_length, 8):
                                 raise ValueError(f"Trajectory {traj_key} 的action维度不正确: {action_data.shape}, 期望: ({max_length}, 8)")
