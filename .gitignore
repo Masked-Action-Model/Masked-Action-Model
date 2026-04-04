@@ -9,6 +9,11 @@ sft_data_generation/output/*
 *.zip
 # .pyc临时文件 
 *.pyc
+__pycache__/
+.ipynb_checkpoints/
+
+# 模型权重
+*.pt
 
 #本地文件
 dp/*

@@ -1,0 +1,133 @@
+#!/bin/bash
+set -euo pipefail
+
+# Multi-GPU train script for examples/baselines/diffusion_policy/multitrain_dit.py
+# Usage:
+#   NPROC_PER_NODE=4 bash examples/baselines/diffusion_policy/run_multitrain_dit.sh
+# Optional:
+#   MASTER_PORT=29600 CUDA_VISIBLE_DEVICES=0,1,2,3 ...
+
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+NNODES="${NNODES:-1}"
+NODE_RANK="${NODE_RANK:-0}"
+MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+MASTER_PORT="${MASTER_PORT:-29500}"
+
+EXP_NAME="${EXP_NAME:-PickCube_rgbd_ddp}"
+SEED="${SEED:-1}"
+TORCH_DETERMINISTIC="${TORCH_DETERMINISTIC:-true}"
+CUDA="${CUDA:-true}"
+TRACK="${TRACK:-false}"
+WANDB_PROJECT_NAME="${WANDB_PROJECT_NAME:-ManiSkill}"
+WANDB_ENTITY="${WANDB_ENTITY:-}"
+CAPTURE_VIDEO="${CAPTURE_VIDEO:-true}"
+
+ENV_ID="${ENV_ID:-PickCube-v1}"
+DEMO_PATH="${DEMO_PATH:-demos/data_1/data_1_concat_train.h5}"
+NUM_DEMOS="${NUM_DEMOS:-100}"
+TOTAL_ITERS="${TOTAL_ITERS:-800000}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
+
+LR="${LR:-1e-4}"
+OBS_HORIZON="${OBS_HORIZON:-2}"
+ACT_HORIZON="${ACT_HORIZON:-8}"
+PRED_HORIZON="${PRED_HORIZON:-16}"
+DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-64}"
+
+OBS_MODE="${OBS_MODE:-rgb+depth}"
+MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-160}"
+LOG_FREQ="${LOG_FREQ:-1000}"
+EVAL_FREQ="${EVAL_FREQ:-5000}"
+SAVE_FREQ="${SAVE_FREQ:-}"
+NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-100}"
+NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-10}"
+ACTION_NORM_PATH="${ACTION_NORM_PATH:-demos/data_1/data_1_norm.json}"
+SIM_BACKEND="${SIM_BACKEND:-physx_cpu}"
+NUM_DATALOAD_WORKERS="${NUM_DATALOAD_WORKERS:-0}"
+CONTROL_MODE="${CONTROL_MODE:-pd_ee_pose}"
+DEMO_TYPE="${DEMO_TYPE:-}"
+
+ARGS=(
+  --seed "$SEED"
+  --wandb-project-name "$WANDB_PROJECT_NAME"
+  --env-id "$ENV_ID"
+  --demo-path "$DEMO_PATH"
+  --total-iters "$TOTAL_ITERS"
+  --batch-size "$BATCH_SIZE"
+  --lr "$LR"
+  --obs-horizon "$OBS_HORIZON"
+  --act-horizon "$ACT_HORIZON"
+  --pred-horizon "$PRED_HORIZON"
+  --diffusion-step-embed-dim "$DIFFUSION_STEP_EMBED_DIM"
+  --obs-mode "$OBS_MODE"
+  --log-freq "$LOG_FREQ"
+  --eval-freq "$EVAL_FREQ"
+  --num-eval-episodes "$NUM_EVAL_EPISODES"
+  --num-eval-envs "$NUM_EVAL_ENVS"
+  --sim-backend "$SIM_BACKEND"
+  --num-dataload-workers "$NUM_DATALOAD_WORKERS"
+  --control-mode "$CONTROL_MODE"
+)
+
+if [[ -n "$EXP_NAME" ]]; then
+  ARGS+=(--exp-name "$EXP_NAME")
+fi
+if [[ "$TORCH_DETERMINISTIC" == "true" ]]; then
+  ARGS+=(--torch-deterministic)
+else
+  ARGS+=(--no-torch-deterministic)
+fi
+if [[ "$CUDA" == "true" ]]; then
+  ARGS+=(--cuda)
+else
+  ARGS+=(--no-cuda)
+fi
+if [[ "$TRACK" == "true" ]]; then
+  ARGS+=(--track)
+else
+  ARGS+=(--no-track)
+fi
+if [[ -n "$WANDB_ENTITY" ]]; then
+  ARGS+=(--wandb-entity "$WANDB_ENTITY")
+fi
+if [[ "$CAPTURE_VIDEO" == "true" ]]; then
+  ARGS+=(--capture-video)
+else
+  ARGS+=(--no-capture-video)
+fi
+if [[ -n "$NUM_DEMOS" ]]; then
+  ARGS+=(--num-demos "$NUM_DEMOS")
+fi
+if [[ -z "$ACTION_NORM_PATH" ]]; then
+  echo "缺少 ACTION_NORM_PATH（动作归一化参数 json）。" >&2
+  exit 2
+fi
+ARGS+=(--action-norm-path "$ACTION_NORM_PATH")
+if [[ -n "$MAX_EPISODE_STEPS" ]]; then
+  ARGS+=(--max-episode-steps "$MAX_EPISODE_STEPS")
+fi
+if [[ -n "$SAVE_FREQ" ]]; then
+  ARGS+=(--save-freq "$SAVE_FREQ")
+fi
+if [[ -n "$DEMO_TYPE" ]]; then
+  ARGS+=(--demo-type "$DEMO_TYPE")
+fi
+
+# if torchrun unavailable in PATH, fallback to python -m torch.distributed.run
+if command -v torchrun >/dev/null 2>&1; then
+  torchrun \
+    --nnodes "$NNODES" \
+    --nproc_per_node "$NPROC_PER_NODE" \
+    --node_rank "$NODE_RANK" \
+    --master_addr "$MASTER_ADDR" \
+    --master_port "$MASTER_PORT" \
+    examples/baselines/diffusion_policy/multitrain_dit.py "${ARGS[@]}"
+else
+  python -m torch.distributed.run \
+    --nnodes "$NNODES" \
+    --nproc_per_node "$NPROC_PER_NODE" \
+    --node_rank "$NODE_RANK" \
+    --master_addr "$MASTER_ADDR" \
+    --master_port "$MASTER_PORT" \
+    examples/baselines/diffusion_policy/multitrain_dit.py "${ARGS[@]}"
+fi

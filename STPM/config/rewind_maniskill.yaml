@@ -1,0 +1,53 @@
+general:
+  project_name: "STPM_PickCube"  
+  task_name: "pick up the cube and place it at the goal"  # language prompt
+  repo_id: demos/data_1/data_1_train.h5                   # dataset .h5 path
+  state_norm_path: STPM/pickcube_state_norm_train.json  
+  camera_names: ["base_camera"] 
+  seed: 42
+  device: "cuda"  
+
+dataloader:
+  batch_size: 32                          
+  num_workers: 6  
+  shuffle: True  
+  pin_memory: True  
+  persistent_workers: True  
+
+val_dataloader:
+  batch_size: 32  
+  num_workers: 6  
+  shuffle: False  
+  pin_memory: True  
+  persistent_workers: True  
+
+encoders:
+  vision_ckpt: "pretrained/clip-vit-base-patch32"  # local CLIP directory, resolved relative to the ManiSkill repo root
+
+model:
+  d_model: 768  # transformer hidden size
+  n_layers: 8  # number of transformer encoder layers
+  n_heads: 12  # number of attention heads
+  dropout: 0.1  # dropout used inside the reward model
+  n_obs_steps: 6  # number of historical observations; dataset sequence length is n_obs_steps + 1
+  frame_gap: 2  # gap in raw observation indices between consecutive sampled frames
+  state_dim: 29  # state feature dimension: qpos + qvel + goal_pos + tcp_pose + is_grasped
+  no_state: False  # if True, replace state input with zeros during training/eval
+  resume_training: False  # whether to load model weights from model_path before training
+  model_path: ""  # checkpoint path used when resume_training=True
+
+optim:
+  lr: 5e-5  # AdamW learning rate
+  weight_decay: 5.0e-3  # AdamW weight decay
+  betas: [0.9, 0.95]  # AdamW beta coefficients
+  eps: 1.0e-8  # AdamW numerical stability term
+  warmup_steps: 1000  # linear warmup steps before cosine decay
+  total_steps: 100_000  # total scheduler horizon used by the cosine schedule
+
+train:
+  num_epochs: 2  # total training epochs
+  grad_clip: 1.0  # gradient clipping threshold
+  log_every: 50  # wandb logging interval in optimizer steps
+  eval_every: 1  # run validation every N epochs
+  save_every: 5_000  # save an extra step checkpoint every N optimizer steps
+  val_portion: 0.1  # fraction of episodes reserved for validation

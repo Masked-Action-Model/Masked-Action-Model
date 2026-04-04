@@ -1,0 +1,50 @@
+general:
+  project_name: STPM_PickCube
+  task_name: pick up the cube and place it at the goal
+  repo_id: demos/data_1/data_1_train.h5
+  state_norm_path: STPM/pickcube_state_norm_train.json
+  camera_names:
+  - base_camera
+  seed: 42
+  device: cuda
+dataloader:
+  batch_size: 32
+  num_workers: 6
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+val_dataloader:
+  batch_size: 32
+  num_workers: 6
+  shuffle: false
+  pin_memory: true
+  persistent_workers: true
+encoders:
+  vision_ckpt: pretrained/clip-vit-base-patch32
+model:
+  d_model: 768
+  n_layers: 8
+  n_heads: 12
+  dropout: 0.1
+  n_obs_steps: 6
+  frame_gap: 2
+  state_dim: 29
+  no_state: false
+  resume_training: false
+  model_path: ''
+optim:
+  lr: 5.0e-05
+  weight_decay: 0.005
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1.0e-08
+  warmup_steps: 1000
+  total_steps: 100000
+train:
+  num_epochs: 2
+  grad_clip: 1.0
+  log_every: 50
+  eval_every: 1
+  save_every: 5000
+  val_portion: 0.1
