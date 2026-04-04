@@ -519,7 +519,7 @@ class Agent(nn.Module):
                 )
         else:
             self.mas_long_window_encoder = None
-        mas_short_feature_dim = self.mas_short_window_dim * 2 if self.enable_short_window else 0
+        mas_short_feature_dim = self.mas_short_window_dim if self.enable_short_window else 0
 
         self.noise_pred_net = DiTNoiseNet(
             ac_dim=self.act_dim,
@@ -706,9 +706,8 @@ class Agent(nn.Module):
             expected_dim=self.mas_short_window_dim,
             state_dtype=state.dtype,
         )
-        mas_value = mas_value.reshape(batch_size, self.obs_horizon, -1)
-        mas_mask = mas_mask.reshape(batch_size, self.obs_horizon, -1)
-        return torch.cat((mas_value, mas_mask), dim=-1)
+        del mas_mask
+        return mas_value.reshape(batch_size, self.obs_horizon, -1)
 
     def obs_conditioning(self, obs_seq, eval_mode):
         rgb = obs_seq["rgb"].float() / 255.0

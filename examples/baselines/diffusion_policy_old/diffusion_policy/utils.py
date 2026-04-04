@@ -86,14 +86,23 @@ def load_hdf5(
     return ret
 
 
-def load_traj_hdf5(path, num_traj=None):
+def load_traj_hdf5(path, num_traj=None, traj_ids=None):
     print("Loading HDF5 file", path)
     file = File(path, "r")
-    keys = [k for k in file.keys() if k.startswith("traj_")]
-    if num_traj is not None:
-        assert num_traj <= len(keys), f"num_traj: {num_traj} > len(keys): {len(keys)}"
-        keys = sorted(keys, key=lambda x: int(x.split("_")[-1]))
-        keys = keys[:num_traj]
+    available_keys = sorted(
+        [k for k in file.keys() if k.startswith("traj_")],
+        key=lambda x: int(x.split("_")[-1]),
+    )
+    if traj_ids is not None:
+        keys = [f"traj_{int(traj_id)}" for traj_id in traj_ids]
+        missing = [key for key in keys if key not in file]
+        if missing:
+            raise KeyError(f"traj ids not found in {path}: {missing}")
+    else:
+        keys = available_keys
+        if num_traj is not None:
+            assert num_traj <= len(keys), f"num_traj: {num_traj} > len(keys): {len(keys)}"
+            keys = keys[:num_traj]
     ret = {key: load_content_from_h5_file(file[key]) for key in keys}
     file.close()
     print("Loaded")
@@ -101,18 +110,19 @@ def load_traj_hdf5(path, num_traj=None):
 
 
 def load_demo_dataset(
-    path, keys=["observations", "actions"], num_traj=None, concat=True
+    path, keys=["observations", "actions"], num_traj=None, traj_ids=None, concat=True
 ):
     # assert num_traj is None
-    raw_data = load_traj_hdf5(path, num_traj)
+    raw_data = load_traj_hdf5(path, num_traj=num_traj, traj_ids=traj_ids)
     # raw_data has keys like: ['traj_0', 'traj_1', ...]
     # raw_data['traj_0'] has keys like: ['actions', 'dones', 'env_states', 'infos', ...]
-    first_key = sorted(raw_data.keys(), key=lambda x: int(x.split("_")[-1]))[0]
+    first_key = next(iter(raw_data.keys()))
     _traj = raw_data[first_key]
     for key in keys:
         source_key = TARGET_KEY_TO_SOURCE_KEY[key]
-        assert source_key in _traj, f"key: {source_key} not in traj_0: {_traj.keys()}"
+        assert source_key in _traj, f"key: {source_key} not in {first_key}: {_traj.keys()}"
     dataset = {}
+    first_traj_actions = _traj["actions"]
     for target_key in keys:
         # if 'next' in target_key:
         #     raise NotImplementedError('Please carefully deal with the length of trajectory')
@@ -121,13 +131,13 @@ def load_demo_dataset(
         if isinstance(dataset[target_key][0], np.ndarray) and concat:
             if target_key in ["observations", "states"] and len(
                 dataset[target_key][0]
-            ) > len(raw_data["traj_0"]["actions"]):
+            ) > len(first_traj_actions):
                 dataset[target_key] = np.concatenate(
                     [t[:-1] for t in dataset[target_key]], axis=0
                 )
             elif target_key in ["next_observations", "next_states"] and len(
                 dataset[target_key][0]
-            ) > len(raw_data["traj_0"]["actions"]):
+            ) > len(first_traj_actions):
                 dataset[target_key] = np.concatenate(
                     [t[1:] for t in dataset[target_key]], axis=0
                 )

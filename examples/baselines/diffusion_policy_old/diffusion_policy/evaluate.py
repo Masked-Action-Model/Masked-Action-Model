@@ -7,14 +7,45 @@ from tqdm import tqdm
 from mani_skill.utils import common
 
 
-def evaluate(n: int, agent, eval_envs, device, sim_backend: str, progress_bar: bool = True):
+def evaluate(
+    n: int,
+    agent,
+    eval_envs,
+    device,
+    sim_backend: str,
+    progress_bar: bool = True,
+    reset_seed: int = None,
+    reset_kwargs_list: list[dict] = None,
+):
     agent.eval()
     if progress_bar:
         pbar = tqdm(total=n)
     with torch.no_grad():
         eval_metrics = defaultdict(list)
-        obs, info = eval_envs.reset()
+        if reset_kwargs_list is not None and len(reset_kwargs_list) > 0:
+            if eval_envs.num_envs != 1:
+                raise ValueError(
+                    "reset_kwargs_list evaluation only supports num_envs=1."
+                )
+            print(
+                f"[eval] evaluating with {len(reset_kwargs_list)} explicit reset kwargs"
+            )
+        elif reset_seed is not None and eval_envs.num_envs > 1:
+            print(
+                f"[eval] reset_seed={reset_seed} with num_envs={eval_envs.num_envs}: "
+                "only env 0 uses that exact seed; other envs will use derived seeds."
+            )
         eps_count = 0
+
+        def reset_env_for_episode(ep_idx: int):
+            if reset_kwargs_list is not None and len(reset_kwargs_list) > 0:
+                reset_kwargs = dict(reset_kwargs_list[ep_idx % len(reset_kwargs_list)])
+                return eval_envs.reset(**reset_kwargs)
+            if reset_seed is None:
+                return eval_envs.reset()
+            return eval_envs.reset(seed=reset_seed)
+
+        obs, info = reset_env_for_episode(eps_count)
         while eps_count < n:
             obs = common.to_tensor(obs, device)
             action_seq = agent.get_action(obs)
@@ -37,6 +68,8 @@ def evaluate(n: int, agent, eval_envs, device, sim_backend: str, progress_bar: b
                 eps_count += eval_envs.num_envs
                 if progress_bar:
                     pbar.update(eval_envs.num_envs)
+                if eps_count < n:
+                    obs, info = reset_env_for_episode(eps_count)
     agent.train()
     for k in eval_metrics.keys():
         eval_metrics[k] = np.stack(eval_metrics[k])

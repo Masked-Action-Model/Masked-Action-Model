@@ -255,12 +255,65 @@
 
 ## overlap eval 对比
 
+- 我按当前 new 的 held-out `eval100` seeds，对两个 old ckpt 都做了逐 seed cross-eval。为了不动现有代码，我新建了副本脚本：
+  - `examples/baselines/diffusion_policy_old/eval_rgbd_overlap_ckpt.py`
+
+- 评估口径：
+  - checkpoint 1：`runs/dit_old/checkpoints/best_eval_success_once.pt`
+  - checkpoint 2：`runs/dit_old_original/best_eval_success_once.pt`
+  - eval seeds：当前 new 的 held-out `100` 个 reset seeds
+  - overlap 定义：是否落在 old 前 `100` 条训练 demo 的 reset seed 集合里（共 `21` 条）
+
+- `dit_old`（训练到约 100k 的那个）结果：
+  - 总体：`success_once = 0.24`，`success_at_end = 0.20`
+  - overlap 21 条：`success_once = 1.00`，`success_at_end = 0.9048`
+  - non-overlap 79 条：`success_once = 0.0380`，`success_at_end = 0.0127`
+  - non-overlap 里只有 `3/79` 条 seed 曾经成功一次：`[124, 206, 252]`
+  - non-overlap 里只有 `1/79` 条 seed 末尾成功：`[252]`
+
+- `dit_old_original`（训练很久的那个）结果：
+  - 总体：`success_once = 0.66`，`success_at_end = 0.35`
+  - overlap 21 条：`success_once = 0.9524`，`success_at_end = 0.8571`
+  - non-overlap 79 条：`success_once = 0.5823`，`success_at_end = 0.2152`
+
+- 最关键的结论：
+  - **old 100k ckpt 基本就是在吃 overlap。** 它在 overlap seeds 上几乎全会，但一到 non-overlap 就几乎全灭。
+  - 这说明之前看到的 `old ~20%`，非常可能主要就是由这 `21/100` 的 overlap 撑起来，而不是它真的具备了稳定的 held-out 泛化能力。
+  - **old_original 虽然确实比 100k ckpt 强，而且在 non-overlap 上也有一定能力，但它同样存在非常明显的 overlap 优势。**
+  - 所以现在可以更有把握地说：  
+    **old/new 的核心差异首先是 eval protocol 和 overlap，而不是“new zero-window 已经被证明有实现 bug”。**
+
 
 ## 进一步指示
 
-- 重写‘- old 检验集（`train_rgbd.py` 当前 `evaluate.py`）：’部分的内容，说清楚随机reset seed的范围以及带来的影响，不要说废话也不要啰嗦，你所说的高位整数seed是否意味着没有泄漏，也就是旧的dit没有问题？
+- 我现在要做最后一步的对比尝试，我需要你修改olddp的数据加载逻辑，把olddp里的train和eval与newdp完全对齐，训练集还是与之前相同（data_1_norm.h5），但是选取100条训练数据时，完全按照newdp的resetseed选取；同样的，eval时，完全选用newdo测试集中的100个seed编码，然后我将再次进行对比实验，来获得确凿的证据。
+修改:
+train_rgbd.py/evaluate.py/....sh
 
-- 我需要你，继续追 zero-window 的真实 bug，最有判别力的实验应该是：  
-    **直接把 old ckpt 放到当前这 100 个 held-out seeds 上逐条评估，并按 overlap / non-overlap 分组看 success。**
-    （不要动现有代码，用副本跑测试，然后结论放在## overlap eval 对比里）
-- 请你用dit-old里的checkpoints 和 dit-old-original里的checkpoints分别做一次，一个是训练了100kiter的，一个是训练了很久的。
+- 已完成对齐改动：
+  - `examples/baselines/diffusion_policy_old/diffusion_policy/utils.py` 现已支持按指定 `traj_ids` 读取 H5，不再只能“取前 N 条”。
+  - `examples/baselines/diffusion_policy_old/train_rgbd.py` 新增了 `source_demo_metadata_path / train_seed_reference_metadata_path / eval_demo_metadata_path` 三个入口：
+    - 训练时会先读取 new train metadata 的前 `100` 个 `reset_seed`，再回到 `demos/data_1/data_1.json` 里按 seed 映射出 old `data_1_normed.h5` 对应的 `traj_id`，然后只加载这些轨迹训练。
+    - 评估时会直接读取 new eval metadata 的前 `100` 个 `reset_kwargs`，逐条 `env.reset(**reset_kwargs)` 做 rollout，而不再走 old 默认的随机 `eval_envs.reset()`。
+  - `examples/baselines/diffusion_policy_old/diffusion_policy/evaluate.py` 已支持 `reset_kwargs_list`，因此 old eval 现在可以和 new 一样按固定 seed 列表逐条评。
+  - `examples/baselines/diffusion_policy_old/run_train_rgbd.sh` 默认已经切到这套对齐口径：
+    - 训练参考 metadata：`demos/data_1_preprocessed/3D_points_0.1/data_1_3D_points_0.1_train.json`
+    - 评估 metadata：`demos/data_1_preprocessed/3D_points_0.1/data_1_3D_points_0.1_eval.json`
+    - source metadata：`demos/data_1/data_1.json`
+    - `NUM_EVAL_ENVS` 默认改成了 `1`，避免 fixed reset list 被并行 env 打乱
+
+- 轻量验证已通过：
+  - 训练对齐不是“简单取前 100 条”，而是真按 seed 回查 old H5。比如：
+    - `seed 52 -> traj 51`
+    - `seed 53 -> traj 52`
+    - `seed 54 -> traj 53`
+    - 这说明代码已经正确跨过了 `seed=51` 缺失造成的错位。
+  - 我直接在 `maniskill_py311` 环境里验证过：
+    - 对齐后的训练前 10 个 `traj_id` 为 `[0, 1, 2, 3, 4, 6, 7, 8, 9, 10]`
+    - 它对应的训练前 10 个 `reset_seed` 也正是 `[0, 1, 2, 3, 4, 6, 7, 8, 9, 10]`
+    - 对齐后的评估前 10 个 `reset_seed` 为 `[5, 12, 18, 26, 36, 41, 45, 46, 55, 57]`
+  - 同时我也验证了 `data_1_normed.h5` 确实能按这些映射后的 `traj_id` 正常读取。
+
+- 现在可以直接用：
+  - `examples/baselines/diffusion_policy_old/run_train_rgbd.sh`
+  - 跑出来的 old 训练/评估口径就已经与当前 new 的 `3D_points_0.1` train/eval split 对齐。

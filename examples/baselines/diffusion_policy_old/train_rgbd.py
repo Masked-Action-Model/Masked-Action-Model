@@ -62,6 +62,12 @@ class Args:
         "demos/PegInsertionSide-v1/trajectory.state.pd_ee_delta_pose.physx_cpu.h5"
     )
     """the path of demo dataset, it is expected to be a ManiSkill dataset h5py format file"""
+    source_demo_metadata_path: Optional[str] = None
+    """metadata for demo_path, used to map reset seeds back to source traj ids"""
+    train_seed_reference_metadata_path: Optional[str] = None
+    """metadata whose first num_demos reset seeds define the aligned training subset"""
+    eval_demo_metadata_path: Optional[str] = None
+    """metadata whose first num_eval_episodes reset kwargs define the aligned evaluation set"""
     num_demos: Optional[int] = None
     """number of trajectories to load from the demo dataset"""
     total_iters: int = 1_000_000
@@ -142,13 +148,119 @@ def load_action_denorm_stats(action_norm_path: str):
     return mins, maxs
 
 
+def extract_reset_seed(episode: dict) -> Optional[int]:
+    reset_kwargs = dict(episode.get("reset_kwargs", {}) or {})
+    reset_seed = reset_kwargs.get("seed", episode.get("episode_seed", None))
+    if isinstance(reset_seed, list):
+        reset_seed = reset_seed[0] if len(reset_seed) > 0 else None
+    return None if reset_seed is None else int(reset_seed)
+
+
+def load_metadata_episodes(meta_path: str) -> List[dict]:
+    if meta_path is None or len(meta_path.strip()) == 0:
+        raise ValueError("metadata path is empty")
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(f"metadata not found: {meta_path}")
+    with open(meta_path, "r") as f:
+        meta = json.load(f)
+    episodes = meta.get("episodes", [])
+    if not isinstance(episodes, list):
+        raise ValueError(f"invalid metadata format: {meta_path}")
+    return episodes
+
+
+def build_source_seed_to_traj_id_map(meta_path: str) -> dict[int, int]:
+    episodes = load_metadata_episodes(meta_path)
+    seed_to_traj_id: dict[int, int] = {}
+    for idx, episode in enumerate(episodes):
+        reset_seed = extract_reset_seed(episode)
+        if reset_seed is None:
+            raise ValueError(f"episode {idx} in {meta_path} has no reset seed")
+        traj_id = int(episode.get("episode_id", idx))
+        if reset_seed in seed_to_traj_id and seed_to_traj_id[reset_seed] != traj_id:
+            raise ValueError(
+                f"duplicate reset seed {reset_seed} in {meta_path}: "
+                f"{seed_to_traj_id[reset_seed]} vs {traj_id}"
+            )
+        seed_to_traj_id[reset_seed] = traj_id
+    return seed_to_traj_id
+
+
+def select_train_traj_ids_by_reference_seeds(
+    source_demo_metadata_path: str,
+    train_seed_reference_metadata_path: str,
+    num_demos: Optional[int],
+):
+    reference_episodes = load_metadata_episodes(train_seed_reference_metadata_path)
+    if num_demos is not None:
+        if num_demos > len(reference_episodes):
+            raise ValueError(
+                f"num_demos={num_demos} exceeds reference metadata episodes={len(reference_episodes)}"
+            )
+        reference_episodes = reference_episodes[:num_demos]
+
+    target_reset_seeds = [extract_reset_seed(episode) for episode in reference_episodes]
+    if any(seed is None for seed in target_reset_seeds):
+        raise ValueError(
+            f"found missing reset seed in reference metadata: {train_seed_reference_metadata_path}"
+        )
+    source_seed_to_traj_id = build_source_seed_to_traj_id_map(source_demo_metadata_path)
+
+    missing_seeds = [seed for seed in target_reset_seeds if seed not in source_seed_to_traj_id]
+    if missing_seeds:
+        raise KeyError(
+            f"reference reset seeds not found in source demo metadata: {missing_seeds}"
+        )
+
+    selected_traj_ids = [source_seed_to_traj_id[seed] for seed in target_reset_seeds]
+    return selected_traj_ids, [int(seed) for seed in target_reset_seeds]
+
+
+def load_eval_reset_kwargs_list(meta_path: str, num_eval_episodes: Optional[int]):
+    episodes = load_metadata_episodes(meta_path)
+    if num_eval_episodes is not None:
+        if num_eval_episodes > len(episodes):
+            raise ValueError(
+                f"num_eval_episodes={num_eval_episodes} exceeds eval metadata episodes={len(episodes)}"
+            )
+        episodes = episodes[:num_eval_episodes]
+
+    reset_kwargs_list = []
+    reset_seeds = []
+    for episode in episodes:
+        reset_kwargs = dict(episode.get("reset_kwargs", {}) or {})
+        reset_seed = extract_reset_seed(episode)
+        if reset_seed is not None:
+            reset_kwargs["seed"] = reset_seed
+        reset_kwargs_list.append(reset_kwargs)
+        reset_seeds.append(reset_seed)
+    return reset_kwargs_list, reset_seeds
+
+
 class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
-    def __init__(self, data_path, obs_process_fn, obs_space, include_rgb, include_depth,obs_horizon,pred_horizon, device, num_traj):
+    def __init__(
+        self,
+        data_path,
+        obs_process_fn,
+        obs_space,
+        include_rgb,
+        include_depth,
+        obs_horizon,
+        pred_horizon,
+        device,
+        num_traj,
+        traj_ids=None,
+    ):
         self.include_rgb = include_rgb
         self.include_depth = include_depth
 
         from diffusion_policy.utils import load_demo_dataset
-        trajectories = load_demo_dataset(data_path, num_traj=num_traj, concat=False)
+        trajectories = load_demo_dataset(
+            data_path,
+            num_traj=None if traj_ids is not None else num_traj,
+            traj_ids=traj_ids,
+            concat=False,
+        )
         # trajectories['observations'] is a list of dict, each dict is a traj, with keys in obs_space, values with length L+1
         # trajectories['actions'] is a list of np.ndarray (L, act_dim)
         print("Raw trajectory loaded, beginning observation pre-processing...")
@@ -447,6 +559,48 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
+    selected_train_traj_ids = None
+    selected_train_reset_seeds = None
+    if args.train_seed_reference_metadata_path:
+        if not args.source_demo_metadata_path:
+            raise ValueError(
+                "source_demo_metadata_path is required when train_seed_reference_metadata_path is set."
+            )
+        selected_train_traj_ids, selected_train_reset_seeds = (
+            select_train_traj_ids_by_reference_seeds(
+                source_demo_metadata_path=args.source_demo_metadata_path,
+                train_seed_reference_metadata_path=args.train_seed_reference_metadata_path,
+                num_demos=args.num_demos,
+            )
+        )
+        print(
+            f"[seed-align] selected {len(selected_train_traj_ids)} train traj ids from "
+            f"{args.demo_path} by matching reset seeds from {args.train_seed_reference_metadata_path}"
+        )
+        print(f"[seed-align] train reset seeds: {selected_train_reset_seeds}")
+        print(f"[seed-align] train traj ids: {selected_train_traj_ids}")
+
+    eval_reset_kwargs_list = None
+    eval_reset_seeds = None
+    effective_num_eval_envs = args.num_eval_envs
+    effective_num_eval_episodes = args.num_eval_episodes
+    if args.eval_demo_metadata_path:
+        eval_reset_kwargs_list, eval_reset_seeds = load_eval_reset_kwargs_list(
+            args.eval_demo_metadata_path, args.num_eval_episodes
+        )
+        effective_num_eval_episodes = len(eval_reset_kwargs_list)
+        if effective_num_eval_envs != 1:
+            print(
+                "[seed-align] explicit eval reset kwargs require num_eval_envs=1; "
+                f"overriding {effective_num_eval_envs} -> 1"
+            )
+            effective_num_eval_envs = 1
+        print(
+            f"[seed-align] loaded {effective_num_eval_episodes} eval reset kwargs from "
+            f"{args.eval_demo_metadata_path}"
+        )
+        print(f"[seed-align] eval reset seeds: {eval_reset_seeds}")
+
     # create evaluation environment
     env_kwargs = dict(
         control_mode=args.control_mode,
@@ -460,7 +614,7 @@ if __name__ == "__main__":
     other_kwargs = dict(obs_horizon=args.obs_horizon)
     envs = make_eval_envs(
         args.env_id,
-        args.num_eval_envs,
+        effective_num_eval_envs,
         args.sim_backend,
         env_kwargs,
         other_kwargs,
@@ -471,7 +625,17 @@ if __name__ == "__main__":
     if args.track:
         import wandb
         config = vars(args)
-        config["eval_env_cfg"] = dict(**env_kwargs, num_envs=args.num_eval_envs, env_id=args.env_id, env_horizon=args.max_episode_steps)
+        config["effective_num_eval_envs"] = effective_num_eval_envs
+        config["effective_num_eval_episodes"] = effective_num_eval_episodes
+        config["selected_train_reset_seeds"] = selected_train_reset_seeds
+        config["selected_train_traj_ids"] = selected_train_traj_ids
+        config["eval_reset_seeds"] = eval_reset_seeds
+        config["eval_env_cfg"] = dict(
+            **env_kwargs,
+            num_envs=effective_num_eval_envs,
+            env_id=args.env_id,
+            env_horizon=args.max_episode_steps,
+        )
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -514,7 +678,8 @@ if __name__ == "__main__":
         obs_horizon=args.obs_horizon,
         pred_horizon=args.pred_horizon,
         device=device,
-        num_traj=args.num_demos
+        num_traj=args.num_demos,
+        traj_ids=selected_train_traj_ids,
     )
     debug_sample_idx = 0
     print("Debug printing a sample from the dataset...")
@@ -561,7 +726,14 @@ if __name__ == "__main__":
         if iteration % args.eval_freq == 0:
             last_tick = time.time()
             ema.copy_to(ema_agent.parameters())
-            eval_metrics = evaluate(args.num_eval_episodes, ema_agent, envs, device, args.sim_backend)
+            eval_metrics = evaluate(
+                effective_num_eval_episodes,
+                ema_agent,
+                envs,
+                device,
+                args.sim_backend,
+                reset_kwargs_list=eval_reset_kwargs_list,
+            )
             timings["eval"] += time.time() - last_tick
 
             print(f"Evaluated {len(eval_metrics['success_at_end'])} episodes")

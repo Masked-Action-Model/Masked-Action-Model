@@ -13,7 +13,7 @@ CONDA_ENV="${CONDA_ENV:-maniskill_py311}"
 EXP_NAME="${EXP_NAME:-test_ce}"
 
 ENTRYPOINT="${ENTRYPOINT:-examples/baselines/diffusion_policy/train_mas_window_test.py}"
-ENV_ID="${ENV_ID:-PickCube-v1}"
+ENV_ID="${ENV_ID:-PickCube}"
 RAW_DEMO_H5="${RAW_DEMO_H5:-demos/data_1/data_1.h5}"
 RAW_DEMO_JSON="${RAW_DEMO_JSON:-demos/data_1/data_1.json}"
 PREPROCESSED_ROOT_DIR="${PREPROCESSED_ROOT_DIR:-demos/data_1_preprocessed}"
@@ -44,9 +44,9 @@ EVAL_DEMO_METADATA_PATH="${EVAL_DEMO_METADATA_PATH:-${TRAIN_DEMO_METADATA_PATH}}
 ACTION_NORM_PATH="${ACTION_NORM_PATH:-${DEMO_PATH}}"
 STPM_CONFIG_PATH="${STPM_CONFIG_PATH:-STPM_PickCube/pick up the cube and place it at the goal/config.yaml}"
 STPM_CKPT_PATH="${STPM_CKPT_PATH:-STPM_PickCube/pick up the cube and place it at the goal/checkpoints/reward_best.pt}"
-MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-150}"
-SIM_BACKEND="${SIM_BACKEND:-cuda}"
-NUM_DATALOAD_WORKERS="${NUM_DATALOAD_WORKERS:-4}"
+MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-200}"
+SIM_BACKEND="${SIM_BACKEND:-physx_cpu}"
+NUM_DATALOAD_WORKERS="${NUM_DATALOAD_WORKERS:-0}"
 
 TOTAL_ITERS="${TOTAL_ITERS:-30000}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
@@ -58,12 +58,12 @@ PRED_HORIZON="${PRED_HORIZON:-16}"
 LONG_WINDOW_HORIZON="${LONG_WINDOW_HORIZON:-${PRED_HORIZON}}"
 EVAL_FREQ="${EVAL_FREQ:-5000}"
 LOG_FREQ="${LOG_FREQ:-1000}"
-SHORT_WINDOW_HORIZON="${SHORT_WINDOW_HORIZON:-8}"
+SHORT_WINDOW_HORIZON="${SHORT_WINDOW_HORIZON:-2}"
 MAS_LONG_ENCODE_MODE="${MAS_LONG_ENCODE_MODE:-2DConv}"
 MAS_LONG_CONV_OUTPUT_DIM="${MAS_LONG_CONV_OUTPUT_DIM:-64}"
 SEED="${SEED:-1}"
 CUDA_FLAG="${CUDA_FLAG:---cuda}"
-CAPTURE_VIDEO_FLAG="${CAPTURE_VIDEO_FLAG:---no-capture-video}"
+CAPTURE_VIDEO_FLAG="${CAPTURE_VIDEO_FLAG:---capture-video}"
 
 ensure_preprocessed_dataset() {
   local missing=0
@@ -190,6 +190,38 @@ if not torch.cuda.is_available():
 print(f"[cuda-check] using GPU: {torch.cuda.get_device_name(0)}")
 PY
 fi
+
+echo "[resolved-config] entrypoint=${ENTRYPOINT}"
+echo "[resolved-config] exp_name=${EXP_NAME}"
+echo "[resolved-config] env_id=${ENV_ID}"
+echo "[resolved-config] demo_path=${DEMO_PATH}"
+echo "[resolved-config] test_demo_path=${TEST_DEMO_PATH}"
+echo "[resolved-config] eval_demo_metadata_path=${EVAL_DEMO_METADATA_PATH}"
+echo "[resolved-config] action_norm_path=${ACTION_NORM_PATH}"
+echo "[resolved-config] stpm_ckpt_path=${STPM_CKPT_PATH}"
+echo "[resolved-config] stpm_config_path=${STPM_CONFIG_PATH}"
+echo "[resolved-config] sim_backend=${SIM_BACKEND}"
+echo "[resolved-config] max_episode_steps=${MAX_EPISODE_STEPS}"
+echo "[resolved-config] total_iters=${TOTAL_ITERS}"
+echo "[resolved-config] batch_size=${BATCH_SIZE}"
+echo "[resolved-config] num_demos=${NUM_DEMOS}"
+echo "[resolved-config] num_eval_demos=${NUM_EVAL_DEMOS}"
+echo "[resolved-config] num_eval_episodes=${NUM_EVAL_EPISODES}"
+echo "[resolved-config] num_eval_envs=${NUM_EVAL_ENVS}"
+echo "[resolved-config] pred_horizon=${PRED_HORIZON}"
+echo "[resolved-config] long_window_horizon=${LONG_WINDOW_HORIZON}"
+echo "[resolved-config] short_window_horizon=${SHORT_WINDOW_HORIZON}"
+echo "[resolved-config] mas_long_encode_mode=${MAS_LONG_ENCODE_MODE}"
+echo "[resolved-config] mas_long_conv_output_dim=${MAS_LONG_CONV_OUTPUT_DIM}"
+echo "[resolved-config] num_dataload_workers=${NUM_DATALOAD_WORKERS}"
+echo "[resolved-config] seed=${SEED}"
+echo "[resolved-config] cuda_flag=${CUDA_FLAG}"
+echo "[resolved-config] capture_video_flag=${CAPTURE_VIDEO_FLAG}"
+printf '[resolved-command] python %q' "${ENTRYPOINT}"
+for arg in "${ARGS[@]}"; do
+  printf ' %q' "${arg}"
+done
+printf ' %q %q\n' "${CUDA_FLAG}" "${CAPTURE_VIDEO_FLAG}"
 
 exec "${CONDA_BIN}" run --no-capture-output -n "${CONDA_ENV}" \
   python "${ENTRYPOINT}" \
