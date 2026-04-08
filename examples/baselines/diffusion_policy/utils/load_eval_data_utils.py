@@ -6,13 +6,35 @@ import numpy as np
 import torch
 from h5py import File
 
-from utils.add_progress_to_mas_utils import (
-    augment_mask_with_progress,
-    augment_mas_with_progress,
-    pad_mas_to_length,
-    pad_mask_to_length,
-)
-from utils.load_train_data_utils import load_demo_dataset
+try:
+    from utils.add_progress_to_mas_utils import (
+        augment_mask_with_progress,
+        augment_mas_with_progress,
+        pad_mas_to_length,
+        pad_mask_to_length,
+    )
+    from utils.load_train_data_utils import load_demo_dataset
+except ModuleNotFoundError:
+    from examples.baselines.diffusion_policy.utils.add_progress_to_mas_utils import (
+        augment_mask_with_progress,
+        augment_mas_with_progress,
+        pad_mas_to_length,
+        pad_mask_to_length,
+    )
+    from examples.baselines.diffusion_policy.utils.load_train_data_utils import (
+        load_demo_dataset,
+    )
+
+
+def _decode_string_value(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if isinstance(value, np.ndarray):
+        if value.shape == ():
+            return _decode_string_value(value.item())
+        if value.size == 1:
+            return _decode_string_value(value.reshape(-1)[0])
+    return str(value)
 
 
 def _candidate_metadata_paths(demo_path: str):
@@ -181,6 +203,31 @@ def read_augmented_mas_length(data_path: str, mas_step_dim: int = 8) -> int:
     return inferred_max_length
 
 
+def load_traj_mask_types(data_path: str, num_traj: Optional[int] = None) -> list[str]:
+    with File(data_path, "r") as f:
+        traj_keys = sorted(
+            [k for k in f.keys() if k.startswith("traj_")],
+            key=lambda x: int(x.split("_")[-1]),
+        )
+        if num_traj is not None:
+            traj_keys = traj_keys[:num_traj]
+
+        default_mask_type = None
+        if "meta" in f and "mask_type" in f["meta"]:
+            default_mask_type = _decode_string_value(f["meta"]["mask_type"][()])
+
+        mask_types = []
+        for traj_key in traj_keys:
+            traj_group = f[traj_key]
+            if "mask_type" in traj_group:
+                mask_types.append(_decode_string_value(traj_group["mask_type"][()]))
+            elif default_mask_type is not None:
+                mask_types.append(default_mask_type)
+            else:
+                mask_types.append("unknown")
+    return mask_types
+
+
 def load_eval_only_mas_data(
     data_path: str,
     device: torch.device,
@@ -273,6 +320,7 @@ def load_eval_mas_window_data(
     mas_list = []
     mas_mask_list = []
     traj_lengths = []
+    mask_types = load_traj_mask_types(data_path=data_path, num_traj=num_traj)
     for i in range(len(trajectories["mas"])):
         raw_mas_t = torch.as_tensor(trajectories["mas"][i], device=device, dtype=torch.float32)
         raw_mask_t = torch.as_tensor(trajectories["mask"][i], device=device, dtype=torch.float32)
@@ -290,6 +338,7 @@ def load_eval_mas_window_data(
         "mas": mas_list,
         "mas_mask": mas_mask_list,
         "traj_lengths": traj_lengths,
+        "mask_types": mask_types,
     }
 
 

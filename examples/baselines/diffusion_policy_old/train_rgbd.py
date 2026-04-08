@@ -271,16 +271,22 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             _obs_traj_dict = reorder_keys(obs_traj_dict, obs_space)  # key order in demo is different from key order in env obs
             _obs_traj_dict = obs_process_fn(_obs_traj_dict)
             if self.include_depth:
-                _obs_traj_dict["depth"] = torch.Tensor(_obs_traj_dict["depth"].astype(np.float32)).to(device=device, dtype=torch.float16)
+                _obs_traj_dict["depth"] = torch.as_tensor(
+                    _obs_traj_dict["depth"], dtype=torch.float16
+                )
             if self.include_rgb:
-                _obs_traj_dict["rgb"] = torch.from_numpy(_obs_traj_dict["rgb"]).to(device)  # still uint8
-            _obs_traj_dict["state"] = torch.from_numpy(_obs_traj_dict["state"]).to(device)
+                _obs_traj_dict["rgb"] = torch.from_numpy(_obs_traj_dict["rgb"])  # still uint8
+            _obs_traj_dict["state"] = torch.as_tensor(
+                _obs_traj_dict["state"], dtype=torch.float32
+            )
             obs_traj_dict_list.append(_obs_traj_dict)
         trajectories["observations"] = obs_traj_dict_list
         self.obs_keys = list(_obs_traj_dict.keys())
         # Pre-process the actions
         for i in range(len(trajectories["actions"])):
-            trajectories["actions"][i] = torch.Tensor(trajectories["actions"][i]).to(device=device)
+            trajectories["actions"][i] = torch.as_tensor(
+                trajectories["actions"][i], dtype=torch.float32
+            )
         print("Obs/action pre-processing is done, start to pre-compute the slice indices...")
 
          # Fixed to pd_ee_pose: pad with final action to keep target unchanged.
@@ -538,6 +544,18 @@ def save_ckpt(run_name, tag):
     )
 
 
+def move_batch_to_device(batch, device):
+    out = {}
+    for k, v in batch.items():
+        if isinstance(v, dict):
+            out[k] = move_batch_to_device(v, device)
+        elif torch.is_tensor(v):
+            out[k] = v.to(device, non_blocking=True)
+        else:
+            out[k] = v
+    return out
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
 
@@ -770,6 +788,7 @@ if __name__ == "__main__":
 
         # forward and compute loss
         last_tick = time.time()
+        data_batch = move_batch_to_device(data_batch, device)
         total_loss = agent.compute_loss(
             obs_seq=data_batch["observations"],  # obs_batch_dict['state'] is (B, L, obs_dim)
             action_seq=data_batch["actions"],  # (B, L, act_dim)

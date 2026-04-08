@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Any, Tuple
 
 import numpy as np
 
@@ -31,6 +31,18 @@ SUPPORTED_MASK_TYPES = {
     "local_planner",
     "random_mask",
 }
+MIXED_SUPPORTED_MASK_TYPES = {
+    "none",
+    "full",
+    "2D_video_trajectory",
+    "2D_image_trajectory",
+    "2D_partial_trajectory",
+    "pose_motion_planning",
+    "points",
+    "3D_points",
+    "local_planner",
+    "random_mask",
+}
 
 
 def validate_mask_config(
@@ -56,6 +68,97 @@ def validate_mask_config(
             raise ValueError(
                 f"mask_seq_len must be positive for {mask_type!r}, got {mask_seq_len}"
             )
+
+
+def build_mask_spec(
+    mask_type: str,
+    raw_param: Any = None,
+    ratio: float = 1.0,
+) -> dict[str, Any]:
+    if mask_type not in MIXED_SUPPORTED_MASK_TYPES:
+        raise ValueError(
+            f"Unsupported mixed mask_type={mask_type!r}. Supported: "
+            f"{sorted(MIXED_SUPPORTED_MASK_TYPES)}"
+        )
+    ratio = float(ratio)
+    if not (0.0 <= ratio <= 1.0):
+        raise ValueError(f"mask ratio must be in [0, 1], got {ratio} for {mask_type!r}")
+
+    retain_ratio = None
+    mask_seq_len = None
+    if mask_type in MASK_TYPES_REQUIRING_RATIO:
+        if raw_param is None:
+            raise ValueError(f"mask_type={mask_type!r} requires retain_ratio")
+        retain_ratio = float(raw_param)
+        if not (0.0 < retain_ratio <= 1.0):
+            raise ValueError(
+                f"retain_ratio must be in (0, 1], got {retain_ratio} for {mask_type!r}"
+            )
+    elif mask_type in MASK_TYPES_REQUIRING_SEQ_LEN:
+        if raw_param is None:
+            raise ValueError(f"mask_type={mask_type!r} requires mask_seq_len")
+        try:
+            mask_seq_len = int(raw_param)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"mask_seq_len must be an integer-like value for {mask_type!r}, got {raw_param!r}"
+            ) from exc
+        if not (1 <= mask_seq_len <= 100):
+            raise ValueError(
+                f"mask_seq_len must be in [1, 100], got {mask_seq_len} for {mask_type!r}"
+            )
+
+    validate_mask_config(
+        mask_type=mask_type,
+        retain_ratio=retain_ratio,
+        mask_seq_len=mask_seq_len,
+    )
+    return {
+        "mask_type": mask_type,
+        "ratio": ratio,
+        "retain_ratio": retain_ratio,
+        "mask_seq_len": mask_seq_len,
+    }
+
+
+def validate_mixed_mask_config(
+    num_mask_type: int,
+    mask_type_list: list[str],
+    mask_type_ratio_list: list[float],
+    mask_param_list: list[Any],
+) -> None:
+    if int(num_mask_type) < 0:
+        raise ValueError(f"num_mask_type must be non-negative, got {num_mask_type}")
+    if int(num_mask_type) == 0:
+        if len(mask_type_list) != 0 or len(mask_type_ratio_list) != 0 or len(mask_param_list) != 0:
+            raise ValueError(
+                "num_mask_type=0 expects empty mask_type_list/mask_type_ratio_list/mask_param_list"
+            )
+        return
+
+    if len(mask_type_list) != int(num_mask_type):
+        raise ValueError(
+            f"len(mask_type_list)={len(mask_type_list)} != num_mask_type={num_mask_type}"
+        )
+    if len(mask_type_ratio_list) != int(num_mask_type):
+        raise ValueError(
+            f"len(mask_type_ratio_list)={len(mask_type_ratio_list)} != num_mask_type={num_mask_type}"
+        )
+    if len(mask_param_list) != int(num_mask_type):
+        raise ValueError(
+            f"len(mask_param_list)={len(mask_param_list)} != num_mask_type={num_mask_type}"
+        )
+
+    total_ratio = 0.0
+    for mask_type, ratio, raw_param in zip(
+        mask_type_list, mask_type_ratio_list, mask_param_list
+    ):
+        spec = build_mask_spec(mask_type=mask_type, raw_param=raw_param, ratio=ratio)
+        total_ratio += float(spec["ratio"])
+    if not np.isclose(total_ratio, 1.0, atol=1e-6):
+        raise ValueError(
+            f"mask_type_ratio_list must sum to 1, got {total_ratio:.8f}"
+        )
 
 
 def _ensure_2d_action(action: np.ndarray) -> np.ndarray:

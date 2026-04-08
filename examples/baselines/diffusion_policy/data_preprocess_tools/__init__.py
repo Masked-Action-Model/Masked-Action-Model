@@ -5,7 +5,12 @@ from .io_utils import (
     write_json,
     write_string_dataset,
 )
-from .mask_utils import apply_mask_to_actions, validate_mask_config
+from .mask_utils import (
+    apply_mask_to_actions,
+    build_mask_spec,
+    validate_mask_config,
+    validate_mixed_mask_config,
+)
 from .normalize_utils import (
     compute_global_min_max,
     load_action_stats_from_path,
@@ -26,6 +31,7 @@ __all__ = [
     "MAS_ACTION_DIM",
     "MAS_STEP_DIM",
     "apply_mask_to_actions",
+    "build_mask_spec",
     "augment_mas_with_progress_np",
     "augment_mas_with_progress_torch",
     "build_default_state_obs_extractor",
@@ -40,6 +46,7 @@ __all__ = [
     "pad_augmented_mas_torch",
     "read_json",
     "validate_mask_config",
+    "validate_mixed_mask_config",
     "write_json",
     "write_string_dataset",
 ]

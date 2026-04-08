@@ -29,10 +29,45 @@ def _scalar_int(value) -> int:
     return int(_to_numpy(value).reshape(-1)[0])
 
 
-def _extract_final_episode_records(info: dict) -> list[dict]:
-    if isinstance(info["final_info"], dict):
-        return [info["final_info"]["episode"]]
-    return [final_info["episode"] for final_info in info["final_info"]]
+def _infer_batched_env_count(episode_info: dict) -> int:
+    for value in episode_info.values():
+        array = _to_numpy(value)
+        if array.ndim >= 1:
+            return int(array.shape[0])
+    return 1
+
+
+def _slice_episode_value(value, env_idx: int, total_envs: int):
+    if torch.is_tensor(value):
+        if value.ndim >= 1 and value.shape[0] == total_envs:
+            return value[env_idx]
+        return value
+    array = np.asarray(value)
+    if array.ndim >= 1 and array.shape[0] == total_envs:
+        return array[env_idx]
+    return value
+
+
+def _extract_final_episode_records(info: dict, num_envs: int | None = None) -> list[dict]:
+    final_info = info["final_info"]
+    if not isinstance(final_info, dict):
+        return [one_final_info["episode"] for one_final_info in final_info]
+
+    episode_info = final_info["episode"]
+    total_envs = int(num_envs or _infer_batched_env_count(episode_info))
+    done_mask = info.get("_final_info", None)
+    if done_mask is None:
+        done_indices = list(range(total_envs))
+    else:
+        done_mask = _to_numpy(done_mask).reshape(-1).astype(bool)
+        done_indices = np.flatnonzero(done_mask).tolist()
+    return [
+        {
+            key: _slice_episode_value(value, env_idx, total_envs)
+            for key, value in episode_info.items()
+        }
+        for env_idx in done_indices
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -188,8 +223,15 @@ def evaluate_mas_window(
                 append_episode_metrics(eval_metrics, info)
                 completed_traj_ids = traj_ids.clone()
                 final_episodes = (
-                    _extract_final_episode_records(info) if return_rollout_records else None
+                    _extract_final_episode_records(info, num_envs=num_envs)
+                    if (return_progress_curves or return_rollout_records)
+                    else None
                 )
+                if final_episodes is not None and len(final_episodes) != num_envs:
+                    raise ValueError(
+                        "final episode record count does not match num_envs: "
+                        f"{len(final_episodes)} vs {num_envs}"
+                    )
 
                 if return_progress_curves:
                     final_progress = predict_current_progress_from_histories(
@@ -202,23 +244,9 @@ def evaluate_mas_window(
                         target_device=obs["state"].device,
                         target_dtype=obs["state"].dtype,
                     )[:, 0]
-                    if isinstance(info["final_info"], dict):
-                        success_flags = [
-                            bool(
-                                np.asarray(
-                                    info["final_info"]["episode"]["success_at_end"]
-                                ).reshape(-1)[0]
-                            )
-                        ]
-                    else:
-                        success_flags = [
-                            bool(
-                                np.asarray(final_info["episode"]["success_at_end"]).reshape(
-                                    -1
-                                )[0]
-                            )
-                            for final_info in info["final_info"]
-                        ]
+                    success_flags = [
+                        _scalar_bool(episode["success_at_end"]) for episode in final_episodes
+                    ]
 
                     for env_idx in range(num_envs):
                         final_step = int(step_ptr[env_idx].item())

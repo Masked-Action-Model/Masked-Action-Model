@@ -1,84 +1,74 @@
 #!/bin/bash
 set -euo pipefail
 
-# Train script for examples/baselines/diffusion_policy/train_mas_window.py
-# Override any value by exporting the variable before running this script.
-# Online control error is computed automatically during each eval round and
-# reuses the existing eval demo / action norm / STPM arguments below.
-
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "${ROOT_DIR}"
 
 export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
 
-
-EXP_NAME="${EXP_NAME:-PickCube}"
+EXP_NAME="${EXP_NAME:-PickCube_window_mixed}"
 SEED="${SEED:-1}"
 TORCH_DETERMINISTIC="${TORCH_DETERMINISTIC:-true}"
 CUDA="${CUDA:-true}"
 TRACK="${TRACK:-false}"
 WANDB_PROJECT_NAME="${WANDB_PROJECT_NAME:-ManiSkill}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
-CAPTURE_VIDEO="${CAPTURE_VIDEO:-true}"
+CAPTURE_VIDEO="${CAPTURE_VIDEO:-false}"
 
 ENV_ID="${ENV_ID:-PickCube-v1}"
 RAW_DEMO_H5="${RAW_DEMO_H5:-demos/data_1/data_1.h5}"
 RAW_DEMO_JSON="${RAW_DEMO_JSON:-demos/data_1/data_1.json}"
 PREPROCESSED_ROOT_DIR="${PREPROCESSED_ROOT_DIR:-demos/data_1_preprocessed}"
-PREPROCESS_MASK_TYPE="${PREPROCESS_MASK_TYPE:-random_mask}"
-PREPROCESS_RETAIN_RATIO="${PREPROCESS_RETAIN_RATIO:-0.2}"
-PREPROCESS_MASK_SEQ_LEN="${PREPROCESS_MASK_SEQ_LEN:-20}"
+PREPROCESSED_DATA_DIR="${PREPROCESSED_DATA_DIR:-${PREPROCESSED_ROOT_DIR}/mixed}"
+PREPROCESSED_DATA_PREFIX="${PREPROCESSED_DATA_PREFIX:-data_1}"
+
+NUM_MASK_TYPE="${NUM_MASK_TYPE:-2}"
+MASK_TYPE_LIST=${MASK_TYPE_LIST:-'["random_mask","points"]'}
+MASK_TYPE_RATIO_LIST=${MASK_TYPE_RATIO_LIST:-'[0.5,0.5]'}
+MASK_PARAM_LIST=${MASK_PARAM_LIST:-'[0.2,0.2]'}
 PREPROCESS_MASK_VALUE="${PREPROCESS_MASK_VALUE:-0}"
 PREPROCESS_NUM_TRAJ="${PREPROCESS_NUM_TRAJ:-}"
-PREPROCESSED_DATA_PREFIX="${PREPROCESSED_DATA_PREFIX:-data_1}"
-case "$PREPROCESS_MASK_TYPE" in
-  pose_AnyGrasp|pose_motion_planning|points|3D_points|random_mask)
-    PREPROCESS_DIR_SUFFIX="${PREPROCESS_MASK_TYPE}_${PREPROCESS_RETAIN_RATIO}"
-    ;;
-  2D_partial_trajectory|local_planner)
-    PREPROCESS_DIR_SUFFIX="${PREPROCESS_MASK_TYPE}_seq${PREPROCESS_MASK_SEQ_LEN}"
-    ;;
-  2D_video_trajectory|2D_image_trajectory)
-    PREPROCESS_DIR_SUFFIX="${PREPROCESS_MASK_TYPE}"
-    ;;
-  *)
-    PREPROCESS_DIR_SUFFIX="${PREPROCESS_MASK_TYPE}"
-    ;;
-esac
-PREPROCESSED_DATA_DIR="${PREPROCESSED_DATA_DIR:-${PREPROCESSED_ROOT_DIR}/${PREPROCESS_DIR_SUFFIX}}"
-PREPROCESSED_FILE_STEM="${PREPROCESSED_FILE_STEM:-${PREPROCESSED_DATA_PREFIX}_${PREPROCESS_DIR_SUFFIX}}"
-DEMO_PATH="${DEMO_PATH:-${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_train.h5}"
-TEST_DEMO_PATH="${TEST_DEMO_PATH:-${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_eval.h5}"
-EVAL_DEMO_METADATA_PATH="${EVAL_DEMO_METADATA_PATH:-${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_eval.json}"
-TRAIN_DEMO_METADATA_PATH="${TRAIN_DEMO_METADATA_PATH:-${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_train.json}"
+
 STPM_CONFIG_PATH="${STPM_CONFIG_PATH:-STPM_PickCube/pick up the cube and place it at the goal/config.yaml}"
 STPM_CKPT_PATH="${STPM_CKPT_PATH:-STPM_PickCube/pick up the cube and place it at the goal/checkpoints/reward_best.pt}"
-NUM_DEMOS="${NUM_DEMOS:-100}"
-TOTAL_ITERS="${TOTAL_ITERS:-1000000}"
-BATCH_SIZE="${BATCH_SIZE:-32}"
 
+NUM_DEMOS="${NUM_DEMOS:-100}"
+TOTAL_ITERS="${TOTAL_ITERS:-200}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
 LR="${LR:-1e-4}"
 OBS_HORIZON="${OBS_HORIZON:-2}"
 ACT_HORIZON="${ACT_HORIZON:-8}"
 PRED_HORIZON="${PRED_HORIZON:-16}"
 LONG_WINDOW_HORIZON="${LONG_WINDOW_HORIZON:-${PRED_HORIZON}}"
 DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-64}"
-SHORT_WINDOW_HORIZON="${SHORT_WINDOW_HORIZON:-8}"
+SHORT_WINDOW_HORIZON="${SHORT_WINDOW_HORIZON:-2}"
 MAS_LONG_ENCODE_MODE="${MAS_LONG_ENCODE_MODE:-2DConv}"
 MAS_LONG_CONV_OUTPUT_DIM="${MAS_LONG_CONV_OUTPUT_DIM:-64}"
 
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-100}"
-LOG_FREQ="${LOG_FREQ:-1000}"
-EVAL_FREQ="${EVAL_FREQ:-1000}"
-SAVE_FREQ="${SAVE_FREQ:-}"
+LOG_FREQ="${LOG_FREQ:-100}"
+EVAL_FREQ="${EVAL_FREQ:-100}"
+SAVE_FREQ="${SAVE_FREQ:-100}"
 NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-100}"
 NUM_EVAL_DEMOS="${NUM_EVAL_DEMOS:-100}"
 NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-10}"
-ACTION_NORM_PATH="${ACTION_NORM_PATH:-${DEMO_PATH}}"
-SIM_BACKEND="${SIM_BACKEND:-physx_cpu}"
+SIM_BACKEND="${SIM_BACKEND:-gpu}"
 NUM_DATALOAD_WORKERS="${NUM_DATALOAD_WORKERS:-0}"
 CONTROL_MODE="${CONTROL_MODE:-pd_ee_pose}"
 DEMO_TYPE="${DEMO_TYPE:-}"
+
+export NUM_MASK_TYPE MASK_TYPE_LIST MASK_TYPE_RATIO_LIST MASK_PARAM_LIST PREPROCESSED_DATA_PREFIX
+
+compute_mixed_file_stem() {
+  python -c 'import os; from types import SimpleNamespace; from examples.baselines.diffusion_policy.data_preprocess_mixed import build_output_stem, normalize_mixed_mask_config; args = SimpleNamespace(num_mask_type=int(os.environ["NUM_MASK_TYPE"]), mask_type_list=os.environ["MASK_TYPE_LIST"], mask_type_ratio_list=os.environ["MASK_TYPE_RATIO_LIST"], mask_param_list=os.environ["MASK_PARAM_LIST"]); print(build_output_stem(os.environ["PREPROCESSED_DATA_PREFIX"], normalize_mixed_mask_config(args)))'
+}
+
+PREPROCESSED_FILE_STEM="${PREPROCESSED_FILE_STEM:-$(compute_mixed_file_stem)}"
+DEMO_PATH="${DEMO_PATH:-${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_train.h5}"
+TEST_DEMO_PATH="${TEST_DEMO_PATH:-${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_eval.h5}"
+EVAL_DEMO_METADATA_PATH="${EVAL_DEMO_METADATA_PATH:-${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_eval.json}"
+TRAIN_DEMO_METADATA_PATH="${TRAIN_DEMO_METADATA_PATH:-${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_train.json}"
+ACTION_NORM_PATH="${ACTION_NORM_PATH:-${DEMO_PATH}}"
 
 ensure_preprocessed_dataset() {
   local missing=0
@@ -90,7 +80,7 @@ ensure_preprocessed_dataset() {
   done
 
   if [[ "$missing" -eq 0 ]]; then
-    echo "[preprocess] reuse existing dataset: ${PREPROCESSED_DATA_DIR}"
+    echo "[mixed-preprocess] reuse existing dataset: ${PREPROCESSED_DATA_DIR}"
     return
   fi
 
@@ -104,28 +94,23 @@ ensure_preprocessed_dataset() {
   fi
 
   mkdir -p "$PREPROCESSED_DATA_DIR"
-  echo "[preprocess] generating dataset into ${PREPROCESSED_DATA_DIR}"
+  echo "[mixed-preprocess] generating dataset into ${PREPROCESSED_DATA_DIR}"
   PREPROCESS_ARGS=(
     --input-h5 "$RAW_DEMO_H5"
     --input-json "$RAW_DEMO_JSON"
     --output-dir "$PREPROCESSED_DATA_DIR"
     --output-prefix "$PREPROCESSED_DATA_PREFIX"
     --env-id "$ENV_ID"
-    --mask-type "$PREPROCESS_MASK_TYPE"
+    --num-mask-type "$NUM_MASK_TYPE"
+    --mask-type-list "$MASK_TYPE_LIST"
+    --mask-type-ratio-list "$MASK_TYPE_RATIO_LIST"
+    --mask-param-list "$MASK_PARAM_LIST"
+    --mask-value "$PREPROCESS_MASK_VALUE"
   )
-  if [[ -n "$PREPROCESS_RETAIN_RATIO" ]]; then
-    PREPROCESS_ARGS+=(--retain-ratio "$PREPROCESS_RETAIN_RATIO")
-  fi
-  if [[ -n "$PREPROCESS_MASK_SEQ_LEN" ]]; then
-    PREPROCESS_ARGS+=(--mask-seq-len "$PREPROCESS_MASK_SEQ_LEN")
-  fi
-  if [[ -n "$PREPROCESS_MASK_VALUE" ]]; then
-    PREPROCESS_ARGS+=(--mask-value "$PREPROCESS_MASK_VALUE")
-  fi
   if [[ -n "$PREPROCESS_NUM_TRAJ" ]]; then
     PREPROCESS_ARGS+=(--num-traj "$PREPROCESS_NUM_TRAJ")
   fi
-  python examples/baselines/diffusion_policy/data_preprocess.py "${PREPROCESS_ARGS[@]}"
+  python examples/baselines/diffusion_policy/data_preprocess_mixed.py "${PREPROCESS_ARGS[@]}"
 }
 
 ensure_preprocessed_dataset
@@ -195,7 +180,7 @@ if [[ ! -f "$DEMO_PATH" ]]; then
   exit 1
 fi
 if [[ -z "$TEST_DEMO_PATH" ]]; then
-  echo "ERROR: TEST_DEMO_PATH is required"
+  echo "ERROR: TEST_DEMO_PATH is required" >&2
   exit 1
 fi
 if [[ ! -f "$TEST_DEMO_PATH" ]]; then
@@ -214,14 +199,7 @@ if [[ ! -f "$STPM_CKPT_PATH" ]]; then
   echo "ERROR: STPM checkpoint file not found: $STPM_CKPT_PATH" >&2
   exit 1
 fi
-if [[ -z "$ACTION_NORM_PATH" ]]; then
-  echo "缺少 ACTION_NORM_PATH。" >&2
-  echo "示例：" >&2
-  echo "  ACTION_NORM_PATH=$DEMO_PATH \\" >&2
-  echo "  bash examples/baselines/diffusion_policy/run_train_mas_window.sh" >&2
-  exit 2
-fi
-if [[ ! -f "$ACTION_NORM_PATH" ]]; then
+if [[ -z "$ACTION_NORM_PATH" || ! -f "$ACTION_NORM_PATH" ]]; then
   echo "ERROR: action norm path not found: $ACTION_NORM_PATH" >&2
   exit 1
 fi
@@ -235,4 +213,4 @@ if [[ -n "$DEMO_TYPE" ]]; then
   ARGS+=(--demo-type "$DEMO_TYPE")
 fi
 
-python examples/baselines/diffusion_policy/train_mas_window.py "${ARGS[@]}"
+python examples/baselines/diffusion_policy/train_mas_window_mixed.py "${ARGS[@]}"

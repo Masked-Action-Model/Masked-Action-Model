@@ -33,14 +33,21 @@ def load_hdf5(path):
     return ret
 
 
-def load_traj_hdf5(path, num_traj=None):
+def load_traj_hdf5(path, num_traj=None, traj_indices=None):
     print("Loading HDF5 file", path)
     file = File(path, "r")
     keys = sorted(
         [k for k in file.keys() if k.startswith("traj_")],
         key=lambda x: int(x.split("_")[-1]),
     )
-    if num_traj is not None:
+    if traj_indices is not None:
+        selected_keys = []
+        for idx in traj_indices:
+            idx = int(idx)
+            assert 0 <= idx < len(keys), f"traj_idx out of range: {idx} not in [0, {len(keys)})"
+            selected_keys.append(keys[idx])
+        keys = selected_keys
+    elif num_traj is not None:
         assert num_traj <= len(keys), f"num_traj: {num_traj} > len(keys): {len(keys)}"
         keys = keys[:num_traj]
     ret = {key: load_content_from_h5_file(file[key]) for key in keys}
@@ -62,8 +69,8 @@ def load_dataset_meta(path):
     return ret
 
 
-def load_demo_dataset(path, keys=["observations", "actions"], num_traj=None, concat=True):
-    raw_data = load_traj_hdf5(path, num_traj)
+def load_demo_dataset(path, keys=["observations", "actions"], num_traj=None, concat=True, traj_indices=None):
+    raw_data = load_traj_hdf5(path, num_traj=num_traj, traj_indices=traj_indices)
     ordered_traj_keys = sorted(raw_data.keys(), key=lambda x: int(x.split("_")[-1]))
     first_key = ordered_traj_keys[0]
     _traj = raw_data[first_key]
