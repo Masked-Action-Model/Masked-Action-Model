@@ -22,10 +22,14 @@ PREPROCESSED_ROOT_DIR="${PREPROCESSED_ROOT_DIR:-demos/data_1_preprocessed}"
 PREPROCESSED_DATA_DIR="${PREPROCESSED_DATA_DIR:-${PREPROCESSED_ROOT_DIR}/mixed}"
 PREPROCESSED_DATA_PREFIX="${PREPROCESSED_DATA_PREFIX:-data_1}"
 
-NUM_MASK_TYPE="${NUM_MASK_TYPE:-2}"
-MASK_TYPE_LIST=${MASK_TYPE_LIST:-'["random_mask","points"]'}
-MASK_TYPE_RATIO_LIST=${MASK_TYPE_RATIO_LIST:-'[0.5,0.5]'}
-MASK_PARAM_LIST=${MASK_PARAM_LIST:-'[0.2,0.2]'}
+TRAIN_NUM_MASK_TYPE="${TRAIN_NUM_MASK_TYPE:-${NUM_MASK_TYPE:-2}}"
+TRAIN_MASK_TYPE_LIST=${TRAIN_MASK_TYPE_LIST:-${MASK_TYPE_LIST:-'["random_mask","points"]'}}
+TRAIN_MASK_TYPE_RATIO_LIST=${TRAIN_MASK_TYPE_RATIO_LIST:-${MASK_TYPE_RATIO_LIST:-'[0.5,0.5]'}}
+TRAIN_MASK_PARAM_LIST=${TRAIN_MASK_PARAM_LIST:-${MASK_PARAM_LIST:-'[0.2,0.2]'}}
+EVAL_NUM_MASK_TYPE="${EVAL_NUM_MASK_TYPE:-${TRAIN_NUM_MASK_TYPE}}"
+EVAL_MASK_TYPE_LIST=${EVAL_MASK_TYPE_LIST:-${TRAIN_MASK_TYPE_LIST}}
+EVAL_MASK_TYPE_RATIO_LIST=${EVAL_MASK_TYPE_RATIO_LIST:-${TRAIN_MASK_TYPE_RATIO_LIST}}
+EVAL_MASK_PARAM_LIST=${EVAL_MASK_PARAM_LIST:-${TRAIN_MASK_PARAM_LIST}}
 PREPROCESS_MASK_VALUE="${PREPROCESS_MASK_VALUE:-0}"
 PREPROCESS_NUM_TRAJ="${PREPROCESS_NUM_TRAJ:-}"
 
@@ -57,10 +61,13 @@ NUM_DATALOAD_WORKERS="${NUM_DATALOAD_WORKERS:-0}"
 CONTROL_MODE="${CONTROL_MODE:-pd_ee_pose}"
 DEMO_TYPE="${DEMO_TYPE:-}"
 
-export NUM_MASK_TYPE MASK_TYPE_LIST MASK_TYPE_RATIO_LIST MASK_PARAM_LIST PREPROCESSED_DATA_PREFIX
+export \
+  TRAIN_NUM_MASK_TYPE TRAIN_MASK_TYPE_LIST TRAIN_MASK_TYPE_RATIO_LIST TRAIN_MASK_PARAM_LIST \
+  EVAL_NUM_MASK_TYPE EVAL_MASK_TYPE_LIST EVAL_MASK_TYPE_RATIO_LIST EVAL_MASK_PARAM_LIST \
+  PREPROCESSED_DATA_PREFIX
 
 compute_mixed_file_stem() {
-  python -c 'import os; from types import SimpleNamespace; from examples.baselines.diffusion_policy.data_preprocess_mixed import build_output_stem, normalize_mixed_mask_config; args = SimpleNamespace(num_mask_type=int(os.environ["NUM_MASK_TYPE"]), mask_type_list=os.environ["MASK_TYPE_LIST"], mask_type_ratio_list=os.environ["MASK_TYPE_RATIO_LIST"], mask_param_list=os.environ["MASK_PARAM_LIST"]); print(build_output_stem(os.environ["PREPROCESSED_DATA_PREFIX"], normalize_mixed_mask_config(args)))'
+  python -c 'import os; from types import SimpleNamespace; from examples.baselines.diffusion_policy.data_preprocess_mixed import build_output_stem, normalize_split_mask_config; args = SimpleNamespace(train_num_mask_type=int(os.environ["TRAIN_NUM_MASK_TYPE"]), train_mask_type_list=os.environ["TRAIN_MASK_TYPE_LIST"], train_mask_type_ratio_list=os.environ["TRAIN_MASK_TYPE_RATIO_LIST"], train_mask_param_list=os.environ["TRAIN_MASK_PARAM_LIST"], eval_num_mask_type=int(os.environ["EVAL_NUM_MASK_TYPE"]), eval_mask_type_list=os.environ["EVAL_MASK_TYPE_LIST"], eval_mask_type_ratio_list=os.environ["EVAL_MASK_TYPE_RATIO_LIST"], eval_mask_param_list=os.environ["EVAL_MASK_PARAM_LIST"]); print(build_output_stem(os.environ["PREPROCESSED_DATA_PREFIX"], normalize_split_mask_config(args, "train"), normalize_split_mask_config(args, "eval")))'
 }
 
 PREPROCESSED_FILE_STEM="${PREPROCESSED_FILE_STEM:-$(compute_mixed_file_stem)}"
@@ -101,10 +108,14 @@ ensure_preprocessed_dataset() {
     --output-dir "$PREPROCESSED_DATA_DIR"
     --output-prefix "$PREPROCESSED_DATA_PREFIX"
     --env-id "$ENV_ID"
-    --num-mask-type "$NUM_MASK_TYPE"
-    --mask-type-list "$MASK_TYPE_LIST"
-    --mask-type-ratio-list "$MASK_TYPE_RATIO_LIST"
-    --mask-param-list "$MASK_PARAM_LIST"
+    --train-num-mask-type "$TRAIN_NUM_MASK_TYPE"
+    --train-mask-type-list "$TRAIN_MASK_TYPE_LIST"
+    --train-mask-type-ratio-list "$TRAIN_MASK_TYPE_RATIO_LIST"
+    --train-mask-param-list "$TRAIN_MASK_PARAM_LIST"
+    --eval-num-mask-type "$EVAL_NUM_MASK_TYPE"
+    --eval-mask-type-list "$EVAL_MASK_TYPE_LIST"
+    --eval-mask-type-ratio-list "$EVAL_MASK_TYPE_RATIO_LIST"
+    --eval-mask-param-list "$EVAL_MASK_PARAM_LIST"
     --mask-value "$PREPROCESS_MASK_VALUE"
   )
   if [[ -n "$PREPROCESS_NUM_TRAJ" ]]; then

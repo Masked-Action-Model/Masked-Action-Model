@@ -58,6 +58,7 @@ from utils.draw_p_t_curve_utils import (
 )
 from utils.load_eval_data_utils import (infer_eval_reset_seeds_from_demo,
                                   infer_eval_traj_ids_from_demo,
+                                  load_traj_mask_type_slots,
                                   load_traj_mask_types,
                                   subset_eval_data)
 from utils.load_train_data_utils import load_dataset_meta, load_demo_dataset
@@ -892,10 +893,10 @@ def build_eval_batch_indices(total_items: int, batch_size: int):
     return batches
 
 
-def summarize_mask_type_counts(mask_types):
+def summarize_label_counts(labels):
     counts = defaultdict(int)
-    for mask_type in mask_types:
-        counts[str(mask_type)] += 1
+    for label in labels:
+        counts[str(label)] += 1
     return dict(sorted(counts.items(), key=lambda item: item[0]))
 
 
@@ -908,20 +909,28 @@ def _decode_meta_string(value):
     return str(value)
 
 
-def load_target_mask_ratio_by_type(data_path: str) -> dict[str, float] | None:
+def load_target_mask_ratio_entries(data_path: str) -> list[tuple[str, float]] | None:
     meta = load_dataset_meta(data_path)
     mixed_enabled = _meta_flag(meta, "mixed_mask_enabled", False)
     if not mixed_enabled:
         return None
-    if "mask_type_list_json" not in meta or "mask_type_ratio_list_json" not in meta:
-        return None
-    mask_types = json.loads(_decode_meta_string(meta["mask_type_list_json"]))
-    ratios = json.loads(_decode_meta_string(meta["mask_type_ratio_list_json"]))
-    if len(mask_types) != len(ratios):
-        raise ValueError(
-            f"mask_type_list_json/mask_type_ratio_list_json length mismatch in {data_path}"
-        )
-    return {str(mask_type): float(ratio) for mask_type, ratio in zip(mask_types, ratios)}
+    if "mask_slot_name_list_json" in meta and "mask_slot_ratio_list_json" in meta:
+        labels = json.loads(_decode_meta_string(meta["mask_slot_name_list_json"]))
+        ratios = json.loads(_decode_meta_string(meta["mask_slot_ratio_list_json"]))
+        if len(labels) != len(ratios):
+            raise ValueError(
+                f"mask_slot_name_list_json/mask_slot_ratio_list_json length mismatch in {data_path}"
+            )
+        return [(str(label), float(ratio)) for label, ratio in zip(labels, ratios)]
+    if "mask_type_list_json" in meta and "mask_type_ratio_list_json" in meta:
+        labels = json.loads(_decode_meta_string(meta["mask_type_list_json"]))
+        ratios = json.loads(_decode_meta_string(meta["mask_type_ratio_list_json"]))
+        if len(labels) != len(ratios):
+            raise ValueError(
+                f"mask_type_list_json/mask_type_ratio_list_json length mismatch in {data_path}"
+            )
+        return [(str(label), float(ratio)) for label, ratio in zip(labels, ratios)]
+    return None
 
 
 def largest_remainder_counts(total_items: int, ratios: list[float]) -> list[int]:
@@ -943,47 +952,57 @@ def largest_remainder_counts(total_items: int, ratios: list[float]) -> list[int]
 
 
 def stratified_select_demo_indices(
-    mask_types: list[str],
+    labels: list[str],
     num_select: int | None,
     seed: int,
-    target_ratio_by_type: dict[str, float] | None = None,
+    target_ratio_entries: list[tuple[str, float]] | None = None,
 ) -> list[int]:
-    total_items = len(mask_types)
+    total_items = len(labels)
     if num_select is None or num_select >= total_items:
         return list(range(total_items))
     if num_select <= 0:
         return []
 
     grouped_indices = defaultdict(list)
-    for idx, mask_type in enumerate(mask_types):
-        grouped_indices[str(mask_type)].append(int(idx))
+    for idx, label in enumerate(labels):
+        grouped_indices[str(label)].append(int(idx))
 
-    if target_ratio_by_type is None:
-        ordered_mask_types = sorted(grouped_indices.keys())
-        ratios = [len(grouped_indices[mask_type]) / float(total_items) for mask_type in ordered_mask_types]
+    if target_ratio_entries is None:
+        ordered_labels = sorted(grouped_indices.keys())
+        target_items = [
+            (label, len(grouped_indices[label]) / float(total_items))
+            for label in ordered_labels
+        ]
     else:
-        ordered_mask_types = []
-        ratios = []
-        for mask_type, ratio in target_ratio_by_type.items():
-            if mask_type not in grouped_indices:
+        target_items = []
+        for label, ratio in target_ratio_entries:
+            label = str(label)
+            if label not in grouped_indices:
                 raise ValueError(
-                    f"mask_type={mask_type!r} from meta ratios not found in dataset selection"
+                    f"label={label!r} from meta ratios not found in dataset selection"
                 )
-            ordered_mask_types.append(str(mask_type))
-            ratios.append(float(ratio))
+            target_items.append((label, float(ratio)))
 
-    target_counts = largest_remainder_counts(num_select, ratios)
+    target_counts = largest_remainder_counts(
+        num_select, [ratio for _, ratio in target_items]
+    )
     rng = np.random.default_rng(seed)
+    shuffled_grouped_indices = {}
+    for label, candidates in grouped_indices.items():
+        shuffled_candidates = list(candidates)
+        rng.shuffle(shuffled_candidates)
+        shuffled_grouped_indices[label] = shuffled_candidates
+
     selected = []
-    for mask_type, target_count in zip(ordered_mask_types, target_counts):
-        candidates = list(grouped_indices[mask_type])
+    for (label, _), target_count in zip(target_items, target_counts):
+        candidates = shuffled_grouped_indices[label]
         if target_count > len(candidates):
             raise ValueError(
-                f"Cannot sample {target_count} demos for mask_type={mask_type!r}; "
+                f"Cannot sample {target_count} demos for label={label!r}; "
                 f"only {len(candidates)} available"
             )
-        rng.shuffle(candidates)
         selected.extend(candidates[:target_count])
+        del candidates[:target_count]
 
     if len(selected) != num_select:
         raise AssertionError(
@@ -1055,7 +1074,11 @@ if __name__ == "__main__":
         eval_demo_path,
         num_traj=None,
     )
-    eval_target_ratio_by_type = load_target_mask_ratio_by_type(eval_demo_path)
+    eval_mask_type_slots_all = load_traj_mask_type_slots(
+        eval_demo_path,
+        num_traj=None,
+    )
+    eval_target_ratio_entries = load_target_mask_ratio_entries(eval_demo_path)
     if len(eval_reset_seeds) == 0:
         raise ValueError(
             "Failed to infer evaluation reset seeds from eval demo metadata. "
@@ -1063,11 +1086,16 @@ if __name__ == "__main__":
         )
     print(f"[seed-infer] auto inferred {len(eval_reset_seeds)} eval seeds")
     total_eval_demos = len(eval_traj_ids) if len(eval_traj_ids) > 0 else len(eval_reset_seeds)
+    eval_selection_labels = (
+        eval_mask_type_slots_all
+        if len(eval_mask_type_slots_all) == len(eval_mask_types_all)
+        else eval_mask_types_all
+    )
     eval_demo_indices = stratified_select_demo_indices(
-        mask_types=eval_mask_types_all[:total_eval_demos],
+        labels=eval_selection_labels[:total_eval_demos],
         num_select=min(total_eval_demos, args.num_eval_demos),
         seed=args.seed,
-        target_ratio_by_type=eval_target_ratio_by_type,
+        target_ratio_entries=eval_target_ratio_entries,
     )
     if len(eval_reset_seeds) > 0:
         eval_reset_seeds = [
@@ -1176,14 +1204,24 @@ if __name__ == "__main__":
         data_path=args.demo_path,
         num_traj=None,
     )
-    train_target_ratio_by_type = load_target_mask_ratio_by_type(args.demo_path)
+    train_mask_type_slots_all = load_traj_mask_type_slots(
+        data_path=args.demo_path,
+        num_traj=None,
+    )
+    train_target_ratio_entries = load_target_mask_ratio_entries(args.demo_path)
+    train_selection_labels = (
+        train_mask_type_slots_all
+        if len(train_mask_type_slots_all) == len(train_mask_types_all)
+        else train_mask_types_all
+    )
     train_demo_indices = stratified_select_demo_indices(
-        mask_types=train_mask_types_all,
+        labels=train_selection_labels,
         num_select=args.num_demos,
         seed=args.seed,
-        target_ratio_by_type=train_target_ratio_by_type,
+        target_ratio_entries=train_target_ratio_entries,
     )
     selected_train_mask_types = [train_mask_types_all[i] for i in train_demo_indices]
+    selected_train_mask_type_slots = [train_mask_type_slots_all[i] for i in train_demo_indices]
     dataset = SmallDemoDataset_MasWindowDiffusionPolicy(
         data_path=args.demo_path,
         obs_process_fn=obs_process_fn,
@@ -1216,12 +1254,18 @@ if __name__ == "__main__":
     )
     if len(eval_demo_indices) > 0:
         eval_mam_data = subset_eval_data(eval_mam_data, eval_demo_indices)
-    eval_mask_type_counts = summarize_mask_type_counts(eval_mam_data.get("mask_types", []))
-    train_mask_type_counts = summarize_mask_type_counts(selected_train_mask_types)
-    train_total_mask_type_counts = summarize_mask_type_counts(train_mask_types_all)
-    print(f"[mixed-train] train mask counts: {train_mask_type_counts}")
-    print(f"[mixed-train] train total mask counts: {train_total_mask_type_counts}")
-    print(f"[mixed-train] eval mask counts: {eval_mask_type_counts}")
+    eval_mask_type_counts = summarize_label_counts(eval_mam_data.get("mask_types", []))
+    eval_mask_slot_counts = summarize_label_counts(eval_mam_data.get("mask_type_slots", []))
+    train_mask_type_counts = summarize_label_counts(selected_train_mask_types)
+    train_mask_slot_counts = summarize_label_counts(selected_train_mask_type_slots)
+    train_total_mask_type_counts = summarize_label_counts(train_mask_types_all)
+    train_total_mask_slot_counts = summarize_label_counts(train_mask_type_slots_all)
+    print(f"[mixed-train] train mask type counts: {train_mask_type_counts}")
+    print(f"[mixed-train] train mask slot counts: {train_mask_slot_counts}")
+    print(f"[mixed-train] train total mask type counts: {train_total_mask_type_counts}")
+    print(f"[mixed-train] train total mask slot counts: {train_total_mask_slot_counts}")
+    print(f"[mixed-train] eval mask type counts: {eval_mask_type_counts}")
+    print(f"[mixed-train] eval mask slot counts: {eval_mask_slot_counts}")
 
     # ------------------------------------------------------------------------ #
     # 8. Build agent, EMA agent, optimizer, and LR scheduler
@@ -1263,7 +1307,8 @@ if __name__ == "__main__":
             last_tick = time.time()
             ema.copy_to(ema_agent.parameters())
             ce_summary = None
-            per_mask_summary = {}
+            per_mask_type_summary = {}
+            per_mask_slot_summary = {}
             if args.capture_video:
                 clear_iteration_artifacts(video_dir=video_dir, iteration=iteration)
             mixed_eval_result = evaluate_mas_window_mixed(
@@ -1287,11 +1332,20 @@ if __name__ == "__main__":
                 return_rollout_records=True,
             )
             if args.capture_video:
-                eval_metrics, per_mask_summary, progress_curve_records, rollout_records = (
-                    mixed_eval_result
-                )
+                (
+                    eval_metrics,
+                    per_mask_type_summary,
+                    per_mask_slot_summary,
+                    progress_curve_records,
+                    rollout_records,
+                ) = mixed_eval_result
             else:
-                eval_metrics, per_mask_summary, rollout_records = mixed_eval_result
+                (
+                    eval_metrics,
+                    per_mask_type_summary,
+                    per_mask_slot_summary,
+                    rollout_records,
+                ) = mixed_eval_result
                 progress_curve_records = None
             ce_summary = aggregate_control_error(
                 compute_control_error_results_from_rollouts(
@@ -1308,11 +1362,16 @@ if __name__ == "__main__":
                 metric_value = float(np.mean(v)) if isinstance(v, np.ndarray) else float(v)
                 writer.add_scalar(f"eval/{k}", metric_value, iteration)
                 print(f"{k}: {metric_value:.6f}")
-            for mask_type, one_summary in per_mask_summary.items():
+            for mask_type, one_summary in per_mask_type_summary.items():
                 for key, value in one_summary.items():
                     metric_value = float(value)
-                    writer.add_scalar(f"eval_by_mask/{mask_type}/{key}", metric_value, iteration)
+                    writer.add_scalar(f"eval_by_mask_type/{mask_type}/{key}", metric_value, iteration)
                     print(f"[{mask_type}] {key}: {metric_value:.6f}")
+            for mask_slot, one_summary in per_mask_slot_summary.items():
+                for key, value in one_summary.items():
+                    metric_value = float(value)
+                    writer.add_scalar(f"eval_by_mask_slot/{mask_slot}/{key}", metric_value, iteration)
+                    print(f"[{mask_slot}] {key}: {metric_value:.6f}")
             if ce_summary is not None:
                 for k in ["ce_all", "ce_success", "ce_failed"]:
                     metric_value = float(ce_summary[k])

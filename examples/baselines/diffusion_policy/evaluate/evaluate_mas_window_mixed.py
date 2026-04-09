@@ -50,24 +50,59 @@ def _build_padded_eval_batches(total_items: int, batch_size: int):
     return batches
 
 
-def group_eval_data_by_mask_type(eval_mas_window_data: dict) -> dict[str, list[int]]:
-    mask_types = eval_mas_window_data.get("mask_types")
-    if mask_types is None:
-        raise ValueError("mixed eval requires eval_mas_window_data['mask_types']")
-    if len(mask_types) != len(eval_mas_window_data["mas"]):
+def _group_indices_by_labels(
+    labels: list[str] | None,
+    total_items: int,
+    label_name: str,
+) -> dict[str, list[int]]:
+    if labels is None:
+        raise ValueError(f"mixed eval requires eval_mas_window_data[{label_name!r}]")
+    if len(labels) != total_items:
         raise ValueError(
-            "mask_types length must match eval trajectory count: "
-            f"{len(mask_types)} vs {len(eval_mas_window_data['mas'])}"
+            f"{label_name} length must match eval trajectory count: "
+            f"{len(labels)} vs {total_items}"
         )
     grouped = defaultdict(list)
-    for idx, mask_type in enumerate(mask_types):
-        grouped[str(mask_type)].append(idx)
+    for idx, label in enumerate(labels):
+        grouped[str(label)].append(idx)
     return dict(sorted(grouped.items(), key=lambda item: item[0]))
 
 
-def evaluate_one_mask_type_group(
-    mask_type: str,
+def group_eval_data_by_mask_type(eval_mas_window_data: dict) -> dict[str, list[int]]:
+    total_items = len(eval_mas_window_data["mas"])
+    return _group_indices_by_labels(
+        eval_mas_window_data.get("mask_types"),
+        total_items=total_items,
+        label_name="mask_types",
+    )
+
+
+def group_eval_data_by_mask_type_slot(eval_mas_window_data: dict) -> dict[str, list[int]]:
+    total_items = len(eval_mas_window_data["mas"])
+    slot_labels = eval_mas_window_data.get("mask_type_slots")
+    if slot_labels is None:
+        slot_labels = eval_mas_window_data.get("mask_types")
+    return _group_indices_by_labels(
+        slot_labels,
+        total_items=total_items,
+        label_name="mask_type_slots",
+    )
+
+
+def _append_metric_dict(dst: dict[str, list[float]], src: dict) -> None:
+    for key, value in src.items():
+        dst[key].extend(np.asarray(value).reshape(-1).tolist())
+
+
+def _metric_dict_from_lists(metric_lists: dict[str, list[float]]) -> dict:
+    return {key: np.asarray(values) for key, values in metric_lists.items()}
+
+
+def evaluate_one_mask_group(
+    group_label: str,
     group_indices: list[int],
+    mask_type_label: str,
+    mask_type_slot_label: str,
     agent,
     eval_envs,
     device,
@@ -85,7 +120,7 @@ def evaluate_one_mask_type_group(
     return_rollout_records: bool = False,
 ):
     if len(group_indices) == 0:
-        raise ValueError(f"group {mask_type!r} is empty")
+        raise ValueError(f"group {group_label!r} is empty")
 
     grouped_eval_data = subset_eval_data(eval_mas_window_data, group_indices)
     grouped_reset_seeds = None
@@ -138,24 +173,23 @@ def evaluate_one_mask_type_group(
             batch_rollout_records = None
 
         batch_metrics = _slice_metric_dict(batch_metrics, valid_batch_size)
-        for key, value in batch_metrics.items():
-            aggregated_metrics[key].extend(np.asarray(value).reshape(-1).tolist())
+        _append_metric_dict(aggregated_metrics, batch_metrics)
 
         if return_progress_curves:
             for record in batch_progress_records[:valid_batch_size]:
                 record = dict(record)
-                record["mask_type"] = mask_type
+                record["mask_type"] = mask_type_label
+                record["mask_type_slot"] = mask_type_slot_label
                 aggregated_progress_records.append(record)
 
         if return_rollout_records:
             for record in batch_rollout_records[:valid_batch_size]:
                 record = dict(record)
-                record["mask_type"] = mask_type
+                record["mask_type"] = mask_type_label
+                record["mask_type_slot"] = mask_type_slot_label
                 aggregated_rollout_records.append(record)
 
-    grouped_metrics = {
-        key: np.asarray(values) for key, values in aggregated_metrics.items()
-    }
+    grouped_metrics = _metric_dict_from_lists(aggregated_metrics)
     if return_progress_curves and return_rollout_records:
         return grouped_metrics, aggregated_progress_records, aggregated_rollout_records
     if return_progress_curves:
@@ -186,7 +220,6 @@ def evaluate_mas_window_mixed(
 ):
     if reset_seed is not None:
         raise ValueError("mixed eval expects reset_seeds instead of a single reset_seed")
-    mask_groups = group_eval_data_by_mask_type(eval_mas_window_data)
     total_items = len(eval_mas_window_data["mas"])
     if n != total_items:
         raise ValueError(
@@ -198,16 +231,31 @@ def evaluate_mas_window_mixed(
             f"{len(reset_seeds)} vs {total_items}"
         )
 
+    mask_types = eval_mas_window_data.get("mask_types")
+    mask_type_slots = eval_mas_window_data.get("mask_type_slots")
+    if mask_type_slots is None:
+        mask_type_slots = mask_types
+
+    _group_indices_by_labels(mask_types, total_items=total_items, label_name="mask_types")
+    slot_groups = _group_indices_by_labels(
+        mask_type_slots,
+        total_items=total_items,
+        label_name="mask_type_slots",
+    )
+
     aggregated_metrics = defaultdict(list)
-    per_mask_summary = {}
+    per_mask_type_metric_lists = defaultdict(lambda: defaultdict(list))
+    per_mask_slot_summary = {}
     progress_curve_records = [] if return_progress_curves else None
     rollout_records = [] if return_rollout_records else None
 
-    for mask_type, group_indices in mask_groups.items():
-        group_reset_seeds = None if reset_seeds is None else reset_seeds
-        one_result = evaluate_one_mask_type_group(
-            mask_type=mask_type,
+    for mask_type_slot, group_indices in slot_groups.items():
+        mask_type = str(mask_types[group_indices[0]])
+        one_result = evaluate_one_mask_group(
+            group_label=mask_type_slot,
             group_indices=group_indices,
+            mask_type_label=mask_type,
+            mask_type_slot_label=str(mask_type_slot),
             agent=agent,
             eval_envs=eval_envs,
             device=device,
@@ -220,7 +268,7 @@ def evaluate_mas_window_mixed(
             stpm_n_obs_steps=stpm_n_obs_steps,
             stpm_frame_gap=stpm_frame_gap,
             progress_bar=progress_bar,
-            reset_seeds=group_reset_seeds,
+            reset_seeds=reset_seeds,
             return_progress_curves=return_progress_curves,
             return_rollout_records=return_rollout_records,
         )
@@ -238,22 +286,31 @@ def evaluate_mas_window_mixed(
             group_progress_records = None
             group_rollout_records = None
 
-        for key, value in group_metrics.items():
-            aggregated_metrics[key].extend(np.asarray(value).reshape(-1).tolist())
-        per_mask_summary[mask_type] = _summarize_metric_dict(group_metrics)
+        _append_metric_dict(aggregated_metrics, group_metrics)
+        _append_metric_dict(per_mask_type_metric_lists[mask_type], group_metrics)
+        per_mask_slot_summary[str(mask_type_slot)] = _summarize_metric_dict(group_metrics)
 
         if return_progress_curves:
             progress_curve_records.extend(group_progress_records)
         if return_rollout_records:
             rollout_records.extend(group_rollout_records)
 
-    overall_metrics = {
-        key: np.asarray(values) for key, values in aggregated_metrics.items()
+    per_mask_type_summary = {
+        str(mask_type): _summarize_metric_dict(_metric_dict_from_lists(metric_lists))
+        for mask_type, metric_lists in sorted(per_mask_type_metric_lists.items(), key=lambda item: item[0])
     }
+    overall_metrics = _metric_dict_from_lists(aggregated_metrics)
+
     if return_progress_curves and return_rollout_records:
-        return overall_metrics, per_mask_summary, progress_curve_records, rollout_records
+        return (
+            overall_metrics,
+            per_mask_type_summary,
+            per_mask_slot_summary,
+            progress_curve_records,
+            rollout_records,
+        )
     if return_progress_curves:
-        return overall_metrics, per_mask_summary, progress_curve_records
+        return overall_metrics, per_mask_type_summary, per_mask_slot_summary, progress_curve_records
     if return_rollout_records:
-        return overall_metrics, per_mask_summary, rollout_records
-    return overall_metrics, per_mask_summary
+        return overall_metrics, per_mask_type_summary, per_mask_slot_summary, rollout_records
+    return overall_metrics, per_mask_type_summary, per_mask_slot_summary

@@ -203,7 +203,13 @@ def read_augmented_mas_length(data_path: str, mas_step_dim: int = 8) -> int:
     return inferred_max_length
 
 
-def load_traj_mask_types(data_path: str, num_traj: Optional[int] = None) -> list[str]:
+def _load_traj_string_field(
+    data_path: str,
+    field_name: str,
+    num_traj: Optional[int] = None,
+    meta_fallback_field: Optional[str] = None,
+    default_value: str = "unknown",
+) -> list[str]:
     with File(data_path, "r") as f:
         traj_keys = sorted(
             [k for k in f.keys() if k.startswith("traj_")],
@@ -212,20 +218,53 @@ def load_traj_mask_types(data_path: str, num_traj: Optional[int] = None) -> list
         if num_traj is not None:
             traj_keys = traj_keys[:num_traj]
 
-        default_mask_type = None
-        if "meta" in f and "mask_type" in f["meta"]:
-            default_mask_type = _decode_string_value(f["meta"]["mask_type"][()])
+        default_field_value = None
+        if (
+            meta_fallback_field is not None
+            and "meta" in f
+            and meta_fallback_field in f["meta"]
+        ):
+            default_field_value = _decode_string_value(f["meta"][meta_fallback_field][()])
 
-        mask_types = []
+        values = []
         for traj_key in traj_keys:
             traj_group = f[traj_key]
-            if "mask_type" in traj_group:
-                mask_types.append(_decode_string_value(traj_group["mask_type"][()]))
-            elif default_mask_type is not None:
-                mask_types.append(default_mask_type)
+            if field_name in traj_group:
+                values.append(_decode_string_value(traj_group[field_name][()]))
+            elif default_field_value is not None:
+                values.append(default_field_value)
             else:
-                mask_types.append("unknown")
-    return mask_types
+                values.append(str(default_value))
+    return values
+
+
+def load_traj_mask_types(data_path: str, num_traj: Optional[int] = None) -> list[str]:
+    return _load_traj_string_field(
+        data_path=data_path,
+        field_name="mask_type",
+        num_traj=num_traj,
+        meta_fallback_field="mask_type",
+        default_value="unknown",
+    )
+
+
+def load_traj_mask_type_slots(data_path: str, num_traj: Optional[int] = None) -> list[str]:
+    slots = _load_traj_string_field(
+        data_path=data_path,
+        field_name="mask_type_slot",
+        num_traj=num_traj,
+        meta_fallback_field="mask_type_slot",
+        default_value="",
+    )
+    if any(len(str(slot)) > 0 for slot in slots):
+        return [
+            str(slot) if len(str(slot)) > 0 else str(mask_type)
+            for slot, mask_type in zip(
+                slots,
+                load_traj_mask_types(data_path=data_path, num_traj=num_traj),
+            )
+        ]
+    return load_traj_mask_types(data_path=data_path, num_traj=num_traj)
 
 
 def load_eval_only_mas_data(
@@ -321,6 +360,7 @@ def load_eval_mas_window_data(
     mas_mask_list = []
     traj_lengths = []
     mask_types = load_traj_mask_types(data_path=data_path, num_traj=num_traj)
+    mask_type_slots = load_traj_mask_type_slots(data_path=data_path, num_traj=num_traj)
     for i in range(len(trajectories["mas"])):
         raw_mas_t = torch.as_tensor(trajectories["mas"][i], device=device, dtype=torch.float32)
         raw_mask_t = torch.as_tensor(trajectories["mask"][i], device=device, dtype=torch.float32)
@@ -339,6 +379,7 @@ def load_eval_mas_window_data(
         "mas_mask": mas_mask_list,
         "traj_lengths": traj_lengths,
         "mask_types": mask_types,
+        "mask_type_slots": mask_type_slots,
     }
 
 
