@@ -28,6 +28,7 @@ mask 类型说明：
   - `pose_motion_planning`：需要 `retain_ratio`；随机保留 `int(T * retain_ratio)` 个 step 的完整 pose/action（前 7 维）。  
   - `random_mask`：需要 `retain_ratio`；在所有位置中随机保留 `retain_ratio` 比例的元素。
 
+  - `mix0`：不需要额外参数；保留所有 step 的 `x,y`，再额外保留 1 个唯一时间步的前 7 维，以及另外 3 个唯一时间步的前 3 维；要求 `T >= 4`。
   - `2D_partial_trajectory`：需要 `mask_seq_len`；随机保留一个连续长度为 `mask_seq_len` 的 `x,y` 子序列。
   - `local_planner`：需要 `mask_seq_len`；先保留全部，再随机 mask 掉一个连续长度为 `mask_seq_len` 的前 7 维子序列。
 
@@ -95,7 +96,7 @@ mask 类型说明：
 - `mask_param_list` 校验：
   - `points / 3D_points / pose_motion_planning / random_mask`：读取为 `retain_ratio`，要求在 `(0,1]`
   - `2D_partial_trajectory / local_planner`：读取为 `mask_seq_len`，要求在 `[1,100]`
-  - `2D_video_trajectory`：忽略该位置参数
+  - `2D_video_trajectory / 2D_image_trajectory / mix0`：忽略该位置参数
 
 - split 内分配算法：
   - 输入：该 split 的 `source_episode_ids` 和 `mask_type_ratio_list`
@@ -237,6 +238,7 @@ mask 类型说明：
       - `3D_points`
       - `pose_motion_planning`
       - `random_mask`
+      - `mix0`
       - `2D_partial_trajectory`
       - `local_planner`
       - `2D_video_trajectory`

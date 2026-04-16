@@ -19,6 +19,11 @@
   - progress 增广
   - 5:1 train/eval split
   - 将 `action_min/max`、`state_min/max` 等统计量写入 `h5/meta`
+  - 新增 `mix0`：
+    - 全轨迹保留 `x,y`
+    - 额外保留 1 个唯一时间步的前 7 维
+    - 再额外保留 3 个其他唯一时间步的前 3 维
+    - 不需要额外参数
 
 另外顺手补了两个兼容点：
 
@@ -30,8 +35,7 @@
 ```bash
 python examples/baselines/diffusion_policy/data_preprocess.py \
   --input-h5 demos/data_1/data_1.h5 \
-  --mask-type 3D_points \
-  --retain-ratio 0.03 \
+  --mask-type mix0 \
   --num-traj 6 \
   --output-dir /tmp/data_1_preprocessed_smoke \
   --overwrite
@@ -96,11 +100,17 @@ python examples/baselines/diffusion_policy/data_preprocess.py \
 
 ```text
 demos/data_1_preprocessed/
-  data_1_<mask_type>_<ratio>_train.h5
-  data_1_<mask_type>_<ratio>_train.json
-  data_1_<mask_type>_<ratio>_eval.h5
-  data_1_<mask_type>_<ratio>_eval.json
+  data_1_<mask_type>_<param>_train.h5
+  data_1_<mask_type>_<param>_train.json
+  data_1_<mask_type>_<param>_eval.h5
+  data_1_<mask_type>_<param>_eval.json
 ```
+
+其中：
+
+- 需要 `retain_ratio` 的 mask，如 `3D_points`，文件名带 `<ratio>`
+- 需要 `mask_seq_len` 的 mask，如 `2D_partial_trajectory`，文件名带 `_seq<len>`
+- 不需要额外参数的 mask，如 `mix0`，文件名直接是 `data_1_mix0_train.h5`
 
 每个输出 `h5` 里保留每条 `traj_*` 的基础结构，但在 `meta` 中额外补全训练需要的统计量。
 
@@ -114,7 +124,7 @@ demos/data_1_preprocessed/
 - `action_dim`
 - `mas_dim`，固定为 `8`
 - `mask_type`
-- `retain_ratio` 或其他 mask 参数
+- `retain_ratio` 或其他 mask 参数；若 mask 不需要额外参数，如 `mix0`，则不写这些字段
 - `num_episodes`
 - `split`
 - `source_h5`
@@ -221,6 +231,14 @@ demos/data_1_preprocessed/
 2. 按 `mask_type` 与对应参数执行 mask
 3. 输出 `mas` shape 为 `(T, 7)`
 4. 不再做全局 `max_length` padding
+
+当前补充的 `mix0` 语义固定为：
+
+- 所有 step 保留 `x,y`
+- 再随机选 4 个互不重复的时间步
+- 第 1 个时间步保留前 7 维
+- 其余 3 个时间步保留前 3 维
+- 要求轨迹长度 `T >= 4`
 
 这里建议明确两条边界：
 

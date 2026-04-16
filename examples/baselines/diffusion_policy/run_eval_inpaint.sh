@@ -10,9 +10,12 @@ CONDA_BIN="${CONDA_BIN:-/home/hebu/miniconda3/bin/conda}"
 CONDA_ENV="${CONDA_ENV:-maniskill_py311}"
 ENTRYPOINT="${ENTRYPOINT:-examples/baselines/diffusion_policy/eval_inpaint.py}"
 
-CHECKPOINT_PT_PATH="${CHECKPOINT_PT_PATH:-runs/window_3dpoints_0.2/best_eval_success_once.pt}"
-EVAL_DEMO_PATH="${EVAL_DEMO_PATH:-demos/data_1_preprocessed/3D_points_0.2/data_1_3D_points_0.2_eval.h5}"
-EVAL_DEMO_METADATA_PATH="${EVAL_DEMO_METADATA_PATH:-demos/data_1_preprocessed/3D_points_0.2/data_1_3D_points_0.2_eval.json}"
+RUN_NAME="${RUN_NAME:-window_3dpoints_0.5}"
+EVAL_DATA_DIR="${EVAL_DATA_DIR:-demos/data_1_preprocessed/3D_points_0.5}"
+
+CHECKPOINT_PT_PATH="${CHECKPOINT_PT_PATH:-runs/${RUN_NAME}/best_eval_success_once.pt}"
+EVAL_DEMO_PATH="${EVAL_DEMO_PATH:-${EVAL_DATA_DIR}/data_1_3D_points_0.5_eval.h5}"
+EVAL_DEMO_METADATA_PATH="${EVAL_DEMO_METADATA_PATH:-${EVAL_DATA_DIR}/data_1_3D_points_0.5_eval.json}"
 STPM_CONFIG_PATH="${STPM_CONFIG_PATH:-STPM_PickCube/pick up the cube and place it at the goal/config.yaml}"
 STPM_CKPT_PATH="${STPM_CKPT_PATH:-STPM_PickCube/pick up the cube and place it at the goal/checkpoints/reward_best.pt}"
 
@@ -27,12 +30,12 @@ RENDER_BACKEND="${RENDER_BACKEND:-gpu}"
 OBS_HORIZON="${OBS_HORIZON:-2}"
 ACT_HORIZON="${ACT_HORIZON:-8}"
 PRED_HORIZON="${PRED_HORIZON:-16}"
-LONG_WINDOW_HORIZON="${LONG_WINDOW_HORIZON:-32}"
-SHORT_WINDOW_HORIZON="${SHORT_WINDOW_HORIZON:-0}"
+LONG_WINDOW_HORIZON="${LONG_WINDOW_HORIZON:-0}"
+SHORT_WINDOW_HORIZON="${SHORT_WINDOW_HORIZON:-20}"
 MAS_LONG_ENCODE_MODE="${MAS_LONG_ENCODE_MODE:-2DConv}"
-MAS_LONG_CONV_OUTPUT_DIM="${MAS_LONG_CONV_OUTPUT_DIM:-128}"
+MAS_LONG_CONV_OUTPUT_DIM="${MAS_LONG_CONV_OUTPUT_DIM:-0}"
 DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-64}"
-LEGACY_SHORT_MASK_BRANCH="${LEGACY_SHORT_MASK_BRANCH:-false}"
+LEGACY_SHORT_MASK_BRANCH="${LEGACY_SHORT_MASK_BRANCH:-true}"
 
 JUMP_LENGTH="${JUMP_LENGTH:-5}"
 NUM_RESAMPLE="${NUM_RESAMPLE:-1}"
@@ -40,7 +43,7 @@ NUM_RESAMPLE="${NUM_RESAMPLE:-1}"
 CHECKPOINT_KEY="${CHECKPOINT_KEY:-auto}"
 SEED="${SEED:-1}"
 CUDA_FLAG="${CUDA_FLAG:---cuda}"
-OUTPUT_DIR="${OUTPUT_DIR:-}"
+OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_NAME}/control_error_inpaint}"
 OUTPUT_JSON_PATH="${OUTPUT_JSON_PATH:-}"
 SAVE_PER_TRAJ_FLAG="${SAVE_PER_TRAJ_FLAG:-}"
 
@@ -110,6 +113,8 @@ if [[ -n "${OUTPUT_JSON_PATH}" ]]; then
 fi
 
 echo "[resolved-config] entrypoint=${ENTRYPOINT}"
+echo "[resolved-config] run_name=${RUN_NAME}"
+echo "[resolved-config] eval_data_dir=${EVAL_DATA_DIR}"
 echo "[resolved-config] checkpoint_pt_path=${CHECKPOINT_PT_PATH}"
 echo "[resolved-config] eval_demo_path=${EVAL_DEMO_PATH}"
 echo "[resolved-config] eval_demo_metadata_path=${EVAL_DEMO_METADATA_PATH}"
@@ -127,6 +132,7 @@ echo "[resolved-config] jump_length=${JUMP_LENGTH}"
 echo "[resolved-config] num_resample=${NUM_RESAMPLE}"
 echo "[resolved-config] num_eval_demos=${NUM_EVAL_DEMOS}"
 echo "[resolved-config] num_eval_envs=${NUM_EVAL_ENVS}"
+echo "[resolved-config] output_dir=${OUTPUT_DIR}"
 
 if [[ "${LEGACY_SHORT_MASK_BRANCH}" == "true" ]]; then
   ARGS+=(--legacy-short-mask-branch)

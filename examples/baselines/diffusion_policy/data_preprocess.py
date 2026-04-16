@@ -104,7 +104,7 @@ def parse_args() -> argparse.Namespace:
         default="3D_points",
         help=(
             "mask 类型，支持例如 "
-            "2D_video_trajectory、2D_image_trajectory、2D_partial_trajectory、"
+            "2D_video_trajectory、2D_image_trajectory、mix0、2D_partial_trajectory、"
             "pose_AnyGrasp、pose_motion_planning、points、3D_points、"
             "local_planner、random_mask 等"
         ),

@@ -426,14 +426,37 @@ mask参数分别是random0.1、random0.2、3dpoints0.2
 
 现在需要你来分析inpainting方法在动作inference中的作用（正作用还是负作用），不同masktype对inpainting的影响，jr值的影响（重点分析jr值增大后的看似发生的负作用，以及其原理），结合ce探究动作生成和图像生成的不同之处，尝试分析现象背后的原理，得出一些初步的结论，并且列出下一步建议的实验计划。
 
-### 已完成的结果整理与初步分析
+### 结果整理与初步分析
 
-说明：
+### 先和原始 no-inpainting 结果做对比
 
-- 当前环境里没有 `tensorboard/tensorflow`，因此暂时没有直接解析 `events.out.tfevents.*`。
-- 因此下面的分析主要基于已经落盘的 `control_error_inpaint/*.json`。
-- 在当前代码语义下，`r=0` 表示不做 resample、只做 hard overwrite；因此以下把 `j=1,r=0` 视为当前离线 inpainting 路径里的基线。
-- `random0.1` 和 `random0.2` 各统计了 100 条 rollout；`3dpoints0.2` 当前只有 50 条 rollout，因此它的结论置信度相对更低。
+这里优先做“同一 checkpoint”的公平比较。
+
+原因：
+
+- 当前离线 inpainting 实验用的都是 `best_eval_success_once.pt`。
+- 因此最公平的 no-inpainting 基线，不是训练全程任意一步的最好值，而是 `tfevents` 中对应 `best_eval_success_once` 那个 step 的原始评估结果。
+
+| run | no-inpaint 基线来源 | success_once | success_end |
+|---|---|---:|---:|
+| `random0.1` | `best_eval_success_once` 对应 step=`340000` | 0.43 | 0.19 |
+| `random0.2` | `best_eval_success_once` 对应 step=`70000` | 0.86 | 0.37 |
+| `3dpoints0.2` | `best_eval_success_once` 对应 step=`265000` | 0.66 | 0.34 |
+| `3dpoints0.5` | `best_eval_success_once` 对应 step=`55000` | 0.62 | 0.32 |
+
+补充说明：
+
+- `random0.1` 训练过程中 `success_end` 的全程最好值是 `0.24`。
+- `random0.2` 训练过程中 `success_end` 的全程最好值是 `0.58`。
+- `3dpoints0.2` 训练过程中 `success_end` 的全程最好值是 `0.40`。
+- `3dpoints0.5` 训练过程中 `success_once` 的最后平滑值大约是 `0.52`，和你提供的观察一致；它的全程最好 `success_end` 是 `0.36`，出现在 step=`80000`。
+
+基于这个公平基线，当前结论先给出来：
+
+- `random0.1`：使用 inpainting 后整体是正作用。即使最朴素的 `j=1,r=0`，也把 `success_once` 从 `0.43` 提到 `0.50`，把 `success_end` 从 `0.19` 提到 `0.24`。
+- `random0.2`：使用 inpainting 后也是明显正作用。最佳已测配置 `j=5,r=5` 把 `success_once` 从 `0.86` 提到 `0.96`，把 `success_end` 从 `0.37` 提到 `0.56`。
+- `3dpoints0.2`：使用 inpainting 后整体是负作用。最好的已测结果仍只有 `0.58/0.24`，低于 no-inpaint 的 `0.66/0.34`。
+- `3dpoints0.5`：使用 inpainting 后不是明显正作用。对同一个 `best_eval_success_once` checkpoint 而言，`j=1,r=0` 的 `success_once` 与 no-inpaint 基线持平，`success_end` 则从 `0.32` 小幅降到 `0.30`；但它仍显著好于 `3dpoints0.2`，说明提高 3D 点密度确实在缓解问题。
 
 ### 结果汇总
 
@@ -452,6 +475,7 @@ mask参数分别是random0.1、random0.2、3dpoints0.2
 - 大多数大 `j/r` 组合都会让 `success_once` 下降。
 - 但 `j=5,r=5` 是一个例外：`success_end` 从 `0.24` 升到 `0.26`，`ce_all` 从 `0.00422` 降到 `0.00341`，说明适中的 jump 配合较强 resample 可能存在一个局部 sweet spot。
 - 单纯把 `r` 拉大但 `j` 很小（`j=1,r=5`）是负作用最明显的组合之一。
+- 如果和原始 no-inpaint 基线比，`random0.1` 上至少 `j=1,r=0` 和 `j=5,r=5` 是明确正收益；但也有一些大 `j/r` 组合会把 `success_once` 拉回到基线附近甚至略低，说明对这类随机 mask，inpainting 是“有帮助但不稳”。
 
 #### 2. `random0.2`
 
@@ -467,6 +491,7 @@ mask参数分别是random0.1、random0.2、3dpoints0.2
 - `success_once` 基本不掉，`success_end` 明显提升。
 - `ce_failed` 明显下降，说明 inpainting 主要在“挽救失败轨迹”这件事上有效。
 - `j=5,r=5` 是当前这组里最好的已测组合。
+- 如果和原始 no-inpaint 基线比，提升非常明显，说明在已知动作较密时，inpainting 不只是“微调”，而是在系统性改善 rollout。
 
 #### 3. `3dpoints0.2`
 
@@ -483,40 +508,27 @@ mask参数分别是random0.1、random0.2、3dpoints0.2
 - 相比 `r=0`，`r=3/5/8` 的 `success_once` 和 `success_end` 都没有超过基线。
 - `r=3` 时 `ce_failed` 降得最多，但成功率掉得也最明显，说明它更像是在“贴已知点”，而不是在提升任务可执行性。
 - 继续把 `r` 提到 `5/8` 后，`success_once` 相比 `r=3` 有一定回升，但 `ce_all` 和 `success_end` 仍劣于 `r=0`，而且 `ce_failed` 也开始反弹，说明更强 resample 并没有真正修复问题，只是在不同失败模式之间移动。
+- 更关键的是，如果和原始 no-inpaint 基线 `0.66/0.34` 比，连 `r=0` 的 hard overwrite 版本都已经是负作用，这说明问题不只是“resample 太强”，而是当前这类 sparse 3D 条件本身就不适合直接拿来做动作 inpainting。
 
-### 逐轨迹对比得到的更细现象
+#### 4. `3dpoints0.5`
 
-以 `j=1,r=0` 为基线：
+| j | r | success_once | success_end | ce_all | ce_success | ce_failed |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 0 | 0.62 | 0.30 | 0.01698 | 0.00307 | 0.03967 |
+| 5 | 1 | 0.44 | 0.24 | 0.02303 | 0.00318 | 0.03864 |
 
-- `random0.1, j=1,r=5`：`success_once` 提升 3 条、下降 11 条；`success_end` 提升 5 条、下降 8 条。说明单纯增大 `r` 更容易把原本成功的 case 搞坏。
-- `random0.1, j=5,r=5`：`success_once` 提升 6 条、下降 8 条；`success_end` 提升 7 条、下降 5 条。说明这组参数虽然仍有副作用，但已经开始出现“末状态修正收益”。
-- `random0.2, j=1,r=5`：`success_once` 提升 3 条、下降 3 条；`success_end` 提升 10 条、下降 3 条。说明它主要改善的是“中途成功过但最后没稳住”的轨迹。
-- `random0.2, j=5,r=5`：`success_once` 提升 4 条、下降 3 条；`success_end` 提升 11 条、下降 3 条。说明适中 jump 会进一步增强这种末端修正作用。
-- `3dpoints0.2, j=1,r=3`：`success_once` 提升 2 条、下降 9 条；`success_end` 提升 2 条、下降 5 条。说明 sparse 3D anchor 下，resample 破坏成功轨迹的风险远大于收益。
-- `3dpoints0.2, j=1,r=5`：相对 `r=0`，`success_once` 提升 2 条、下降 6 条；`success_end` 提升 2 条、下降 4 条。说明比 `r=3` 略有回升，但整体仍是负收益。
-- `3dpoints0.2, j=1,r=8`：相对 `r=0`，`success_once` 提升 1 条、下降 5 条；`success_end` 提升 1 条、下降 5 条。说明继续增大 `r` 没有带来额外收益，反而让末状态更差。
+结论：
 
-### 不同 mask type 对 inpainting 的影响
+- `3dpoints0.5` 的表现明显好于 `3dpoints0.2`，说明仅仅把 3D 点的保留比例从 `0.2` 提高到 `0.5`，就足以显著改善动作 inpainting 的可用性。
+- 在当前已测结果里，`j=1,r=0` 明显优于 `j=5,r=1`；也就是说，对 `3dpoints0.5` 这类较密但仍不完整的条件，hard overwrite 版本已经够用，而较大的 jump 反而在破坏前缀稳定性。
+- 如果和同 checkpoint 的 no-inpaint 基线 `0.62/0.32` 比，`j=1,r=0` 更接近“近似持平但略负”，而不是明确正收益；不过它仍然远好于 `3dpoints0.2`，说明提高点密度是有效方向。
 
-从 `num_known_points` 的均值看：
+补充观察：
 
-- `random0.2`: `61.01`
-- `random0.1`: `40.60`
-- `3dpoints0.2`: `15.22`
+- 对当前参与评估的 50 条 demo，`3dpoints0.5` 的 `num_known_points` 均值约为 `38.8`，而 `3dpoints0.2` 只有 `15.22`。
+- 这里的 `num_known_points` 统计的是“有至少一个已知维度的时间步数”，不是已知坐标总数。
+- 这说明 `3dpoints0.5` 的改善很可能首先来自“条件更密”，而不一定意味着只靠 `xyz` 三维点本身就足够了。
 
-这和最终表现高度一致：
-
-- `random0.2` 的已知控制信号最密，inpainting 的收益最稳定。
-- `random0.1` 的已知信号中等，inpainting 很敏感，说明它既可能提供有用约束，也可能在重采样中把已有的可行动作扰乱。
-- `3dpoints0.2` 的已知信号最稀，而且只覆盖 `x,y,z`，没有完整 pose/gripper 约束，因此最容易出现“几何上更像演示、任务上反而更差”的情况。
-
-也就是说，动作版 inpainting 的收益很依赖已知条件是否足够“强”和“完整”。只给稀疏位置点，不给姿态/抓取信息时，模型很难把局部几何约束转成完整可执行策略。
-
-从新增的 `r=5/8` 看，这个结论进一步被强化了：
-
-- 当 known condition 本身不完整时，单纯增大 resample 轮次并不能持续带来收益。
-- 它最多只能在某些轨迹上把 `r=3` 的过强扰动稍微拉回一点，但无法重新超过 `r=0` 基线。
-- 这说明当前瓶颈更像是“条件信息不够”，而不是“resample 强度还不够大”。
 
 ### `j/r` 增大后为何常出现负作用
 
@@ -544,6 +556,7 @@ mask参数分别是random0.1、random0.2、3dpoints0.2
 - 在 `random0.2` 上，inpainting 既降低了 `ce_failed`，也提升了 `success_end`，说明这里 CE 改善和任务成功大体一致。
 - 在 `random0.1` 上，部分组合会让 `ce_all` 变好，但 `success_once` 仍下降，说明“更像演示”不等于“更容易完成任务”。
 - 在 `3dpoints0.2` 上，这种背离更明显：失败轨迹的 CE 下降，但整体成功率下降，说明模型在 sparse known points 周围生成了更像演示的局部运动，却没有补出正确的姿态、抓取时机和后续动作衔接。
+- 在 `3dpoints0.5` 上，又出现了另一种背离：`j=1,r=0` 的 success 明显高于 `3dpoints0.2`，但 `ce_all` 反而更高。这说明已知点变多后，模型可能为了满足更多局部 3D 点约束，牺牲了一部分全局轨迹相似度，但闭环任务反而更容易成功。
 
 因此，对动作 inpainting 来说：
 
@@ -553,13 +566,17 @@ mask参数分别是random0.1、random0.2、3dpoints0.2
 
 ### 初步结论
 
-1. inpainting 不是普遍正作用，它对 mask type 很敏感。
-2. 当 known action 较密、且覆盖维度较完整时，inpainting 更可能带来正收益。
+1. 和原始 no-inpaint 基线相比，inpainting 不是普遍正作用，它对 mask type 很敏感。
+2. 当 known action 较密、且覆盖维度较完整时，inpainting 更可能带来明确正收益。
    `random0.2` 是当前最明显的正例。
-3. 当 known action 稀疏、且只覆盖局部几何维度时，resample 往往是负作用。
+3. `random0.1` 也整体偏正作用，但对 `j/r` 更敏感，说明它处于“有帮助但不稳定”的中间区域。
+4. `3dpoints` 系列表明，“条件密度”和“条件完整性”都重要。
+   `3dpoints0.2` 明显过稀，因此连 hard overwrite 都可能是负作用；
+   而 `3dpoints0.5` 在密度提高后，至少已经从“明显负作用”走到了“接近 no-inpaint 基线的中间状态”。
+5. 当 known action 稀疏、且只覆盖局部几何维度时，不只是 resample，连 hard overwrite 本身都可能是负作用。
    `3dpoints0.2` 是当前最明显的反例。
-4. `j/r` 不是越大越好；大多数情况下，过大的重采样会破坏已经成形的动作前缀。`3dpoints0.2` 上从 `r=3` 加到 `r=5/8` 也没有翻正，说明“继续加大 resample”并不是主要出路。
-5. 当前结果更像在说明：动作版 RePaint 需要更保守的使用方式，尤其要优先保护近未来 prefix 的稳定性。
+6. `j/r` 不是越大越好；大多数情况下，过大的重采样会破坏已经成形的动作前缀。`3dpoints0.2` 上从 `r=3` 加到 `r=5/8` 也没有翻正，而 `3dpoints0.5` 上 `j=5,r=1` 也明显差于 `j=1,r=0`，说明“继续加大 jump/resample”并不是主要出路。
+7. 当前结果更像在说明：动作版 RePaint 需要更保守的使用方式，尤其要优先保护近未来 prefix 的稳定性，并且前提是 known condition 本身要足够强。
 
 ### 下一步建议实验计划
 
@@ -586,10 +603,12 @@ mask参数分别是random0.1、random0.2、3dpoints0.2
   - `j=7,r=3`
 - 目标是看最佳点是否在 `j≈3~5`、`r≈3~5` 这一带，而不是继续盲目增大。
 
-#### D. 对 `3dpoints0.2` 做“条件完整性”验证
+#### D. 对 `3dpoints` 系列做“条件密度/完整性”验证
 
+- 继续把 `3dpoints0.2 / 3dpoints0.5` 放在一起分析。
 - 增加一个包含姿态/夹爪信息的变体 mask，与纯 `3dpoints` 对照。
-- 如果补全姿态信息后 inpainting 变好，就能直接支持“当前负作用主要来自 known condition 不完整”这一判断。
+- 如果补全姿态信息后 inpainting 进一步变好，就能直接支持“当前瓶颈主要来自 known condition 不完整”这一判断。
+- 如果只提高点密度、不补姿态也能持续变好，就说明“条件过稀”同样是主要瓶颈。
 
 #### E. 增加 prefix-stability 指标
 
@@ -607,8 +626,9 @@ mask参数分别是random0.1、random0.2、3dpoints0.2
 
 ### 当前最值得保留的判断
 
-- `random0.2`: inpainting 倾向于正作用，值得继续挖。
-- `random0.1`: 效果高度敏感，说明方法并不稳，需要更细参数和更强约束设计。
-- `3dpoints0.2`: 现阶段不应继续盲目加大 `j/r`。新增 `r=5/8` 后结论依旧没变，更应该先补条件信息或改更保守的推理策略。
+- `random0.2`: 相比原始 no-inpaint 基线，inpainting 是明确正作用，值得继续挖。
+- `random0.1`: 相比原始 no-inpaint 基线，inpainting 也是正作用，但效果高度敏感，说明方法并不稳，需要更细参数和更强约束设计。
+- `3dpoints0.2`: 相比原始 no-inpaint 基线，inpainting 是负作用。新增 `r=5/8` 后结论依旧没变，更应该先补条件信息或改更保守的推理策略。
+- `3dpoints0.5`: 比 `3dpoints0.2` 乐观很多，但按同 checkpoint 公平比较，`j=1,r=0` 目前仍只是“接近 no-inpaint 基线”，还不能算明确正作用；它更适合被定义为“值得继续补更多 `j/r` 组合验证的中间状态”。
 
 把结论写在下面：

@@ -22,6 +22,7 @@ SUPPORTED_MASK_TYPES = {
     "full",
     "2D_video_trajectory",
     "2D_image_trajectory",
+    "mix0",
     "2D_partial_trajectory",
     "pose_AnyGrasp",
     "pose_motion_planning",
@@ -36,6 +37,7 @@ MIXED_SUPPORTED_MASK_TYPES = {
     "full",
     "2D_video_trajectory",
     "2D_image_trajectory",
+    "mix0",
     "2D_partial_trajectory",
     "pose_motion_planning",
     "points",
@@ -207,6 +209,15 @@ def apply_mask_to_actions(
 
     if mask_type in {"2D_video_trajectory", "2D_image_trajectory"}:
         keep_mask[:, 0:2] = True
+    elif mask_type == "mix0":
+        if n < 4:
+            raise ValueError(
+                f"mix0 requires trajectory length >= 4, got {n}"
+            )
+        keep_mask[:, 0:2] = True
+        retain_idx = _retain_random_rows(keep_mask, rng, retain_num=4)
+        keep_mask[retain_idx[0], :] = True
+        keep_mask[retain_idx[1:], 0:3] = True
     elif mask_type == "2D_partial_trajectory":
         if mask_seq_len >= n:
             raise ValueError(
