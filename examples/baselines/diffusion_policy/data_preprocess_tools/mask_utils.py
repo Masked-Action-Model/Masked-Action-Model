@@ -126,15 +126,24 @@ def build_mask_spec(
 def validate_mixed_mask_config(
     num_mask_type: int,
     mask_type_list: list[str],
-    mask_type_ratio_list: list[float],
-    mask_param_list: list[Any],
+    mask_composition_list: list[float] | None = None,
+    mask_ratio_list: list[Any] | None = None,
 ) -> None:
+    if mask_composition_list is None:
+        mask_composition_list = []
+    if mask_ratio_list is None:
+        mask_ratio_list = []
+
     if int(num_mask_type) < 0:
         raise ValueError(f"num_mask_type must be non-negative, got {num_mask_type}")
     if int(num_mask_type) == 0:
-        if len(mask_type_list) != 0 or len(mask_type_ratio_list) != 0 or len(mask_param_list) != 0:
+        if (
+            len(mask_type_list) != 0
+            or len(mask_composition_list) != 0
+            or len(mask_ratio_list) != 0
+        ):
             raise ValueError(
-                "num_mask_type=0 expects empty mask_type_list/mask_type_ratio_list/mask_param_list"
+                "num_mask_type=0 expects empty mask_type_list/mask_composition_list/mask_ratio_list"
             )
         return
 
@@ -142,24 +151,24 @@ def validate_mixed_mask_config(
         raise ValueError(
             f"len(mask_type_list)={len(mask_type_list)} != num_mask_type={num_mask_type}"
         )
-    if len(mask_type_ratio_list) != int(num_mask_type):
+    if len(mask_composition_list) != int(num_mask_type):
         raise ValueError(
-            f"len(mask_type_ratio_list)={len(mask_type_ratio_list)} != num_mask_type={num_mask_type}"
+            f"len(mask_composition_list)={len(mask_composition_list)} != num_mask_type={num_mask_type}"
         )
-    if len(mask_param_list) != int(num_mask_type):
+    if len(mask_ratio_list) != int(num_mask_type):
         raise ValueError(
-            f"len(mask_param_list)={len(mask_param_list)} != num_mask_type={num_mask_type}"
+            f"len(mask_ratio_list)={len(mask_ratio_list)} != num_mask_type={num_mask_type}"
         )
 
     total_ratio = 0.0
     for mask_type, ratio, raw_param in zip(
-        mask_type_list, mask_type_ratio_list, mask_param_list
+        mask_type_list, mask_composition_list, mask_ratio_list
     ):
         spec = build_mask_spec(mask_type=mask_type, raw_param=raw_param, ratio=ratio)
         total_ratio += float(spec["ratio"])
     if not np.isclose(total_ratio, 1.0, atol=1e-6):
         raise ValueError(
-            f"mask_type_ratio_list must sum to 1, got {total_ratio:.8f}"
+            f"mask_composition_list must sum to 1, got {total_ratio:.8f}"
         )
 
 
@@ -199,7 +208,10 @@ def apply_mask_to_actions(
     masked = np.full_like(action, fill_value=np.float32(masked_value))
     keep_mask = np.zeros((n, m), dtype=bool)
 
-    if mask_type in {"none", "full"}:
+    if mask_type == "none":
+        return masked, keep_mask
+
+    if mask_type == "full":
         masked = action.copy()
         keep_mask[:] = True
         return masked, keep_mask

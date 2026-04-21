@@ -51,6 +51,7 @@ from utils.control_error_utils import (
     aggregate_control_error,
     compute_control_error_results_from_rollouts,
     load_ce_eval_data,
+    load_source_episode_ids,
 )
 from utils.draw_p_t_curve_utils import (
     save_control_error_curve,
@@ -909,7 +910,7 @@ def _decode_meta_string(value):
     return str(value)
 
 
-def load_target_mask_ratio_entries(data_path: str) -> list[tuple[str, float]] | None:
+def load_target_mask_composition_entries(data_path: str) -> list[tuple[str, float]] | None:
     meta = load_dataset_meta(data_path)
     mixed_enabled = _meta_flag(meta, "mixed_mask_enabled", False)
     if not mixed_enabled:
@@ -922,15 +923,25 @@ def load_target_mask_ratio_entries(data_path: str) -> list[tuple[str, float]] | 
                 f"mask_slot_name_list_json/mask_slot_ratio_list_json length mismatch in {data_path}"
             )
         return [(str(label), float(ratio)) for label, ratio in zip(labels, ratios)]
-    if "mask_type_list_json" in meta and "mask_type_ratio_list_json" in meta:
+    if "mask_type_list_json" in meta and "mask_composition_list_json" in meta:
         labels = json.loads(_decode_meta_string(meta["mask_type_list_json"]))
-        ratios = json.loads(_decode_meta_string(meta["mask_type_ratio_list_json"]))
+        ratios = json.loads(_decode_meta_string(meta["mask_composition_list_json"]))
         if len(labels) != len(ratios):
             raise ValueError(
-                f"mask_type_list_json/mask_type_ratio_list_json length mismatch in {data_path}"
+                f"mask_type_list_json/mask_composition_list_json length mismatch in {data_path}"
             )
         return [(str(label), float(ratio)) for label, ratio in zip(labels, ratios)]
     return None
+
+
+def load_mask_assign_mode(data_path: str) -> str:
+    meta = load_dataset_meta(data_path)
+    if "mask_assign_mode" not in meta:
+        return "composition"
+    mode = _decode_meta_string(meta["mask_assign_mode"])
+    if mode not in {"composition", "one_demo_multi_mask"}:
+        raise ValueError(f"unsupported mask_assign_mode={mode!r} in {data_path}")
+    return mode
 
 
 def largest_remainder_counts(total_items: int, ratios: list[float]) -> list[int]:
@@ -951,11 +962,68 @@ def largest_remainder_counts(total_items: int, ratios: list[float]) -> list[int]
     return [int(v) for v in counts.tolist()]
 
 
+def select_source_demo_indices(
+    source_episode_ids: list[int],
+    num_source_demos: int | None,
+    seed: int,
+) -> list[int]:
+    if len(source_episode_ids) == 0:
+        return []
+
+    source_to_indices = defaultdict(list)
+    ordered_source_ids = []
+    for local_idx, source_episode_id in enumerate(source_episode_ids):
+        source_episode_id = int(source_episode_id)
+        if source_episode_id not in source_to_indices:
+            ordered_source_ids.append(source_episode_id)
+        source_to_indices[source_episode_id].append(int(local_idx))
+
+    if num_source_demos is None or num_source_demos >= len(ordered_source_ids):
+        selected_source_ids = set(ordered_source_ids)
+    elif num_source_demos <= 0:
+        selected_source_ids = set()
+    else:
+        rng = np.random.default_rng(seed)
+        shuffled_source_ids = list(ordered_source_ids)
+        rng.shuffle(shuffled_source_ids)
+        selected_source_ids = set(shuffled_source_ids[:num_source_demos])
+
+    selected_indices = []
+    for source_episode_id in ordered_source_ids:
+        if source_episode_id in selected_source_ids:
+            selected_indices.extend(source_to_indices[source_episode_id])
+    return sorted(selected_indices)
+
+
+def select_demo_indices_by_mask_assign_mode(
+    labels: list[str],
+    source_episode_ids: list[int],
+    num_select: int | None,
+    seed: int,
+    target_composition_entries: list[tuple[str, float]] | None,
+    mask_assign_mode: str,
+) -> list[int]:
+    if mask_assign_mode == "composition":
+        return stratified_select_demo_indices(
+            labels=labels,
+            num_select=num_select,
+            seed=seed,
+            target_composition_entries=target_composition_entries,
+        )
+    if mask_assign_mode == "one_demo_multi_mask":
+        return select_source_demo_indices(
+            source_episode_ids=source_episode_ids,
+            num_source_demos=num_select,
+            seed=seed,
+        )
+    raise ValueError(f"unsupported mask_assign_mode={mask_assign_mode!r}")
+
+
 def stratified_select_demo_indices(
     labels: list[str],
     num_select: int | None,
     seed: int,
-    target_ratio_entries: list[tuple[str, float]] | None = None,
+    target_composition_entries: list[tuple[str, float]] | None = None,
 ) -> list[int]:
     total_items = len(labels)
     if num_select is None or num_select >= total_items:
@@ -967,7 +1035,7 @@ def stratified_select_demo_indices(
     for idx, label in enumerate(labels):
         grouped_indices[str(label)].append(int(idx))
 
-    if target_ratio_entries is None:
+    if target_composition_entries is None:
         ordered_labels = sorted(grouped_indices.keys())
         target_items = [
             (label, len(grouped_indices[label]) / float(total_items))
@@ -975,13 +1043,13 @@ def stratified_select_demo_indices(
         ]
     else:
         target_items = []
-        for label, ratio in target_ratio_entries:
+        for label, composition in target_composition_entries:
             label = str(label)
             if label not in grouped_indices:
                 raise ValueError(
-                    f"label={label!r} from meta ratios not found in dataset selection"
+                    f"label={label!r} from meta composition not found in dataset selection"
                 )
-            target_items.append((label, float(ratio)))
+            target_items.append((label, float(composition)))
 
     target_counts = largest_remainder_counts(
         num_select, [ratio for _, ratio in target_items]
@@ -1078,7 +1146,12 @@ if __name__ == "__main__":
         eval_demo_path,
         num_traj=None,
     )
-    eval_target_ratio_entries = load_target_mask_ratio_entries(eval_demo_path)
+    eval_source_episode_ids_all = load_source_episode_ids(
+        eval_demo_path,
+        num_traj=None,
+    )
+    eval_mask_assign_mode = load_mask_assign_mode(eval_demo_path)
+    eval_target_composition_entries = load_target_mask_composition_entries(eval_demo_path)
     if len(eval_reset_seeds) == 0:
         raise ValueError(
             "Failed to infer evaluation reset seeds from eval demo metadata. "
@@ -1091,11 +1164,22 @@ if __name__ == "__main__":
         if len(eval_mask_type_slots_all) == len(eval_mask_types_all)
         else eval_mask_types_all
     )
-    eval_demo_indices = stratified_select_demo_indices(
+    eval_num_select = (
+        min(total_eval_demos, args.num_eval_demos)
+        if eval_mask_assign_mode == "composition"
+        else args.num_eval_demos
+    )
+    eval_demo_indices = select_demo_indices_by_mask_assign_mode(
         labels=eval_selection_labels[:total_eval_demos],
-        num_select=min(total_eval_demos, args.num_eval_demos),
+        source_episode_ids=eval_source_episode_ids_all[:total_eval_demos],
+        num_select=eval_num_select,
         seed=args.seed,
-        target_ratio_entries=eval_target_ratio_entries,
+        target_composition_entries=(
+            eval_target_composition_entries
+            if eval_mask_assign_mode == "composition"
+            else None
+        ),
+        mask_assign_mode=eval_mask_assign_mode,
     )
     if len(eval_reset_seeds) > 0:
         eval_reset_seeds = [
@@ -1114,6 +1198,7 @@ if __name__ == "__main__":
         f"[mas-window] num_demos={args.num_demos}, demo_path={args.demo_path}, "
         f"test_demo_path={args.test_demo_path}, eval_demo_path={eval_demo_path}, "
         f"eval_demo_metadata_path={args.eval_demo_metadata_path}, "
+        f"eval_mask_assign_mode={eval_mask_assign_mode}, "
         f"eval_demo_indices={eval_demo_indices}, "
         f"eval_reset_seeds={eval_reset_seeds if len(eval_reset_seeds) > 0 else None}, "
         f"eval_traj_ids={eval_traj_ids if len(eval_traj_ids) > 0 else None}"
@@ -1208,17 +1293,28 @@ if __name__ == "__main__":
         data_path=args.demo_path,
         num_traj=None,
     )
-    train_target_ratio_entries = load_target_mask_ratio_entries(args.demo_path)
+    train_source_episode_ids_all = load_source_episode_ids(
+        data_path=args.demo_path,
+        num_traj=None,
+    )
+    train_mask_assign_mode = load_mask_assign_mode(args.demo_path)
+    train_target_composition_entries = load_target_mask_composition_entries(args.demo_path)
     train_selection_labels = (
         train_mask_type_slots_all
         if len(train_mask_type_slots_all) == len(train_mask_types_all)
         else train_mask_types_all
     )
-    train_demo_indices = stratified_select_demo_indices(
+    train_demo_indices = select_demo_indices_by_mask_assign_mode(
         labels=train_selection_labels,
+        source_episode_ids=train_source_episode_ids_all,
         num_select=args.num_demos,
         seed=args.seed,
-        target_ratio_entries=train_target_ratio_entries,
+        target_composition_entries=(
+            train_target_composition_entries
+            if train_mask_assign_mode == "composition"
+            else None
+        ),
+        mask_assign_mode=train_mask_assign_mode,
     )
     selected_train_mask_types = [train_mask_types_all[i] for i in train_demo_indices]
     selected_train_mask_type_slots = [train_mask_type_slots_all[i] for i in train_demo_indices]
@@ -1266,6 +1362,11 @@ if __name__ == "__main__":
     print(f"[mixed-train] train total mask slot counts: {train_total_mask_slot_counts}")
     print(f"[mixed-train] eval mask type counts: {eval_mask_type_counts}")
     print(f"[mixed-train] eval mask slot counts: {eval_mask_slot_counts}")
+    print(
+        f"[mixed-train] mask_assign_mode: train={train_mask_assign_mode}, "
+        f"eval={eval_mask_assign_mode}, selected_train={len(train_demo_indices)}, "
+        f"selected_eval={len(eval_demo_indices)}"
+    )
 
     # ------------------------------------------------------------------------ #
     # 8. Build agent, EMA agent, optimizer, and LR scheduler

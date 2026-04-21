@@ -114,6 +114,16 @@ def parse_args() -> argparse.Namespace:
         help="环境 id，仅用于记录 meta 和后续对齐",
     )
     parser.add_argument(
+        "--mask-assign-mode",
+        type=str,
+        choices=["composition", "one_demo_multi_mask"],
+        default="composition",
+        help=(
+            "mixed mask 分配模式：composition=每条 demo 按比例分配一个 mask；"
+            "one_demo_multi_mask=每条 demo 复制为每个 mask slot 各一条。"
+        ),
+    )
+    parser.add_argument(
         "--num-mask-type",
         type=int,
         default=0,
@@ -126,16 +136,18 @@ def parse_args() -> argparse.Namespace:
         help="mask type 列表，支持 JSON / Python list / 逗号分隔字符串",
     )
     parser.add_argument(
-        "--mask-type-ratio-list",
+        "--mask-composition-list",
+        dest="mask_composition_list",
         type=str,
         default="[]",
-        help="mask 占比列表，支持 JSON / Python list / 逗号分隔字符串",
+        help="mask composition 列表，支持 JSON / Python list / 逗号分隔字符串",
     )
     parser.add_argument(
-        "--mask-param-list",
+        "--mask-ratio-list",
+        dest="mask_ratio_list",
         type=str,
         default="[]",
-        help="mask 参数列表，支持 JSON / Python list / 逗号分隔字符串",
+        help="mask ratio 列表，支持 JSON / Python list / 逗号分隔字符串",
     )
     parser.add_argument(
         "--train-num-mask-type",
@@ -150,16 +162,18 @@ def parse_args() -> argparse.Namespace:
         help="训练集 mask type 列表；未提供时回退到 --mask-type-list",
     )
     parser.add_argument(
-        "--train-mask-type-ratio-list",
+        "--train-mask-composition-list",
+        dest="train_mask_composition_list",
         type=str,
         default=None,
-        help="训练集 mask ratio 列表；未提供时回退到 --mask-type-ratio-list",
+        help="训练集 mask composition 列表；未提供时回退到 --mask-composition-list",
     )
     parser.add_argument(
-        "--train-mask-param-list",
+        "--train-mask-ratio-list",
+        dest="train_mask_ratio_list",
         type=str,
         default=None,
-        help="训练集 mask 参数列表；未提供时回退到 --mask-param-list",
+        help="训练集 mask ratio 列表；未提供时回退到 --mask-ratio-list",
     )
     parser.add_argument(
         "--eval-num-mask-type",
@@ -174,16 +188,18 @@ def parse_args() -> argparse.Namespace:
         help="评估集 mask type 列表；未提供时默认复制训练集配置",
     )
     parser.add_argument(
-        "--eval-mask-type-ratio-list",
+        "--eval-mask-composition-list",
+        dest="eval_mask_composition_list",
+        type=str,
+        default=None,
+        help="评估集 mask composition 列表；未提供时默认复制训练集配置",
+    )
+    parser.add_argument(
+        "--eval-mask-ratio-list",
+        dest="eval_mask_ratio_list",
         type=str,
         default=None,
         help="评估集 mask ratio 列表；未提供时默认复制训练集配置",
-    )
-    parser.add_argument(
-        "--eval-mask-param-list",
-        type=str,
-        default=None,
-        help="评估集 mask 参数列表；未提供时默认复制训练集配置",
     )
     parser.add_argument(
         "--mask-value",
@@ -263,46 +279,49 @@ def _resolve_split_mask_inputs(
     if split not in {"train", "eval"}:
         raise ValueError(f"unsupported split={split!r}")
 
-    legacy_num = int(getattr(args, "num_mask_type", 0))
-    legacy_type_list = getattr(args, "mask_type_list", "[]")
-    legacy_ratio_list = getattr(args, "mask_type_ratio_list", "[]")
-    legacy_param_list = getattr(args, "mask_param_list", "[]")
+    shared_num = int(getattr(args, "num_mask_type", 0))
+    shared_type_list = str(getattr(args, "mask_type_list", "[]"))
+    shared_composition_list = str(getattr(args, "mask_composition_list", "[]"))
+    shared_ratio_list = str(getattr(args, "mask_ratio_list", "[]"))
 
     train_num = getattr(args, "train_num_mask_type", None)
     train_type_list = getattr(args, "train_mask_type_list", None)
-    train_ratio_list = getattr(args, "train_mask_type_ratio_list", None)
-    train_param_list = getattr(args, "train_mask_param_list", None)
+    train_composition_list = getattr(args, "train_mask_composition_list", None)
+    train_ratio_list = getattr(args, "train_mask_ratio_list", None)
 
     if split == "train":
         return (
-            legacy_num if train_num is None else int(train_num),
-            legacy_type_list if train_type_list is None else str(train_type_list),
-            legacy_ratio_list if train_ratio_list is None else str(train_ratio_list),
-            legacy_param_list if train_param_list is None else str(train_param_list),
+            shared_num if train_num is None else int(train_num),
+            shared_type_list if train_type_list is None else str(train_type_list),
+            shared_composition_list
+            if train_composition_list is None
+            else str(train_composition_list),
+            shared_ratio_list if train_ratio_list is None else str(train_ratio_list),
         )
 
     eval_num = getattr(args, "eval_num_mask_type", None)
     eval_type_list = getattr(args, "eval_mask_type_list", None)
-    eval_ratio_list = getattr(args, "eval_mask_type_ratio_list", None)
-    eval_param_list = getattr(args, "eval_mask_param_list", None)
+    eval_composition_list = getattr(args, "eval_mask_composition_list", None)
+    eval_ratio_list = getattr(args, "eval_mask_ratio_list", None)
     train_resolved = _resolve_split_mask_inputs(args, split="train")
     return (
         train_resolved[0] if eval_num is None else int(eval_num),
         train_resolved[1] if eval_type_list is None else str(eval_type_list),
-        train_resolved[2] if eval_ratio_list is None else str(eval_ratio_list),
-        train_resolved[3] if eval_param_list is None else str(eval_param_list),
+        train_resolved[2] if eval_composition_list is None else str(eval_composition_list),
+        train_resolved[3] if eval_ratio_list is None else str(eval_ratio_list),
     )
 
 
 def _attach_mask_slot_metadata(mask_specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     counters: dict[str, int] = {}
     out = []
-    for spec in mask_specs:
+    for spec_index, spec in enumerate(mask_specs):
         one_spec = copy.deepcopy(spec)
         base_type = str(one_spec["mask_type"])
         slot_index = counters.get(base_type, 0)
         counters[base_type] = slot_index + 1
         slot_name = f"{base_type}#{slot_index}"
+        one_spec["mask_spec_index"] = int(spec_index)
         one_spec["mask_type_base"] = base_type
         one_spec["mask_slot_index"] = int(slot_index)
         one_spec["mask_type_slot"] = slot_name
@@ -322,17 +341,23 @@ def build_output_stem(
     output_prefix: str,
     train_mask_specs: list[dict[str, Any]],
     eval_mask_specs: list[dict[str, Any]] | None = None,
+    mask_assign_mode: str = "composition",
 ) -> str:
     if eval_mask_specs is None:
         eval_mask_specs = train_mask_specs
+    if mask_assign_mode not in {"composition", "one_demo_multi_mask"}:
+        raise ValueError(f"unsupported mask_assign_mode={mask_assign_mode!r}")
+    mode_token = "mixed" if mask_assign_mode == "composition" else "onedemo"
 
     if (
         len(train_mask_specs) == 1
         and len(eval_mask_specs) == 1
+        and train_mask_specs[0]["mask_type"] == eval_mask_specs[0]["mask_type"]
         and train_mask_specs[0]["mask_type"] in {"none", "full"}
-        and eval_mask_specs[0]["mask_type"] in {"none", "full"}
     ):
-        return f"{output_prefix}_none"
+        if mask_assign_mode != "composition":
+            return f"{output_prefix}_{mode_token}_{train_mask_specs[0]['mask_type']}"
+        return f"{output_prefix}_{train_mask_specs[0]['mask_type']}"
 
     train_tokens = [_build_readable_spec_token(spec) for spec in train_mask_specs]
     eval_tokens = [_build_readable_spec_token(spec) for spec in eval_mask_specs]
@@ -342,6 +367,7 @@ def build_output_stem(
         readable = f"train__{'__'.join(train_tokens)}__eval__{'__'.join(eval_tokens)}"
     canonical_json = json.dumps(
         {
+            "mask_assign_mode": mask_assign_mode,
             "train_mask_specs": train_mask_specs,
             "eval_mask_specs": eval_mask_specs,
         },
@@ -357,14 +383,17 @@ def build_output_stem(
             if train_mask_specs == eval_mask_specs
             else f"train__{train_readable}__eval__{eval_readable}"
         )
-    return f"{output_prefix}_mixed_{readable}_{digest}"
+    return f"{output_prefix}_{mode_token}_{readable}_{digest}"
 
 
 def normalize_split_mask_config(
     args: argparse.Namespace,
     split: str,
+    mask_assign_mode: str = "composition",
 ) -> list[dict[str, Any]]:
-    num_mask_type, mask_type_list_raw, mask_type_ratio_list_raw, mask_param_list_raw = (
+    if mask_assign_mode not in {"composition", "one_demo_multi_mask"}:
+        raise ValueError(f"unsupported mask_assign_mode={mask_assign_mode!r}")
+    num_mask_type, mask_type_list_raw, mask_composition_list_raw, mask_ratio_list_raw = (
         _resolve_split_mask_inputs(args, split=split)
     )
     if int(num_mask_type) == 0:
@@ -375,29 +404,46 @@ def normalize_split_mask_config(
     mask_type_list = [
         str(v) for v in _parse_list_arg(mask_type_list_raw, f"{split}_mask_type_list")
     ]
-    mask_type_ratio_list = [
-        float(v)
-        for v in _parse_list_arg(mask_type_ratio_list_raw, f"{split}_mask_type_ratio_list")
-    ]
-    mask_param_list = _parse_list_arg(mask_param_list_raw, f"{split}_mask_param_list")
+    mask_ratio_list = _parse_list_arg(mask_ratio_list_raw, f"{split}_mask_ratio_list")
+    if mask_assign_mode == "composition":
+        mask_composition_list = [
+            float(v)
+            for v in _parse_list_arg(mask_composition_list_raw, f"{split}_mask_composition_list")
+        ]
+    else:
+        if len(mask_type_list) != int(num_mask_type):
+            raise ValueError(
+                f"len(mask_type_list)={len(mask_type_list)} != num_mask_type={num_mask_type}"
+            )
+        if len(mask_ratio_list) != int(num_mask_type):
+            raise ValueError(
+                f"len(mask_ratio_list)={len(mask_ratio_list)} != num_mask_type={num_mask_type}"
+            )
+        mask_composition_list = [
+            1.0 / float(num_mask_type) for _ in range(int(num_mask_type))
+        ]
     validate_mixed_mask_config(
         num_mask_type=int(num_mask_type),
         mask_type_list=mask_type_list,
-        mask_type_ratio_list=mask_type_ratio_list,
-        mask_param_list=mask_param_list,
+        mask_composition_list=mask_composition_list,
+        mask_ratio_list=mask_ratio_list,
     )
     return _attach_mask_slot_metadata(
         [
             build_mask_spec(mask_type=mask_type, raw_param=raw_param, ratio=ratio)
             for mask_type, ratio, raw_param in zip(
-                mask_type_list, mask_type_ratio_list, mask_param_list
+                mask_type_list, mask_composition_list, mask_ratio_list
             )
         ]
     )
 
 
 def normalize_mixed_mask_config(args: argparse.Namespace) -> list[dict[str, Any]]:
-    return normalize_split_mask_config(args, split="train")
+    return normalize_split_mask_config(
+        args,
+        split="train",
+        mask_assign_mode=getattr(args, "mask_assign_mode", "composition"),
+    )
 
 
 def largest_remainder_counts(total_items: int, ratios: list[float]) -> list[int]:
@@ -448,6 +494,57 @@ def assign_mask_specs_to_episodes(
     return assigned
 
 
+def build_mask_jobs(
+    source_episode_ids: list[int],
+    mask_specs: list[dict[str, Any]],
+    mask_assign_mode: str,
+    seed: int,
+) -> list[dict[str, Any]]:
+    if mask_assign_mode not in {"composition", "one_demo_multi_mask"}:
+        raise ValueError(f"unsupported mask_assign_mode={mask_assign_mode!r}")
+
+    if mask_assign_mode == "composition":
+        assigned_mask_specs = assign_mask_specs_to_episodes(
+            source_episode_ids=source_episode_ids,
+            mask_specs=mask_specs,
+            seed=seed,
+        )
+        return [
+            dict(
+                source_episode_id=int(source_episode_id),
+                mask_spec=copy.deepcopy(assigned_mask_specs[int(source_episode_id)]),
+                source_mask_copy_key=(
+                    f"traj_{int(source_episode_id)}_"
+                    f"{int(assigned_mask_specs[int(source_episode_id)]['mask_spec_index'])}"
+                ),
+                rng_seed=int(seed) + int(source_episode_id),
+            )
+            for source_episode_id in source_episode_ids
+        ]
+
+    jobs = []
+    for source_episode_id in source_episode_ids:
+        for spec in mask_specs:
+            spec_index = int(spec["mask_spec_index"])
+            jobs.append(
+                dict(
+                    source_episode_id=int(source_episode_id),
+                    mask_spec=copy.deepcopy(spec),
+                    source_mask_copy_key=f"traj_{int(source_episode_id)}_{spec_index}",
+                    rng_seed=(
+                        int(seed)
+                        + int(source_episode_id) * 1009
+                        + int(spec_index) * 9176
+                    ),
+                )
+            )
+    rng = np.random.default_rng(seed)
+    if len(jobs) > 1:
+        order = rng.permutation(len(jobs)).tolist()
+        jobs = [jobs[i] for i in order]
+    return jobs
+
+
 def _mask_param_repr(mask_spec: dict[str, Any]) -> Any:
     if mask_spec["mask_type"] in MASK_TYPES_REQUIRING_RATIO:
         return float(mask_spec["retain_ratio"])
@@ -460,16 +557,22 @@ def build_split_metadata_json(
     source_metadata: dict,
     split_name: str,
     source_episode_ids: list[int],
+    mask_jobs: list[dict[str, Any]],
     input_h5: Path,
     input_json: Path,
     env_id: str,
     mask_specs: list[dict[str, Any]],
-    assigned_mask_specs: dict[int, dict[str, Any]],
     requested_train_mask_specs: list[dict[str, Any]],
     requested_eval_mask_specs: list[dict[str, Any]],
+    mask_assign_mode: str,
     split_seed: int,
     mask_seed: int,
 ) -> dict:
+    mask_composition_list = [float(spec["ratio"]) for spec in mask_specs]
+    mask_ratio_list = [_mask_param_repr(spec) for spec in mask_specs]
+    expanded_source_episode_ids = [
+        int(job["source_episode_id"]) for job in mask_jobs
+    ]
     output_metadata = {
         "env_info": copy.deepcopy(source_metadata.get("env_info", {})),
         "commit_info": copy.deepcopy(source_metadata.get("commit_info", {})),
@@ -480,16 +583,20 @@ def build_split_metadata_json(
             "source_h5": str(input_h5),
             "source_json": str(input_json),
             "source_episode_ids": [int(x) for x in source_episode_ids],
+            "expanded_source_episode_ids": expanded_source_episode_ids,
             "mixed_mask_enabled": True,
+            "mask_assign_mode": str(mask_assign_mode),
+            "source_num_episodes": int(len(source_episode_ids)),
+            "expanded_num_episodes": int(len(mask_jobs)),
             "num_mask_type": int(len(mask_specs)),
             "mask_specs": copy.deepcopy(mask_specs),
             "mask_type_list": [spec["mask_type"] for spec in mask_specs],
-            "mask_type_ratio_list": [float(spec["ratio"]) for spec in mask_specs],
-            "mask_param_list": [_mask_param_repr(spec) for spec in mask_specs],
+            "mask_composition_list": mask_composition_list,
+            "mask_ratio_list": mask_ratio_list,
             "mask_type_slot_list": [spec["mask_type_slot"] for spec in mask_specs],
             "mask_slot_name_list": [spec["mask_type_slot"] for spec in mask_specs],
-            "mask_slot_ratio_list": [float(spec["ratio"]) for spec in mask_specs],
-            "mask_slot_param_list": [_mask_param_repr(spec) for spec in mask_specs],
+            "mask_slot_ratio_list": mask_composition_list,
+            "mask_slot_param_list": mask_ratio_list,
             "requested_train_mask_specs": copy.deepcopy(requested_train_mask_specs),
             "requested_eval_mask_specs": copy.deepcopy(requested_eval_mask_specs),
             "split_seed": int(split_seed),
@@ -499,15 +606,18 @@ def build_split_metadata_json(
         },
     }
     episodes = source_metadata.get("episodes", [])
-    for local_episode_id, source_episode_id in enumerate(source_episode_ids):
+    for local_episode_id, job in enumerate(mask_jobs):
+        source_episode_id = int(job["source_episode_id"])
         if source_episode_id >= len(episodes):
             raise IndexError(
                 f"source_episode_id {source_episode_id} exceeds json episodes ({len(episodes)})"
             )
         episode = copy.deepcopy(episodes[source_episode_id])
-        mask_spec = assigned_mask_specs[int(source_episode_id)]
+        mask_spec = job["mask_spec"]
         episode["episode_id"] = int(local_episode_id)
         episode["source_episode_id"] = int(source_episode_id)
+        episode["source_mask_copy_key"] = str(job["source_mask_copy_key"])
+        episode["source_mask_copy_index"] = int(mask_spec["mask_spec_index"])
         episode["mask_type"] = str(mask_spec["mask_type"])
         episode["mask_type_slot"] = str(mask_spec["mask_type_slot"])
         episode["mask_slot_name"] = str(mask_spec["mask_type_slot"])
@@ -525,9 +635,15 @@ def _write_mask_spec_meta(
     mask_specs: list[dict[str, Any]],
     requested_train_mask_specs: list[dict[str, Any]],
     requested_eval_mask_specs: list[dict[str, Any]],
+    mask_assign_mode: str,
+    source_num_episodes: int,
+    expanded_num_episodes: int,
 ) -> None:
     meta_group.create_dataset("mixed_mask_enabled", data=np.bool_(True))
     meta_group.create_dataset("num_mask_type", data=np.int32(len(mask_specs)))
+    meta_group.create_dataset("source_num_episodes", data=np.int32(source_num_episodes))
+    meta_group.create_dataset("expanded_num_episodes", data=np.int32(expanded_num_episodes))
+    write_string_dataset(meta_group, "mask_assign_mode", str(mask_assign_mode))
     write_string_dataset(
         meta_group,
         "mask_specs_json",
@@ -540,7 +656,7 @@ def _write_mask_spec_meta(
     )
     write_string_dataset(
         meta_group,
-        "mask_type_ratio_list_json",
+        "mask_composition_list_json",
         json.dumps([float(spec["ratio"]) for spec in mask_specs]),
     )
     write_string_dataset(
@@ -555,7 +671,7 @@ def _write_mask_spec_meta(
     )
     write_string_dataset(
         meta_group,
-        "mask_param_list_json",
+        "mask_ratio_list_json",
         json.dumps([_mask_param_repr(spec) for spec in mask_specs]),
     )
     write_string_dataset(
@@ -595,15 +711,16 @@ def write_split_h5(
     output_h5: Path,
     split_name: str,
     source_episode_ids: list[int],
+    mask_jobs: list[dict[str, Any]],
     action_min: np.ndarray,
     action_max: np.ndarray,
     state_min: np.ndarray,
     state_max: np.ndarray,
     env_id: str,
     mask_specs: list[dict[str, Any]],
-    assigned_mask_specs: dict[int, dict[str, Any]],
     requested_train_mask_specs: list[dict[str, Any]],
     requested_eval_mask_specs: list[dict[str, Any]],
+    mask_assign_mode: str,
     mask_value: float,
     split_seed: int,
     mask_seed: int,
@@ -619,7 +736,7 @@ def write_split_h5(
         meta.create_dataset("action_dim", data=np.int32(MAS_ACTION_DIM))
         meta.create_dataset("state_dim", data=np.int32(state_min.shape[0]))
         meta.create_dataset("mas_dim", data=np.int32(MAS_STEP_DIM))
-        meta.create_dataset("num_episodes", data=np.int32(len(source_episode_ids)))
+        meta.create_dataset("num_episodes", data=np.int32(len(mask_jobs)))
         meta.create_dataset("mask_value", data=np.float32(mask_value))
         meta.create_dataset("split_seed", data=np.int32(split_seed))
         meta.create_dataset("mask_seed", data=np.int32(mask_seed))
@@ -636,6 +753,13 @@ def write_split_h5(
         )
         meta.create_dataset(
             "source_episode_ids",
+            data=np.asarray(
+                [int(job["source_episode_id"]) for job in mask_jobs],
+                dtype=np.int32,
+            ),
+        )
+        meta.create_dataset(
+            "unique_source_episode_ids",
             data=np.asarray(source_episode_ids, dtype=np.int32),
         )
         write_string_dataset(meta, "split", split_name)
@@ -647,12 +771,16 @@ def write_split_h5(
             mask_specs=mask_specs,
             requested_train_mask_specs=requested_train_mask_specs,
             requested_eval_mask_specs=requested_eval_mask_specs,
+            mask_assign_mode=mask_assign_mode,
+            source_num_episodes=len(source_episode_ids),
+            expanded_num_episodes=len(mask_jobs),
         )
 
-        for local_episode_id, source_episode_id in enumerate(source_episode_ids):
+        for local_episode_id, job in enumerate(mask_jobs):
+            source_episode_id = int(job["source_episode_id"])
             src_traj = src_file[f"traj_{source_episode_id}"]
             dst_traj = dst_file.create_group(f"traj_{local_episode_id}")
-            mask_spec = assigned_mask_specs[int(source_episode_id)]
+            mask_spec = job["mask_spec"]
 
             actions = np.asarray(src_traj["actions"][()], dtype=np.float32)
             normalized_actions = normalize_selected_dims(
@@ -674,7 +802,7 @@ def write_split_h5(
                     f"traj_{source_episode_id}: {normalized_state.shape[0]} vs {normalized_actions.shape[0]}"
                 )
 
-            traj_rng = np.random.default_rng(mask_seed + int(source_episode_id))
+            traj_rng = np.random.default_rng(int(job["rng_seed"]))
             masked_actions, keep_mask = apply_mask_to_actions(
                 normalized_actions,
                 mask_type=mask_spec["mask_type"],
@@ -689,7 +817,19 @@ def write_split_h5(
             )
 
             for key in src_traj.keys():
-                if key in {"actions", "mas", "mask", "mask_type", "retain_ratio", "mask_seq_len"}:
+                if key in {
+                    "actions",
+                    "mas",
+                    "mask",
+                    "mask_type",
+                    "mask_type_slot",
+                    "mask_slot_index",
+                    "retain_ratio",
+                    "mask_seq_len",
+                    "source_episode_id",
+                    "source_mask_copy_key",
+                    "source_mask_copy_index",
+                }:
                     continue
                 if key == "obs":
                     src_file.copy(src_traj["obs"], dst_traj, name="obs")
@@ -703,30 +843,53 @@ def write_split_h5(
             dst_traj.create_dataset("mas", data=mas)
             dst_traj.create_dataset("mask", data=keep_mask)
             dst_traj.create_dataset("source_episode_id", data=np.int32(source_episode_id))
+            write_string_dataset(
+                dst_traj,
+                "source_mask_copy_key",
+                str(job["source_mask_copy_key"]),
+            )
+            dst_traj.create_dataset(
+                "source_mask_copy_index",
+                data=np.int32(mask_spec["mask_spec_index"]),
+            )
             _write_traj_mask_spec(dst_traj, mask_spec)
 
 
 def _summarize_assignments(
     split_name: str,
-    source_episode_ids: list[int],
-    assigned_mask_specs: dict[int, dict[str, Any]],
+    mask_jobs: list[dict[str, Any]],
 ) -> None:
     slot_counts: dict[str, int] = {}
     type_counts: dict[str, int] = {}
-    for source_episode_id in source_episode_ids:
-        one_spec = assigned_mask_specs[int(source_episode_id)]
+    source_episode_ids = []
+    for job in mask_jobs:
+        source_episode_ids.append(int(job["source_episode_id"]))
+        one_spec = job["mask_spec"]
         mask_type = str(one_spec["mask_type"])
         mask_slot = str(one_spec["mask_type_slot"])
         type_counts[mask_type] = type_counts.get(mask_type, 0) + 1
         slot_counts[mask_slot] = slot_counts.get(mask_slot, 0) + 1
+    unique_source_count = len(set(source_episode_ids))
+    print(
+        f"[mixed_preprocess] {split_name} source trajs={unique_source_count}, "
+        f"expanded trajs={len(mask_jobs)}"
+    )
     print(f"[mixed_preprocess] {split_name} mask slot counts: {dict(sorted(slot_counts.items()))}")
     print(f"[mixed_preprocess] {split_name} mask type counts: {dict(sorted(type_counts.items()))}")
 
 
 def main() -> None:
     args = parse_args()
-    train_mask_specs = normalize_split_mask_config(args, split="train")
-    eval_mask_specs = normalize_split_mask_config(args, split="eval")
+    train_mask_specs = normalize_split_mask_config(
+        args,
+        split="train",
+        mask_assign_mode=args.mask_assign_mode,
+    )
+    eval_mask_specs = normalize_split_mask_config(
+        args,
+        split="eval",
+        mask_assign_mode=args.mask_assign_mode,
+    )
 
     input_h5 = args.input_h5.resolve()
     input_json = (
@@ -751,6 +914,7 @@ def main() -> None:
         output_prefix=output_prefix,
         train_mask_specs=train_mask_specs,
         eval_mask_specs=eval_mask_specs,
+        mask_assign_mode=args.mask_assign_mode,
     )
 
     with h5py.File(input_h5, "r") as src_file:
@@ -769,14 +933,16 @@ def main() -> None:
         source_episode_ids=source_episode_ids,
         split_seed=args.split_seed,
     )
-    train_assignments = assign_mask_specs_to_episodes(
+    train_jobs = build_mask_jobs(
         source_episode_ids=train_ids,
         mask_specs=train_mask_specs,
+        mask_assign_mode=args.mask_assign_mode,
         seed=args.mask_seed,
     )
-    eval_assignments = assign_mask_specs_to_episodes(
+    eval_jobs = build_mask_jobs(
         source_episode_ids=eval_ids,
         mask_specs=eval_mask_specs,
+        mask_assign_mode=args.mask_assign_mode,
         seed=args.mask_seed + 1_000_003,
     )
 
@@ -797,15 +963,16 @@ def main() -> None:
         output_h5=train_h5,
         split_name="train",
         source_episode_ids=train_ids,
+        mask_jobs=train_jobs,
         action_min=action_min,
         action_max=action_max,
         state_min=state_min,
         state_max=state_max,
         env_id=args.env_id,
         mask_specs=train_mask_specs,
-        assigned_mask_specs=train_assignments,
         requested_train_mask_specs=train_mask_specs,
         requested_eval_mask_specs=eval_mask_specs,
+        mask_assign_mode=args.mask_assign_mode,
         mask_value=args.mask_value,
         split_seed=args.split_seed,
         mask_seed=args.mask_seed,
@@ -817,13 +984,14 @@ def main() -> None:
             source_metadata=metadata,
             split_name="train",
             source_episode_ids=train_ids,
+            mask_jobs=train_jobs,
             input_h5=input_h5,
             input_json=input_json,
             env_id=args.env_id,
             mask_specs=train_mask_specs,
-            assigned_mask_specs=train_assignments,
             requested_train_mask_specs=train_mask_specs,
             requested_eval_mask_specs=eval_mask_specs,
+            mask_assign_mode=args.mask_assign_mode,
             split_seed=args.split_seed,
             mask_seed=args.mask_seed,
         ),
@@ -835,15 +1003,16 @@ def main() -> None:
             output_h5=eval_h5,
             split_name="eval",
             source_episode_ids=eval_ids,
+            mask_jobs=eval_jobs,
             action_min=action_min,
             action_max=action_max,
             state_min=state_min,
             state_max=state_max,
             env_id=args.env_id,
             mask_specs=eval_mask_specs,
-            assigned_mask_specs=eval_assignments,
             requested_train_mask_specs=train_mask_specs,
             requested_eval_mask_specs=eval_mask_specs,
+            mask_assign_mode=args.mask_assign_mode,
             mask_value=args.mask_value,
             split_seed=args.split_seed,
             mask_seed=args.mask_seed + 1_000_003,
@@ -855,13 +1024,14 @@ def main() -> None:
                 source_metadata=metadata,
                 split_name="eval",
                 source_episode_ids=eval_ids,
+                mask_jobs=eval_jobs,
                 input_h5=input_h5,
                 input_json=input_json,
                 env_id=args.env_id,
                 mask_specs=eval_mask_specs,
-                assigned_mask_specs=eval_assignments,
                 requested_train_mask_specs=train_mask_specs,
                 requested_eval_mask_specs=eval_mask_specs,
+                mask_assign_mode=args.mask_assign_mode,
                 split_seed=args.split_seed,
                 mask_seed=args.mask_seed + 1_000_003,
             ),
@@ -869,12 +1039,14 @@ def main() -> None:
 
     print(
         "[data_preprocess_mixed] done: "
-        f"train={len(train_ids)} trajs -> {train_h5}, "
-        f"eval={len(eval_ids)} trajs -> {eval_h5 if len(eval_ids) > 0 else 'N/A'}"
+        f"mode={args.mask_assign_mode}, "
+        f"train={len(train_ids)} source/{len(train_jobs)} expanded trajs -> {train_h5}, "
+        f"eval={len(eval_ids)} source/{len(eval_jobs)} expanded trajs -> "
+        f"{eval_h5 if len(eval_ids) > 0 else 'N/A'}"
     )
-    _summarize_assignments("train", train_ids, train_assignments)
+    _summarize_assignments("train", train_jobs)
     if len(eval_ids) > 0:
-        _summarize_assignments("eval", eval_ids, eval_assignments)
+        _summarize_assignments("eval", eval_jobs)
     print(
         "[data_preprocess_mixed] stats: "
         f"action_dim={MAS_ACTION_DIM}, state_dim={state_min.shape[0]}, mas_dim={MAS_STEP_DIM}"

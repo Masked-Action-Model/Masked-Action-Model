@@ -30,6 +30,66 @@
 - `utils/denormalize_utils.py` 现在支持直接从预处理后的 `h5/meta` 读取 `action_min/max`
 - `utils/add_progress_to_mas_utils.py` 现在对已经是 `(T, 8)` 的 `mas` 幂等，不会重复加 progress
 
+## 更新（2026-04-17）
+
+针对文档末尾“multimask training 时每个训练 batch 是否混合”的问题，结合当前代码实现，结论如下：
+
+- 当前 **mixed preprocess 是按轨迹分配 mask type**，不是按 step 分配。
+  - 见 `data_preprocess_mixed.py` 中的 `assign_mask_specs_to_episodes(...)`
+  - 先按 ratio 给每条 `source_episode_id` 分配一个 `mask_spec`
+  - 每条轨迹在写入 `train/eval.h5` 时只会带一种 `mask_type`
+
+- 当前 **mixed train 的一个 batch 通常是混合的**，不是“一个 mask type 训完再训下一个”。
+  - 见 `train_mas_window_mixed.py`
+  - 训练集先按 `mask_type_slot` 做一次分层抽样，保证选入的 demo 总体比例接近目标比例
+  - 之后 `Dataset` 会把每条轨迹展开成很多 `slice`
+  - 再用 `RandomSampler(dataset, replacement=False)` 对这些 slice 随机打乱
+  - `BatchSampler` 是直接从这个随机顺序里按 batch size 切块
+  - 所以一个 batch 里的样本通常会来自不同轨迹，也通常会来自不同 mask type
+
+- 但要注意：当前实现只是“随机混合”，**不是每个 batch 都严格按 mask ratio 配平**。
+  - 某个 batch 可能刚好全是同一种 mask，也可能是多种混合
+  - 从长期统计上看会混合，但单个 batch 没有硬约束
+  - 另外由于采样单位是 `slice`，轨迹更长的 demo 会贡献更多训练样本，因此训练时实际看到的 mask 占比更接近“按 slice 数加权后的比例”，不完全等于“按轨迹条数”的比例
+
+两种方式的利弊如下。
+
+### 方式 A：当前实现这种“batch 内随机混合”
+
+优点：
+
+- 每个优化 step 都更容易看到多种 mask 条件，梯度更平滑
+- 不容易连续很多 step 都只朝某一种 mask 过拟合
+- 更接近“共享主干、统一策略”这类多任务训练的常见做法
+- 实现简单，直接复用标准 `RandomSampler`
+
+缺点：
+
+- 单个 batch 的 mask 组成不可控，方差较大
+- 如果不同 mask 难度差异很大，容易互相干扰
+- 更长轨迹会自然占更多 slice，导致实际训练占比和预设 ratio 不完全一致
+
+### 方式 B：按 mask type 分组，依次训练
+
+优点：
+
+- 每个 batch 语义更纯，梯度方向更集中
+- 更容易做分组对比、debug 和 curriculum
+- 如果某些 mask 需要更高训练强度，可以单独调度
+
+缺点：
+
+- 连续很多 step 只看一种 mask，容易对当前组短期过拟合
+- 组与组之间梯度切换更剧烈，训练更不平稳
+- 共享策略会更容易出现“刚学会 A 又被 B 冲掉”的现象
+- 需要额外实现 grouped sampler / grouped batch sampler，训练管线更复杂
+
+因此，按当前代码和目标来看：
+
+- **现在的实现是“轨迹级分配 + batch 级随机混合”**
+- 如果目标是训练一个能统一处理多种 mask 的单策略，这通常是更合适的默认方案
+- 如果后面发现某些 mask 明显被压制，再考虑引入“按 mask 分组采样”或“每 batch 强制配比”的 sampler 会更稳妥
+
 当前 smoke test 命令：
 
 ```bash
@@ -475,3 +535,8 @@ demos/data_1_preprocessed/
 6. 最后统一清理 shell 参数与旧兼容代码
 
 这样改动面最可控，也最容易 debug。
+
+## 下一步指示
+
+在增加multimasktraining的工作流后，数据集进行了混合，但我需要你调研确认，在每个训练batch里是否混合，还是每种类别依次训练？
+并且分析两种方式的利弊。

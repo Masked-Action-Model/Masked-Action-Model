@@ -317,3 +317,75 @@ train_rgbd.py/evaluate.py/....sh
 - 现在可以直接用：
   - `examples/baselines/diffusion_policy_old/run_train_rgbd.sh`
   - 跑出来的 old 训练/评估口径就已经与当前 new 的 `3D_points_0.1` train/eval split 对齐。
+
+## 进一步指示
+
+我找到了另一份代码，可能之前用于对比分析的train_rgbd pipeline搞错了，导致分析结果有误，现在找到了真正跑出60%成功率的那套dit代码（在dp_old里的带_origin后缀的train、eval、sh文件）。请你仔细对比两套pipeline，找出所有不同之处，然后分析是否是影响成功率的关键。
+
+结论：
+
+- 我对比了三组文件：
+  - `train_rgbd.py` vs `train_rgbd_origin.py`
+  - `diffusion_policy/evaluate.py` vs `evaluate_origin.py`
+  - `run_train_rgbd.sh` vs `run_train_rgbd_origin.sh`
+
+- 最重要的结论先写：
+  - **`train_rgbd.py` 和 `train_rgbd_origin.py` 里的 DiT `Agent` 主体完全一致。**
+  - 也就是说：visual encoder / DiTNoiseNet / diffusion scheduler / `compute_loss` / `get_action` / action denorm 逻辑都不是这两套 olddp pipeline 的差异来源。
+  - 所以“origin 能到 60%”不能解释成 origin 有另一套更强的 DiT 模型代码；真正差异一定在 **训练数据、训练/评估 seed 口径、训练时长/批大小、或当时的 checkpoint 历史**。
+
+- `*_origin` 三件套当前还有一个很关键的问题：**按现在工作区里的文件，它们并不是一套可直接复现的闭环 pipeline。**
+  - `run_train_rgbd_origin.sh` 最后一行指向的是 `examples/baselines/diffusion_policy/train_rgbd.py`，但这个文件当前不存在。
+  - `run_train_rgbd_origin.sh` 默认数据是 `demos/data_1/data_1_concat_train.h5`，这个文件当前也不存在。
+  - `train_rgbd_origin.py` 实际 import 的是 `from diffusion_policy.evaluate import evaluate`，不是根目录下的 `evaluate_origin.py`；所以如果现在直接跑 `train_rgbd_origin.py`，它不会自动使用 `evaluate_origin.py`。
+  - 因此，当前 repo 里的 `*_origin` 文件更像是从旧位置拷出来的残片；它们能帮助定位差异，但不能单独证明“现在这套文件原样就是当时 60% 的完整运行环境”。
+
+- 训练脚本层面的差异：
+  - origin 默认 `EXP_NAME=PickCube_rgbd`，非 origin 默认 `EXP_NAME=dit_old`。
+  - origin 默认 `DEMO_PATH=demos/data_1/data_1_concat_train.h5`；非 origin 当前默认 `DEMO_PATH=demos/data_1/data_1_normed.h5`。
+  - origin 没有 train/eval metadata 对齐参数；非 origin 当前新增了：
+    - `source_demo_metadata_path`
+    - `train_seed_reference_metadata_path`
+    - `eval_demo_metadata_path`
+  - origin 默认 `TOTAL_ITERS=200000, BATCH_SIZE=32, NUM_EVAL_ENVS=10`。
+  - 非 origin 当前默认 `TOTAL_ITERS=500000, BATCH_SIZE=64, NUM_EVAL_ENVS=1`，并且 eval 走 new split 的固定 `100` 个 reset seed。
+  - 这些里面最可能影响成功率判断的是 **数据文件和 eval seed 口径**；batch/iter 也可能影响最终强度，但不属于实现 bug。
+
+- train 文件层面的差异：
+  - 非 origin 新增了按 new train metadata 的 reset seed 回查 old H5 `traj_id` 的逻辑；origin 只会按 H5 里的顺序取前 `num_demos` 条。
+  - 非 origin 新增了 fixed eval reset list；origin eval 不读任何 eval metadata。
+  - 非 origin dataset 支持 `traj_ids`；origin dataset 不支持。
+  - 非 origin 把 dataset tensor 保持在 CPU，训练 batch 时再搬到 GPU；origin 在 dataset 初始化时就把 rgb/depth/state/action 放到 device。
+  - 这个 CPU/GPU 搬运差异主要影响速度/显存，不应该是成功率从 0 到 60% 的关键。
+
+- eval 文件层面的差异：
+  - `evaluate_origin.py` 是 old-style eval：直接 `eval_envs.reset()`，不接收 fixed seed list，不读 demo metadata。
+  - 当前 `diffusion_policy/evaluate.py` 支持 `reset_kwargs_list`，因此可以逐条 reset 到 new eval split 的 100 个 seed。
+  - 所以 origin 的训练日志成功率和 newdp 的 held-out demo-seed eval 仍然不是同一个指标。
+
+- 关于 `data_1_concat_train.h5`：
+  - 这是现在最关键但缺失的变量。
+  - 当前工作区没有这个文件，所以我无法核实它当时到底包含哪些轨迹、什么 split、是否重编号、是否和 new train split 对齐。
+  - 但从 `concat_mas_h5.py` 的逻辑看，concat 数据里的 `actions` 应该来自 normalized 数据；而 `train_rgbd_origin.py` 只读取 `obs/actions`，会忽略 `mas/mask`。因此如果 `data_1_concat_train.h5` 的 `obs/actions/traj` 与 `data_1_normed.h5` 等价，那么 concat 格式本身不应带来 60% 差异。
+  - 真正可能造成差异的是：`data_1_concat_train.h5` 当时的 **轨迹集合、轨迹顺序、split 方式、或数据版本** 和现在的 `data_1_normed.h5` 不一样。
+
+- 对之前结论的修正：
+  - 之前关于 `runs/dit_old` 这个 100k ckpt 的 overlap 结论仍然成立：它在 new eval100 上主要吃 overlap，non-overlap 基本不行。
+  - 但这个结论不能外推到 `runs/dit_old_original` / origin 高成功率 pipeline。
+  - 因为 `dit_old_original` 在 new held-out eval100 上已经测到：
+    - 总体 `success_once = 0.66`
+    - non-overlap `success_once = 0.5823`
+  - 这说明 `dit_old_original` checkpoint 本身确实强，不只是 origin eval protocol 虚高。
+
+- 现在最稳的判断：
+  - **old_original 强、dit_old 弱，核心差异不在 DiT 代码主体。**
+  - 最大嫌疑是 **当时 old_original 使用的训练数据/数据 split/训练轮数/训练历史** 与后来复现实验不同，尤其是当前缺失的 `data_1_concat_train.h5`。
+  - 因此接下来要找真正原因，第一优先级不是继续改 DiT 结构，而是恢复或确认 old_original 当时的完整运行输入：
+    - 原始 `run_train_rgbd_origin.sh` 实际调用的 python 文件；
+    - `data_1_concat_train.h5` 的真实内容；
+    - old_original 的训练步数、batch size、eval 口径；
+    - 是否使用了当前缺失/已重写的数据版本。
+
+- 最有判别力的下一步实验：
+  - 找回 `data_1_concat_train.h5` 后，用同一份数据、同一批 train seeds、同一套 fixed new eval seeds，分别跑 `train_rgbd_origin.py` 和当前 `train_rgbd.py`。
+  - 由于两者 `Agent` 完全一致，如果结果仍然大幅不同，才说明 dataset/eval 之外还有隐藏代码差异；如果结果接近，就可以确认 bug 不在 olddp DiT 代码，而在数据版本或实验口径。

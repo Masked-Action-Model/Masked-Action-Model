@@ -11,10 +11,10 @@
 具体输入方式：（sh文件中）
 - num_mask_type:n
 - mask_type_list:['type1','type2',...] (读取输入的列表，验证总数是否为n，以及名字合法)
-- mask_type_ratio_list:[0.2,0.2,0.5,...] (读取输入的列表，验证是否和为1)
+- mask_composition_list:[0.2,0.2,0.5,...] (读取输入的列表，验证是否和为1)
 **指每种mask的占比，在train和eval集中保持一致**
-- mask_param_list:[0.3,0.3,20,...] (读取输入的列表，验证masktype和param是否对应)
-**注意这个mask_param列指的是每种mask所需要的额外参数，详见后面mask类型说明中，前四种masktype需要‘retain_ratio’,后两种需要‘mask_seq_len’,最后一种不需要额外参数。因此需要验证，若所需ratio则在01之间，若所需len，则在1-100之间，若不需要额外参数，则不读取该位置的参数** 
+- mask_ratio_list:[0.3,0.3,20,...] (读取输入的列表，验证masktype和param是否对应)
+**注意这个mask_ratio列指的是每种mask所需要的额外参数，详见后面mask类型说明中，前四种masktype需要‘retain_ratio’,后两种需要‘mask_seq_len’,最后一种不需要额外参数。因此需要验证，若所需ratio则在01之间，若所需len，则在1-100之间，若不需要额外参数，则不读取该位置的参数** 
 - mask_value (保留这个参数，一般仍设为0)
 
 ## 单一mask相关配置
@@ -84,22 +84,22 @@ mask 类型说明：
 
 - `num_mask_type = 0`：
   - 等价于单一 `none`。
-  - 不读取 `mask_type_list / mask_type_ratio_list / mask_param_list`。
+  - 不读取 `mask_type_list / mask_composition_list / mask_ratio_list`。
 
 - `num_mask_type > 0`：
-  - `len(mask_param_list) == len(mask_type_list) == len(mask_type_ratio_list) == num_mask_type`
+  - `len(mask_ratio_list) == len(mask_type_list) == len(mask_composition_list) == num_mask_type`
 
-- `mask_type_ratio_list` 校验：
+- `mask_composition_list` 校验：
   - 每个值都在 `[0,1]`
   - 总和为 `1`
 
-- `mask_param_list` 校验：
+- `mask_ratio_list` 校验：
   - `points / 3D_points / pose_motion_planning / random_mask`：读取为 `retain_ratio`，要求在 `(0,1]`
   - `2D_partial_trajectory / local_planner`：读取为 `mask_seq_len`，要求在 `[1,100]`
   - `2D_video_trajectory / 2D_image_trajectory / mix0`：忽略该位置参数
 
 - split 内分配算法：
-  - 输入：该 split 的 `source_episode_ids` 和 `mask_type_ratio_list`
+  - 输入：该 split 的 `source_episode_ids` 和 `mask_composition_list`
   - 先算每个 mask 的期望数量 `ratio * num_episodes`
   - 再用“最大余数法”取整，保证总数严格等于该 split 的 episode 数
   - 然后用固定随机种子打乱该 split 的 episode 顺序，按数量切块分配给各个 mask
@@ -121,8 +121,8 @@ mask 类型说明：
   - 只保留 mixed 所需变量：
     - `NUM_MASK_TYPE`
     - `MASK_TYPE_LIST`
-    - `MASK_TYPE_RATIO_LIST`
-    - `MASK_PARAM_LIST`
+    - `MASK_COMPOSITION_LIST`
+    - `MASK_RATIO_LIST`
   - 始终调用 `data_preprocess_mixed.py`
   - 输出目录后缀不要再只看单一 `PREPROCESS_MASK_TYPE`，而是根据整组 mixed spec 生成一个 canonical suffix，避免不同 mixed 配置写到同一路径
 
@@ -145,8 +145,8 @@ mask 类型说明：
 - 新增参数解析：
   - `--num-mask-type`
   - `--mask-type-list`
-  - `--mask-type-ratio-list`
-  - `--mask-param-list`
+  - `--mask-composition-list`
+  - `--mask-ratio-list`
 
 - 新增/调整函数设计：
   - `parse_args()`
@@ -247,7 +247,7 @@ mask 类型说明：
   - `validate_mask_config(...)`
     - 继续负责“单个 mask_type 的参数是否合法”
 
-  - `validate_mixed_mask_config(num_mask_type, mask_type_list, mask_type_ratio_list, mask_param_list)`
+  - `validate_mixed_mask_config(num_mask_type, mask_type_list, mask_composition_list, mask_ratio_list)`
     - 新函数
     - 负责 mixed 级别校验：数量、名字、ratio 总和、参数类型和范围
 
@@ -283,8 +283,8 @@ mask 类型说明：
   - `mixed_mask_enabled`
   - `num_mask_type`
   - `mask_type_list`
-  - `mask_type_ratio_list`
-  - `mask_param_list`
+  - `mask_composition_list`
+  - `mask_ratio_list`
 
 - `traj` 级别新增：
   - `mask_type`
@@ -339,7 +339,7 @@ mask 类型说明：
 但训练侧在读取 h5 `meta` 时，会把：
 
 - `mask_type_list_json`
-- `mask_type_ratio_list_json`
+- `mask_composition_list_json`
 
 压成一个 `dict[str, float]`。
 
@@ -454,8 +454,8 @@ mask 类型说明：
 原有字段建议保留，但语义调整为“原始输入顺序”：
 
 - `mask_type_list_json`
-- `mask_type_ratio_list_json`
-- `mask_param_list_json`
+- `mask_composition_list_json`
+- `mask_ratio_list_json`
 
 `traj` 级别建议新增：
 
@@ -527,8 +527,8 @@ mask 类型说明：
 
 - `NUM_MASK_TYPE`
 - `MASK_TYPE_LIST`
-- `MASK_TYPE_RATIO_LIST`
-- `MASK_PARAM_LIST`
+- `MASK_COMPOSITION_LIST`
+- `MASK_RATIO_LIST`
 
 然后 train split 和 eval split 只是：
 
@@ -552,15 +552,15 @@ mask 类型说明：
 
 - `TRAIN_NUM_MASK_TYPE`
 - `TRAIN_MASK_TYPE_LIST`
-- `TRAIN_MASK_TYPE_RATIO_LIST`
-- `TRAIN_MASK_PARAM_LIST`
+- `TRAIN_MASK_COMPOSITION_LIST`
+- `TRAIN_MASK_RATIO_LIST`
 
 测试集配置：
 
 - `EVAL_NUM_MASK_TYPE`
 - `EVAL_MASK_TYPE_LIST`
-- `EVAL_MASK_TYPE_RATIO_LIST`
-- `EVAL_MASK_PARAM_LIST`
+- `EVAL_MASK_COMPOSITION_LIST`
+- `EVAL_MASK_RATIO_LIST`
 
 其余通用参数继续保留：
 
@@ -586,15 +586,15 @@ mask 类型说明：
 
 - `--train-num-mask-type`
 - `--train-mask-type-list`
-- `--train-mask-type-ratio-list`
-- `--train-mask-param-list`
+- `--train-mask-composition-list`
+- `--train-mask-ratio-list`
 
 评估 split：
 
 - `--eval-num-mask-type`
 - `--eval-mask-type-list`
-- `--eval-mask-type-ratio-list`
-- `--eval-mask-param-list`
+- `--eval-mask-composition-list`
+- `--eval-mask-ratio-list`
 
 内部处理上：
 
@@ -748,7 +748,7 @@ train/eval 的分配算法仍相同，只是输入 spec 不再共享。
 2. 否则回退到旧字段：
    - `mask_type`
    - `mask_type_list_json`
-   - `mask_type_ratio_list_json`
+   - `mask_composition_list_json`
 
 这样：
 
