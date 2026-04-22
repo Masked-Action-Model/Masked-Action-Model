@@ -6,13 +6,33 @@ import numpy as np
 
 try:
     from evaluate.evaluate_mas_window import evaluate_mas_window
+    from utils.draw_p_t_curve_utils import save_progress_curve_for_video
+    from utils.eval_video_sampling_utils import build_eval_batches
     from utils.load_eval_data_utils import subset_eval_data
+    from utils.video_utils import (
+        collect_failed_video,
+        collect_success_video,
+        delete_new_video_files,
+        snapshot_video_files,
+    )
 except ModuleNotFoundError:
     from examples.baselines.diffusion_policy.evaluate.evaluate_mas_window import (
         evaluate_mas_window,
     )
+    from examples.baselines.diffusion_policy.utils.draw_p_t_curve_utils import (
+        save_progress_curve_for_video,
+    )
+    from examples.baselines.diffusion_policy.utils.eval_video_sampling_utils import (
+        build_eval_batches,
+    )
     from examples.baselines.diffusion_policy.utils.load_eval_data_utils import (
         subset_eval_data,
+    )
+    from examples.baselines.diffusion_policy.utils.video_utils import (
+        collect_failed_video,
+        collect_success_video,
+        delete_new_video_files,
+        snapshot_video_files,
     )
 
 
@@ -33,21 +53,6 @@ def _summarize_metric_dict(metrics: dict) -> dict:
         summary[key] = float(np.mean(array)) if array.size > 0 else float("nan")
     summary["num_episodes"] = num_episodes
     return summary
-
-
-def _build_padded_eval_batches(total_items: int, batch_size: int):
-    if total_items <= 0:
-        return []
-    if batch_size <= 0:
-        raise ValueError(f"batch_size must be positive, got {batch_size}")
-    batches = []
-    for start in range(0, total_items, batch_size):
-        valid_indices = list(range(start, min(start + batch_size, total_items)))
-        padded_indices = valid_indices[:]
-        while len(padded_indices) < batch_size:
-            padded_indices.append(valid_indices[-1])
-        batches.append((padded_indices, len(valid_indices)))
-    return batches
 
 
 def _group_indices_by_labels(
@@ -118,30 +123,42 @@ def evaluate_one_mask_group(
     reset_seeds: list[int] | None = None,
     return_progress_curves: bool = False,
     return_rollout_records: bool = False,
+    capture_indices: set[int] | None = None,
+    video_dir: str | None = None,
+    iteration: int | None = None,
+    eval_traj_ids: list[int] | None = None,
 ):
     if len(group_indices) == 0:
         raise ValueError(f"group {group_label!r} is empty")
-
-    grouped_eval_data = subset_eval_data(eval_mas_window_data, group_indices)
-    grouped_reset_seeds = None
-    if reset_seeds is not None:
-        grouped_reset_seeds = [reset_seeds[i] for i in group_indices]
+    if video_dir is not None and iteration is None:
+        raise ValueError("iteration is required when video_dir is provided")
 
     aggregated_metrics = defaultdict(list)
     aggregated_progress_records = [] if return_progress_curves else None
     aggregated_rollout_records = [] if return_rollout_records else None
     batch_size = int(eval_envs.num_envs)
 
-    for padded_indices, valid_batch_size in _build_padded_eval_batches(
-        len(group_indices), batch_size
-    ):
-        batch_eval_data = subset_eval_data(grouped_eval_data, padded_indices)
+    eval_batches = build_eval_batches(
+        group_indices,
+        batch_size,
+        capture_indices=capture_indices,
+    )
+    for eval_batch in eval_batches:
+        batch_indices = eval_batch.indices
+        valid_batch_size = eval_batch.valid_count
+        batch_eval_data = subset_eval_data(eval_mas_window_data, batch_indices)
         batch_reset_seeds = None
-        if grouped_reset_seeds is not None:
-            batch_reset_seeds = [grouped_reset_seeds[i] for i in padded_indices]
+        if reset_seeds is not None:
+            batch_reset_seeds = [reset_seeds[i] for i in batch_indices]
+        batch_return_progress_curves = return_progress_curves and (
+            video_dir is None or eval_batch.capture_index is not None
+        )
+        video_snapshot = None
+        if video_dir is not None:
+            video_snapshot = snapshot_video_files(video_dir)
 
         one_result = evaluate_mas_window(
-            batch_size,
+            valid_batch_size,
             agent,
             eval_envs,
             device,
@@ -155,13 +172,13 @@ def evaluate_one_mask_group(
             stpm_frame_gap=stpm_frame_gap,
             progress_bar=progress_bar,
             reset_seeds=batch_reset_seeds,
-            return_progress_curves=return_progress_curves,
+            return_progress_curves=batch_return_progress_curves,
             return_rollout_records=return_rollout_records,
         )
 
-        if return_progress_curves and return_rollout_records:
+        if batch_return_progress_curves and return_rollout_records:
             batch_metrics, batch_progress_records, batch_rollout_records = one_result
-        elif return_progress_curves:
+        elif batch_return_progress_curves:
             batch_metrics, batch_progress_records = one_result
             batch_rollout_records = None
         elif return_rollout_records:
@@ -172,10 +189,49 @@ def evaluate_one_mask_group(
             batch_progress_records = None
             batch_rollout_records = None
 
+        if video_dir is not None:
+            if eval_batch.capture_index is not None:
+                recorded_env_idx = 0
+                success_at_end = bool(
+                    np.asarray(batch_metrics["success_at_end"]).reshape(-1)[recorded_env_idx]
+                )
+                demo_idx = (
+                    eval_traj_ids[int(eval_batch.capture_index)]
+                    if eval_traj_ids is not None
+                    else int(eval_batch.capture_index)
+                )
+                if success_at_end:
+                    archived_video_path = collect_success_video(
+                        video_dir=video_dir,
+                        previous_snapshot=video_snapshot,
+                        iteration=int(iteration),
+                        demo_idx=demo_idx,
+                    )
+                else:
+                    archived_video_path = collect_failed_video(
+                        video_dir=video_dir,
+                        previous_snapshot=video_snapshot,
+                        iteration=int(iteration),
+                        demo_idx=demo_idx,
+                    )
+                if (
+                    archived_video_path is not None
+                    and batch_progress_records is not None
+                    and recorded_env_idx < len(batch_progress_records)
+                ):
+                    save_progress_curve_for_video(
+                        video_path=archived_video_path,
+                        video_dir=video_dir,
+                        timesteps=batch_progress_records[recorded_env_idx]["steps"],
+                        progress=batch_progress_records[recorded_env_idx]["progress"],
+                    )
+            else:
+                delete_new_video_files(video_dir, video_snapshot)
+
         batch_metrics = _slice_metric_dict(batch_metrics, valid_batch_size)
         _append_metric_dict(aggregated_metrics, batch_metrics)
 
-        if return_progress_curves:
+        if return_progress_curves and batch_progress_records is not None:
             for record in batch_progress_records[:valid_batch_size]:
                 record = dict(record)
                 record["mask_type"] = mask_type_label
@@ -217,6 +273,10 @@ def evaluate_mas_window_mixed(
     reset_seeds: list[int] | None = None,
     return_progress_curves: bool = False,
     return_rollout_records: bool = False,
+    capture_indices: set[int] | None = None,
+    video_dir: str | None = None,
+    iteration: int | None = None,
+    eval_traj_ids: list[int] | None = None,
 ):
     if reset_seed is not None:
         raise ValueError("mixed eval expects reset_seeds instead of a single reset_seed")
@@ -271,6 +331,10 @@ def evaluate_mas_window_mixed(
             reset_seeds=reset_seeds,
             return_progress_curves=return_progress_curves,
             return_rollout_records=return_rollout_records,
+            capture_indices=capture_indices,
+            video_dir=video_dir,
+            iteration=iteration,
+            eval_traj_ids=eval_traj_ids,
         )
 
         if return_progress_curves and return_rollout_records:

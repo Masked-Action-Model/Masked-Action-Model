@@ -109,194 +109,11 @@ TRAIN_MASK_RATIO_LIST='[0.1,0.3,0.2]'
 
 这里不能把两个 `points` 合并；它们应分别成为 `points#0` 和 `points#1` 两个 mask slot。
 
-### 1. sh 参数设计
-
-只改 `examples/baselines/diffusion_policy/run_train_window_mixed.sh` 的 mixed preprocess 分区。
-
-新增：
-
-```bash
-PREPROCESS_MASK_ASSIGN_MODE="${PREPROCESS_MASK_ASSIGN_MODE:-composition}"
-```
-
-可选值：
-- `composition`
-- `one_demo_multi_mask`
-
-`composition` 模式继续使用：
-- `TRAIN_NUM_MASK_TYPE`
-- `TRAIN_MASK_TYPE_LIST`
-- `TRAIN_MASK_COMPOSITION_LIST`
-- `TRAIN_MASK_RATIO_LIST`
-- eval 对应一套参数
-
-`one_demo_multi_mask` 模式使用：
-- `TRAIN_NUM_MASK_TYPE`
-- `TRAIN_MASK_TYPE_LIST`
-- `TRAIN_MASK_RATIO_LIST`
-- eval 对应一套参数
-
-在 `one_demo_multi_mask` 模式下，`*_MASK_COMPOSITION_LIST` 不参与轨迹分配；可以保留为兼容字段，但不要求用户手动设置。metadata 中可写成 uniform ratio，仅用于记录。
-
-重复 mask type 规则：
-- `mask_type_list` 允许重复。
-- 同一 `mask_type` 的不同 param 视为不同 slot。
-- slot 命名继续使用已有规则：`points#0`、`points#1`、`random_mask#0`。
-- `one_demo_multi_mask` 展开时按 slot 展开，而不是按 base mask type 去重。
-
-### 2. data_preprocess_mixed.py 参数设计
-
-新增 CLI 参数：
-
-```bash
---mask-assign-mode composition|one_demo_multi_mask
-```
-
-内部新增或改造函数：
-
-- `normalize_split_mask_config(args, split, mode)`
-  - `composition`：保持现有校验，要求 composition list 长度等于 mask type 数量且总和为 1。
-  - `one_demo_multi_mask`：只要求 type list 和 param list 长度等于 mask type 数量；composition 自动设为 `1 / num_mask_type`，仅用于 metadata。
-
-- `build_output_stem(...)`
-  - 文件名中加入 mode，避免 `composition` 和 `one_demo_multi_mask` 产物冲突。
-  - 例如：`data_1_mixed_...` 与 `data_1_onedemo_...` 区分。
-
-### 3. 轨迹展开逻辑
-
-新增 helper：
-
-```python
-build_mask_jobs(source_episode_ids, mask_specs, mode, seed)
-```
-
-返回 job list，每个 job 至少包含：
-- `source_episode_id`
-- `mask_spec`
-- `mask_slot_index`
-- `mask_type_slot`
-- `source_mask_copy_key`，例如 `traj_12_0`
-
-两种模式：
-
-- `composition`
-  - 先按当前最大余数法给 source episode 分配 mask。
-  - 每个 source episode 只生成 1 个 job。
-
-- `one_demo_multi_mask`
-  - 对每个 source episode 和每个 mask spec 做笛卡尔积。
-  - 每个 source episode 生成 `num_mask_type` 个 job。
-  - 若 mask type 重复，仍按 `mask_type_slot` 展开；例如 `points#0` 和 `points#1` 是同一 source demo 的两份不同 copy。
-  - 再用固定 seed shuffle job list，使 h5 中 mask type 顺序打乱，降低 batch 内同类型聚集风险。
-
-### 4. h5/json 写入规则
-
-为了兼容现有 loader，h5 group 仍建议使用：
-
-```text
-traj_0
-traj_1
-traj_2
-...
-```
-
-不直接用 `traj_0_0` 作为 h5 key，因为当前 loader 依赖 `int(key.split("_")[-1])` 排序，多级编号可能引入排序歧义。
-
-但在每个 traj 里新增字段记录可读编号：
-
-- `source_episode_id`
-- `source_mask_copy_key`，如 `traj_0_0`
-- `mask_type`
-- `mask_type_slot`
-- `mask_slot_index`
-
-json 的 `episodes[*]` 同步写入：
-
-- `episode_id`：展开后的本地 id
-- `source_episode_id`：原始 demo id
-- `source_mask_copy_key`：如 `traj_0_0`
-- 当前 mask type 和参数
-
-meta / preprocess_info 新增：
-
-- `mask_assign_mode`
-- `source_num_episodes`
-- `expanded_num_episodes`
-- `num_mask_type`
-
-### 5. 训练侧 NUM_DEMOS / NUM_EVAL_DEMOS 语义
-
-当前 `train_mas_window_mixed.py` 的 `num_demos` 是按 h5 中的 expanded traj 数选择的；这不符合新需求。
-
-需要改为：
-
-- `composition` 模式：保持当前语义，`NUM_DEMOS` 表示选择多少条 h5 轨迹。
-- `one_demo_multi_mask` 模式：`NUM_DEMOS` 表示选择多少个 source demo，然后自动包含这些 source demo 的所有 mask copy。
-
-建议新增 helper：
-
-```python
-select_train_demo_indices_by_mode(
-    source_episode_ids,
-    mask_type_slots,
-    num_source_demos,
-    mode,
-    seed,
-)
-```
-
-输出仍然是 h5 local traj indices，传给 Dataset。
-
-eval 同理：
-
-- `NUM_EVAL_DEMOS=10`
-- `num_mask_type=5`
-- 实际 eval expanded traj 数为 `50`
-- reset seeds 允许重复，因为同一个 source demo 的不同 mask copy 应在相同初始状态下评估。
-
-### 6. load_eval / metadata 对齐
-
-`load_traj_mask_types()`、`load_traj_mask_type_slots()` 可继续按 h5 traj 读取。
-
-需要确认或补充：
-- `source_episode_ids` 对 expanded traj 一一对应。
-- `infer_eval_reset_seeds_from_demo()` 从 json 读取 expanded episodes 时，每个 mask copy 都保留原 source demo 的 reset seed。
-- `eval_traj_ids` 与 expanded traj 数一致。
-
-### 7. 验证计划
-
-最小验证：
-
-1. 单元级验证：
-   - `mask_assign_mode=composition` 时，输出 job 数等于 source episode 数。
-   - `mask_assign_mode=one_demo_multi_mask` 时，输出 job 数等于 `source episode 数 * num_mask_type`。
-   - 每个 source episode 都包含完整 mask type 集合。
-   - 重复 mask type 不应被合并；`points#0` 和 `points#1` 应分别生成 copy，并保留各自参数。
-
-2. 小数据 preprocess：
-   - `PREPROCESS_NUM_TRAJ=6`
-   - `TRAIN_NUM_MASK_TYPE=3`
-   - 预期 train/eval split 后，每个 split 的 expanded 数等于 source split 数乘 3。
-
-3. h5 检查：
-   - `none` copy 的 `mas[:, :7]` 全 0，`mask[:, :7]` 全 False。
-   - `full` copy 的 `mas[:, :7]` 等于 normalized action，`mask[:, :7]` 全 True。
-   - 同一个 `source_episode_id` 下存在多个 `mask_type_slot`。
-
-4. train smoke：
-   - `TOTAL_ITERS=1`
-   - `NUM_DEMOS=2`
-   - `TRAIN_NUM_MASK_TYPE=3`
-   - 确认实际 Dataset 选择到 `2*3=6` 条 source-mask copies。
-
 #### 执行记录
-
-已实现 `one_demo_multi_mask`：
 
 - `run_train_window_mixed.sh`
   - 新增 `PREPROCESS_MASK_ASSIGN_MODE`，默认 `composition`。
   - 可设为 `one_demo_multi_mask`。
-  - 文件名计算和 `data_preprocess_mixed.py` 调用都会传入该 mode。
 
 - `data_preprocess_mixed.py`
   - 新增 `--mask-assign-mode composition|one_demo_multi_mask`。
@@ -348,3 +165,108 @@ bash examples/baselines/diffusion_policy/run_train_window_mixed.sh
   - `full#0` 的 `mas[:, :7]` 等于 normalized action，`mask[:, :7]` 全 True。
   - 每个 source demo 都包含 `none#0`, `points#0`, `points#1`, `full#0`。
 - 训练选择逻辑验证通过：`NUM_DEMOS=2` 时选中 `2 * 4 = 8` 条 expanded traj。
+
+## Model
+
+这部分的改动要针对整个diffusionpolicy文件夹进行，就是onlymas、maswindow、windowmixed三条线路同时改动。
+
+### Benchmark test Debug
+
+在之前的degub过程中，benchmark test存在一定问题（详见Debug4.md）
+现在需要重新跑benchmark test，但这次为了保证准确，我将直接从maniskill官网上pull原始dp文件夹，重新采集并且使用pd delta mode的模式的数据集。
+请你：
+1、给我从maniskill上把dp的文件夹copy下来，放在现在的diffusionpolicy文件夹旁边，然后命名为diffusion_policy_origin
+2、（环境用maniskill_py311）用命令行，用panda的mp功能采集600条新的训练数据（命名experiment_4），然后replay成（pdeedeltapose、rgbd）
+3、最后给我启动训练脚本的命令行，里面要有所有可改参数，写到这个md文件里。
+
+#### origin RGBD benchmark 训练命令
+
+```bash
+PATH=/home/hebu/miniconda3/envs/maniskill_py311/bin:$PATH \
+MPLCONFIGDIR=/tmp/matplotlib-maniskill \
+python examples/baselines/diffusion_policy_origin/train_rgbd.py \
+  --exp-name benchmark-delta-unet \
+  --seed 1 \
+  --torch-deterministic \
+  --cuda \
+  --no-track \
+  --wandb-project-name ManiSkill \
+  --wandb-entity None \
+  --no-capture-video \
+  --env-id PickCube-v1 \
+  --demo-path demos/exp_4/PickCube-v1/motionplanning/experiment_4.rgbd.pd_ee_delta_pose.physx_cpu.h5 \
+  --num-demos 50 \
+  --total-iters 100000 \
+  --batch-size 64 \
+  --lr 1e-4 \
+  --obs-horizon 2 \
+  --act-horizon 8 \
+  --pred-horizon 16 \
+  --diffusion-step-embed-dim 64 \
+  --unet-dims 64 128 256 \
+  --n-groups 8 \
+  --obs-mode rgb+depth \
+  --max-episode-steps 100 \
+  --log-freq 1000 \
+  --eval-freq 5000 \
+  --save-freq 50000 \
+  --num-eval-episodes 100 \
+  --num-eval-envs 10 \
+  --sim-backend physx_cpu \
+  --num-dataload-workers 0 \
+  --control-mode pd_ee_delta_pose \
+  --demo-type None
+```
+
+## Loss 设计
+
+这部分的改动要针对整个diffusionpolicy文件夹进行，就是onlymas、maswindow、windowmixed三条线路同时改动。
+
+### mask-area与none-mask-area分层设计
+
+我需要在计算loss时，能够手动设置已知和位置区域的占比。
+原本是对所有点做平均MSE，现在改成加权平均。
+
+1、在三个sh文件的MAS WINDOW设置这块，加入loss_mode参数，如果设置为‘average’就维持原样，如果设置为‘weighted’就再接收一个0.2，位置区域*0.8。
+2、在train文件中做相应修改（计算loss的函数里传入mask或者mas，然后做相应计算）
+
+具体实现方案：
+
+loss 计算设计：
+
+```python
+per_elem_loss = (noise_pred - noise).square()
+known_mask = action_mask.to(torch.bool)
+unknown_mask = ~known_mask
+
+known_loss = masked_mean(per_elem_loss, known_mask)
+unknown_loss = masked_mean(per_elem_loss, unknown_mask)
+loss = known_w * known_loss + unknown_w * unknown_loss
+```
+
+### Eval video frequency 拆分
+
+#### 执行记录
+
+- 新增 `utils/eval_video_sampling_utils.py`：
+  - `validate_eval_video_config(...)`：统一校验 `num_eval_episodes` 必须能被 `num_eval_envs` 和 `capture_video_freq` 整除。
+  - `build_capture_indices(...)`：按全局 eval episode 下标生成 `0, freq, 2*freq, ...`。
+  - `build_eval_batches(...)`：把需要采样的视频 episode 尽量放到 env0，并用 `valid_count` 区分真实 episode 和 padding/重复 rollout。
+- 修改三条 train 链路：
+  - 新增 `capture_video_freq: int = 10`。
+  - `only_mas` 移除硬编码 `eval_freq * 10` 的视频保存周期。
+  - `mas_window` 只在 batch 的 env0 对应采样 index 时归档视频，否则删除新视频。
+  - `window_mixed` 在 mixed evaluator 内按全局 eval episode index 采样，不按 mask slot 内部 index 采样。
+- 修改三个 sh：
+  - 新增 `CAPTURE_VIDEO_FREQ="${CAPTURE_VIDEO_FREQ:-10}"`。
+  - 透传 `--capture-video-freq "$CAPTURE_VIDEO_FREQ"`。
+- 已验证：
+  - `python -m py_compile` 通过。
+  - `bash -n run_train_only_mas.sh` 通过。
+  - `bash -n run_train_mas_window.sh` 通过。
+  - `bash -n run_train_window_mixed.sh` 通过。
+  - 小单元检查通过：
+    - `100 / env=10 / freq=10` 生成 10 个采样 index。
+    - `100 / env=5 / freq=10` 生成 10 个采样 index。
+    - `100 / env=10 / freq=20` 生成 5 个采样 index。
+    - `100 % 6 != 0` 与 `100 % 12 != 0` 都会报错。

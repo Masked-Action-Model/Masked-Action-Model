@@ -17,7 +17,6 @@ from gymnasium.vector.vector_env import VectorEnv
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 import tyro
@@ -55,7 +54,10 @@ from utils.control_error_utils import (
 )
 from utils.draw_p_t_curve_utils import (
     save_control_error_curve,
-    save_progress_curve_for_video,
+)
+from utils.eval_video_sampling_utils import (
+    build_capture_indices,
+    validate_eval_video_config,
 )
 from utils.load_eval_data_utils import (infer_eval_reset_seeds_from_demo,
                                   infer_eval_traj_ids_from_demo,
@@ -63,14 +65,15 @@ from utils.load_eval_data_utils import (infer_eval_reset_seeds_from_demo,
                                   load_traj_mask_types,
                                   subset_eval_data)
 from utils.load_train_data_utils import load_dataset_meta, load_demo_dataset
+from utils.loss_utils import (
+    compute_mask_weighted_noise_mse,
+    slice_action_mask_sequence,
+)
 from utils.make_env import make_eval_envs
 from utils.utils import (IterationBasedBatchSampler, build_state_obs_extractor,
                          convert_obs, worker_init_fn)
 from utils.video_utils import (
     clear_iteration_artifacts,
-    collect_failed_video,
-    collect_success_video,
-    snapshot_video_files,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -98,6 +101,8 @@ class Args:
     """the entity (team) of wandb's project"""
     capture_video: bool = True
     """whether to capture videos of the agent performances (check out `videos` folder)"""
+    capture_video_freq: int = 10
+    """archive one eval video every capture_video_freq eval episodes"""
 
     env_id: str = "PegInsertionSide-v1"
     """the id of the environment"""
@@ -137,6 +142,10 @@ class Args:
     """how to encode the long MAS window before concatenating it into the observation conditioning"""
     mas_long_conv_output_dim: int = 64
     """Output feature dim used by long-window conv encoders; set to 0 to disable the long-window branch."""
+    loss_mode: Literal["average", "weighted"] = "average"
+    """average keeps plain MSE; weighted balances known mask area and unknown area"""
+    loss_mask_area_weight: float = 0.2
+    """weight for known mask area when loss_mode=weighted; unknown area uses 1 - this value"""
     # Environment/experiment specific arguments
     max_episode_steps: Optional[int] = None
     """Change the environments' max_episode_steps to this value. Sometimes necessary if the demonstrations being imitated are too short. Typically the default
@@ -445,6 +454,14 @@ class SmallDemoDataset_MasWindowDiffusionPolicy(Dataset):  # Load everything int
 
         # Slice action window directly from full trajectory length.
         act_seq = self.trajectories["actions"][traj_idx][max(0, start) : end]
+        action_mask_seq = slice_action_mask_sequence(
+            mask_traj=mask_traj,
+            start=start,
+            end=end,
+            action_len=L,
+            act_dim=act_dim,
+            pred_horizon=self.pred_horizon,
+        )
         if start < 0:  # pad before the trajectory
             pad_len = -start
             pad_actions = act_seq[0].unsqueeze(0).repeat(pad_len, 1)
@@ -454,11 +471,16 @@ class SmallDemoDataset_MasWindowDiffusionPolicy(Dataset):  # Load everything int
             act_seq = torch.cat([act_seq, pad_action.repeat(end - L, 1)], dim=0)
             # making the robot (arm and gripper) stay still
         
-        assert (obs_seq["state"].shape[0] == self.obs_horizon and act_seq.shape[0] == self.pred_horizon)
+        assert (
+            obs_seq["state"].shape[0] == self.obs_horizon
+            and act_seq.shape[0] == self.pred_horizon
+            and action_mask_seq.shape == act_seq.shape
+        )
         
         return {
             "observations": obs_seq,
             "actions": act_seq,
+            "action_mask": action_mask_seq,
         }
 
     def __len__(self):
@@ -493,6 +515,8 @@ class Agent(nn.Module):
         self.short_window_horizon = int(args.short_window_horizon)
         self.enable_long_window = int(args.mas_long_conv_output_dim) > 0
         self.enable_short_window = self.short_window_horizon > 0
+        self.loss_mode = args.loss_mode
+        self.loss_mask_area_weight = float(args.loss_mask_area_weight)
         self.mas_long_window_dim = self.long_window_horizon * MAS_STEP_DIM
         self.mas_short_window_dim = self.short_window_horizon * MAS_STEP_DIM
         self.mas_long_encode_mode = args.mas_long_encode_mode
@@ -781,7 +805,7 @@ class Agent(nn.Module):
             self._printed_obs_cond_check = True
         return feature
 
-    def compute_loss(self, obs_seq, action_seq):
+    def compute_loss(self, obs_seq, action_seq, action_mask=None):
         B = obs_seq["state"].shape[0]
 
         # observation as FiLM conditioning
@@ -800,7 +824,13 @@ class Agent(nn.Module):
         # predict the noise residual
         noise_pred = self.noise_pred_net(noisy_action_seq, timesteps, obs_cond)
 
-        return F.mse_loss(noise_pred, noise)
+        return compute_mask_weighted_noise_mse(
+            noise_pred=noise_pred,
+            noise=noise,
+            action_mask=action_mask,
+            loss_mode=self.loss_mode,
+            mask_area_weight=self.loss_mask_area_weight,
+        )
 
     def get_action(self, obs_seq):
         # init scheduler
@@ -874,24 +904,6 @@ def save_ckpt(run_name, tag):
         },
         f"runs/{run_name}/checkpoints/{tag}.pt",
     )
-
-
-def build_eval_batch_indices(total_items: int, batch_size: int):
-    if total_items <= 0:
-        return []
-    if batch_size <= 0:
-        raise ValueError(f"batch_size must be positive, got {batch_size}")
-    if total_items % batch_size != 0:
-        raise ValueError(
-            "mas-window eval requires the selected eval demo count to be divisible by "
-            f"num_eval_envs to avoid duplicate padded rollouts, got total_items={total_items}, "
-            f"batch_size={batch_size}"
-        )
-    batches = []
-    for start in range(0, total_items, batch_size):
-        batch = list(range(start, start + batch_size))
-        batches.append(batch)
-    return batches
 
 
 def summarize_label_counts(labels):
@@ -1094,6 +1106,10 @@ if __name__ == "__main__":
 
     assert args.obs_horizon + args.act_horizon - 1 <= args.pred_horizon
     assert args.obs_horizon >= 1 and args.act_horizon >= 1 and args.pred_horizon >= 1
+    if not 0.0 <= float(args.loss_mask_area_weight) <= 1.0:
+        raise ValueError(
+            f"loss_mask_area_weight must be in [0, 1], got {args.loss_mask_area_weight}"
+        )
     if args.long_window_horizon is None:
         args.long_window_horizon = args.pred_horizon
     args.long_window_horizon = int(args.long_window_horizon)
@@ -1194,6 +1210,11 @@ if __name__ == "__main__":
         assert len(eval_traj_ids) == len(eval_reset_seeds), (
             "failed to align eval traj ids with eval seeds for video naming"
         )
+    validate_eval_video_config(
+        num_eval_episodes=args.num_eval_episodes,
+        num_eval_envs=args.num_eval_envs,
+        capture_video_freq=args.capture_video_freq,
+    )
     print(
         f"[mas-window] num_demos={args.num_demos}, demo_path={args.demo_path}, "
         f"test_demo_path={args.test_demo_path}, eval_demo_path={eval_demo_path}, "
@@ -1402,6 +1423,11 @@ if __name__ == "__main__":
     ce_curve_all = []
     ce_curve_success = []
     ce_curve_failed = []
+    capture_indices = (
+        build_capture_indices(args.num_eval_episodes, args.capture_video_freq)
+        if args.capture_video
+        else set()
+    )
 
     def evaluate_and_save_best(iteration):
         if iteration % args.eval_freq == 0:
@@ -1431,6 +1457,10 @@ if __name__ == "__main__":
                 reset_seeds=eval_reset_seeds if len(eval_reset_seeds) > 0 else None,
                 return_progress_curves=args.capture_video,
                 return_rollout_records=True,
+                capture_indices=capture_indices if args.capture_video else None,
+                video_dir=video_dir if args.capture_video else None,
+                iteration=iteration,
+                eval_traj_ids=eval_traj_ids if len(eval_traj_ids) > 0 else None,
             )
             if args.capture_video:
                 (
@@ -1524,6 +1554,7 @@ if __name__ == "__main__":
         total_loss = agent.compute_loss(
             obs_seq=data_batch["observations"],  # obs_batch_dict['state'] is (B, L, obs_dim)
             action_seq=data_batch["actions"],  # (B, L, act_dim)
+            action_mask=data_batch["action_mask"],  # (B, L, act_dim)
         )
         timings["forward"] += time.time() - last_tick
 

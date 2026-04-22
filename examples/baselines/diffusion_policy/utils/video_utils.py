@@ -22,6 +22,11 @@ def find_new_video_files(
     return sorted(current - previous)
 
 
+def delete_new_video_files(video_dir: str | Path, previous_snapshot: Iterable[Path]):
+    for video_path in find_new_video_files(video_dir, previous_snapshot):
+        Path(video_path).unlink(missing_ok=True)
+
+
 def clear_iteration_artifacts(video_dir: str | Path, iteration: int):
     """Remove archived videos/curves for one eval iteration so reruns don't accumulate stale files."""
     video_root = Path(video_dir)

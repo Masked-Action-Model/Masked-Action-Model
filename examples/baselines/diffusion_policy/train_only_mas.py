@@ -16,7 +16,6 @@ from gymnasium.vector.vector_env import VectorEnv
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 import tyro
@@ -50,6 +49,11 @@ from utils.build_progress_window_utils import (
 from utils.denormalize_utils import (compute_state_min_max,
                                      load_action_denorm_stats)
 from utils.draw_p_t_curve_utils import save_progress_curve_for_video
+from utils.eval_video_sampling_utils import (
+    build_capture_indices,
+    build_eval_batches,
+    validate_eval_video_config,
+)
 from utils.load_eval_data_utils import (infer_eval_reset_seeds_from_demo,
                                   infer_eval_traj_ids_from_demo,
                                   load_eval_only_mas_data,
@@ -57,13 +61,17 @@ from utils.load_eval_data_utils import (infer_eval_reset_seeds_from_demo,
                                   select_eval_demo_indices,
                                   subset_eval_data)
 from utils.load_train_data_utils import load_dataset_meta, load_demo_dataset
+from utils.loss_utils import (
+    compute_mask_weighted_noise_mse,
+    slice_action_mask_sequence,
+)
 from utils.make_env import make_eval_envs
 from utils.utils import (IterationBasedBatchSampler, build_state_obs_extractor,
                          convert_obs, worker_init_fn)
 from utils.video_utils import (
     collect_failed_video,
     collect_success_video,
-    find_new_video_files,
+    delete_new_video_files,
     snapshot_video_files,
 )
 
@@ -92,6 +100,8 @@ class Args:
     """the entity (team) of wandb's project"""
     capture_video: bool = True
     """whether to capture videos of the agent performances (check out `videos` folder)"""
+    capture_video_freq: int = 10
+    """archive one eval video every capture_video_freq eval episodes"""
 
     env_id: str = "PegInsertionSide-v1"
     """the id of the environment"""
@@ -135,6 +145,10 @@ class Args:
     """Output feature dim used by MAS conv encoders; ignored when mas_encode_mode=no_encode."""
     progress_mode: Literal["MLP8", "MAS8", "AP8"] = "AP8"
     """how to convert progress into the observation conditioning branch"""
+    loss_mode: Literal["average", "weighted"] = "average"
+    """average keeps plain MSE; weighted balances known mask area and unknown area"""
+    loss_mask_area_weight: float = 0.2
+    """weight for known mask area when loss_mode=weighted; unknown area uses 1 - this value"""
 
     # Environment/experiment specific arguments
     max_episode_steps: Optional[int] = None
@@ -478,6 +492,14 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
 
         # Slice action window directly from full trajectory length.
         act_seq = self.trajectories["actions"][traj_idx][max(0, start) : end]
+        action_mask_seq = slice_action_mask_sequence(
+            mask_traj=mask_traj,
+            start=start,
+            end=end,
+            action_len=L,
+            act_dim=act_dim,
+            pred_horizon=self.pred_horizon,
+        )
         if start < 0:  # pad before the trajectory
             pad_len = -start
             pad_actions = act_seq[0].unsqueeze(0).repeat(pad_len, 1)
@@ -487,11 +509,16 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             act_seq = torch.cat([act_seq, pad_action.repeat(end - L, 1)], dim=0)
             # making the robot (arm and gripper) stay still
         
-        assert (obs_seq["state"].shape[0] == self.obs_horizon and act_seq.shape[0] == self.pred_horizon)
+        assert (
+            obs_seq["state"].shape[0] == self.obs_horizon
+            and act_seq.shape[0] == self.pred_horizon
+            and action_mask_seq.shape == act_seq.shape
+        )
         
         return {
             "observations": obs_seq,
             "actions": act_seq,
+            "action_mask": action_mask_seq,
         }
 
     def __len__(self):
@@ -524,6 +551,8 @@ class Agent(nn.Module):
         self.pred_horizon = args.pred_horizon
         self.include_mas = True
         self.progress_mode = args.progress_mode
+        self.loss_mode = args.loss_mode
+        self.loss_mask_area_weight = float(args.loss_mask_area_weight)
         assert (len(env.single_observation_space["state"].shape) == 2)  # (obs_horizon, obs_dim)
         assert len(env.single_action_space.shape) == 1  # (act_dim, )
         self.act_dim = env.single_action_space.shape[0]
@@ -892,7 +921,7 @@ class Agent(nn.Module):
             self._printed_obs_cond_check = True
         return feature
 
-    def compute_loss(self, obs_seq, action_seq):
+    def compute_loss(self, obs_seq, action_seq, action_mask=None):
         B = obs_seq["state"].shape[0]
 
         # observation as FiLM conditioning
@@ -911,7 +940,13 @@ class Agent(nn.Module):
         # predict the noise residual
         noise_pred = self.noise_pred_net(noisy_action_seq, timesteps, obs_cond)
 
-        return F.mse_loss(noise_pred, noise)
+        return compute_mask_weighted_noise_mse(
+            noise_pred=noise_pred,
+            noise=noise,
+            action_mask=action_mask,
+            loss_mode=self.loss_mode,
+            mask_area_weight=self.loss_mask_area_weight,
+        )
 
     def get_action(self, obs_seq):
         # init scheduler
@@ -987,20 +1022,6 @@ def save_ckpt(run_name, tag):
     )
 
 
-def build_eval_batch_indices(total_items: int, batch_size: int):
-    if total_items <= 0:
-        return []
-    if batch_size <= 0:
-        raise ValueError(f"batch_size must be positive, got {batch_size}")
-    batches = []
-    for start in range(0, total_items, batch_size):
-        batch = list(range(start, min(start + batch_size, total_items)))
-        if len(batch) < batch_size:
-            batch = batch + [batch[-1]] * (batch_size - len(batch))
-        batches.append(batch)
-    return batches
-
-
 if __name__ == "__main__":
     args = tyro.cli(Args)
 
@@ -1016,6 +1037,10 @@ if __name__ == "__main__":
 
     assert args.obs_horizon + args.act_horizon - 1 <= args.pred_horizon
     assert args.obs_horizon >= 1 and args.act_horizon >= 1 and args.pred_horizon >= 1
+    if not 0.0 <= float(args.loss_mask_area_weight) <= 1.0:
+        raise ValueError(
+            f"loss_mask_area_weight must be in [0, 1], got {args.loss_mask_area_weight}"
+        )
     if args.long_window_horizon is not None:
         args.long_window_horizon = int(args.long_window_horizon)
         if args.long_window_horizon <= 0:
@@ -1071,6 +1096,11 @@ if __name__ == "__main__":
         assert len(eval_traj_ids) == len(eval_reset_seeds), (
             "failed to align eval traj ids with eval seeds for video naming"
         )
+    validate_eval_video_config(
+        num_eval_episodes=args.num_eval_episodes,
+        num_eval_envs=args.num_eval_envs,
+        capture_video_freq=args.capture_video_freq,
+    )
     print(
         f"[only-mas] num_demos={args.num_demos}, demo_path={args.demo_path}, "
         f"test_demo_path={args.test_demo_path}, eval_demo_path={eval_demo_path}, "
@@ -1241,24 +1271,29 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------------ #
     best_eval_metrics = defaultdict(float)
     timings = defaultdict(float)
-    video_save_period = max(1, args.eval_freq * 10)
-
-    def should_archive_eval_videos(iteration: int) -> bool:
-        return args.capture_video and (iteration % video_save_period == 0)
+    capture_indices = (
+        build_capture_indices(args.num_eval_episodes, args.capture_video_freq)
+        if args.capture_video
+        else set()
+    )
 
     def evaluate_and_save_best(iteration):
         if iteration % args.eval_freq == 0:
             last_tick = time.time()
             ema.copy_to(ema_agent.parameters())
-            should_save_eval_artifacts = should_archive_eval_videos(iteration)
             if len(eval_reset_seeds) > 0:
                 eval_metrics = defaultdict(list)
-                eval_batch_indices = build_eval_batch_indices(
-                    total_items=len(eval_reset_seeds),
-                    batch_size=args.num_eval_envs,
+                eval_batches = build_eval_batches(
+                    len(eval_reset_seeds),
+                    args.num_eval_envs,
+                    capture_indices=capture_indices if args.capture_video else None,
                 )
-                for batch_indices in eval_batch_indices:
-                    valid_batch_size = sum(idx < len(eval_reset_seeds) for idx in batch_indices)
+                for eval_batch in eval_batches:
+                    batch_indices = eval_batch.indices
+                    valid_batch_size = eval_batch.valid_count
+                    should_save_eval_artifacts = (
+                        args.capture_video and eval_batch.capture_index is not None
+                    )
                     video_snapshot = None
                     if args.capture_video:
                         video_snapshot = snapshot_video_files(video_dir)
@@ -1288,41 +1323,38 @@ if __name__ == "__main__":
                         progress_curve_records = None
                     if args.capture_video:
                         if should_save_eval_artifacts:
-                            for env_idx in range(valid_batch_size):
-                                success_at_end = bool(
-                                    np.asarray(one_metrics["success_at_end"]).reshape(-1)[env_idx]
+                            recorded_env_idx = 0
+                            local_idx = int(eval_batch.capture_index)
+                            success_at_end = bool(
+                                np.asarray(one_metrics["success_at_end"]).reshape(-1)[recorded_env_idx]
+                            )
+                            if success_at_end:
+                                archived_video_path = collect_success_video(
+                                    video_dir=video_dir,
+                                    previous_snapshot=video_snapshot,
+                                    iteration=iteration,
+                                    demo_idx=eval_traj_ids[local_idx],
                                 )
-                                local_idx = batch_indices[env_idx]
-                                if success_at_end:
-                                    archived_video_path = collect_success_video(
-                                        video_dir=video_dir,
-                                        previous_snapshot=video_snapshot,
-                                        iteration=iteration,
-                                        demo_idx=eval_traj_ids[local_idx],
-                                    )
-                                else:
-                                    archived_video_path = collect_failed_video(
-                                        video_dir=video_dir,
-                                        previous_snapshot=video_snapshot,
-                                        iteration=iteration,
-                                        demo_idx=eval_traj_ids[local_idx],
-                                    )
-                                if (
-                                    archived_video_path is not None
-                                    and progress_curve_records is not None
-                                    and env_idx < len(progress_curve_records)
-                                ):
-                                    save_progress_curve_for_video(
-                                        video_path=archived_video_path,
-                                        video_dir=video_dir,
-                                        timesteps=progress_curve_records[env_idx]["steps"],
-                                        progress=progress_curve_records[env_idx]["progress"],
-                                    )
-                        else:
-                            for video_path in find_new_video_files(
-                                video_dir, video_snapshot
+                            else:
+                                archived_video_path = collect_failed_video(
+                                    video_dir=video_dir,
+                                    previous_snapshot=video_snapshot,
+                                    iteration=iteration,
+                                    demo_idx=eval_traj_ids[local_idx],
+                                )
+                            if (
+                                archived_video_path is not None
+                                and progress_curve_records is not None
+                                and recorded_env_idx < len(progress_curve_records)
                             ):
-                                Path(video_path).unlink(missing_ok=True)
+                                save_progress_curve_for_video(
+                                    video_path=archived_video_path,
+                                    video_dir=video_dir,
+                                    timesteps=progress_curve_records[recorded_env_idx]["steps"],
+                                    progress=progress_curve_records[recorded_env_idx]["progress"],
+                                )
+                        else:
+                            delete_new_video_files(video_dir, video_snapshot)
                     for k, v in one_metrics.items():
                         metric_values = np.asarray(v).reshape(-1)[:valid_batch_size]
                         eval_metrics[k].extend(metric_values.tolist())
@@ -1384,6 +1416,7 @@ if __name__ == "__main__":
         total_loss = agent.compute_loss(
             obs_seq=data_batch["observations"],  # obs_batch_dict['state'] is (B, L, obs_dim)
             action_seq=data_batch["actions"],  # (B, L, act_dim)
+            action_mask=data_batch["action_mask"],  # (B, L, act_dim)
         )
         timings["forward"] += time.time() - last_tick
 

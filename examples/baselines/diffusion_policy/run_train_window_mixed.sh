@@ -84,6 +84,8 @@ DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-64}"
 SHORT_WINDOW_HORIZON="${SHORT_WINDOW_HORIZON:-2}"
 MAS_LONG_ENCODE_MODE="${MAS_LONG_ENCODE_MODE:-2DConv}"
 MAS_LONG_CONV_OUTPUT_DIM="${MAS_LONG_CONV_OUTPUT_DIM:-64}"
+LOSS_MODE="${LOSS_MODE:-average}" #average or weighted
+LOSS_MASK_AREA_WEIGHT="${LOSS_MASK_AREA_WEIGHT:-0.2}"
 
 # -----------------------------------------------------------------------------
 # 7. Eval, logging, and checkpoint params
@@ -96,6 +98,7 @@ SAVE_FREQ="${SAVE_FREQ:-100}"
 NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-100}"
 NUM_EVAL_DEMOS="${NUM_EVAL_DEMOS:-100}"
 NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-10}"
+CAPTURE_VIDEO_FREQ="${CAPTURE_VIDEO_FREQ:-10}"
 SIM_BACKEND="${SIM_BACKEND:-gpu}"
 
 # -----------------------------------------------------------------------------
@@ -229,11 +232,14 @@ ARGS=(
   --short-window-horizon "$SHORT_WINDOW_HORIZON"
   --mas-long-encode-mode "$MAS_LONG_ENCODE_MODE"
   --mas-long-conv-output-dim "$MAS_LONG_CONV_OUTPUT_DIM"
+  --loss-mode "$LOSS_MODE"
+  --loss-mask-area-weight "$LOSS_MASK_AREA_WEIGHT"
   --log-freq "$LOG_FREQ"
   --eval-freq "$EVAL_FREQ"
   --num-eval-episodes "$NUM_EVAL_EPISODES"
   --num-eval-demos "$NUM_EVAL_DEMOS"
   --num-eval-envs "$NUM_EVAL_ENVS"
+  --capture-video-freq "$CAPTURE_VIDEO_FREQ"
   --action-norm-path "$ACTION_NORM_PATH"
   --sim-backend "$SIM_BACKEND"
   --num-dataload-workers "$NUM_DATALOAD_WORKERS"
