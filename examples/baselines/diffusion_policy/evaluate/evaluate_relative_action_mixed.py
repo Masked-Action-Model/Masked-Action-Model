@@ -5,7 +5,7 @@ from collections import defaultdict
 import numpy as np
 
 try:
-    from evaluate.evaluate_mas_window import evaluate_mas_window
+    from evaluate.evaluate_relative_action import evaluate_relative_action
     from utils.draw_p_t_curve_utils import save_progress_curve_for_video
     from utils.eval_video_sampling_utils import build_eval_batches
     from utils.load_eval_data_utils import subset_eval_data
@@ -16,8 +16,8 @@ try:
         snapshot_video_files,
     )
 except ModuleNotFoundError:
-    from examples.baselines.diffusion_policy.evaluate.evaluate_mas_window import (
-        evaluate_mas_window,
+    from examples.baselines.diffusion_policy.evaluate.evaluate_relative_action import (
+        evaluate_relative_action,
     )
     from examples.baselines.diffusion_policy.utils.draw_p_t_curve_utils import (
         save_progress_curve_for_video,
@@ -129,7 +129,6 @@ def evaluate_one_mask_group(
     video_dir: str | None = None,
     iteration: int | None = None,
     eval_traj_ids: list[int] | None = None,
-    inpainting: bool = False,
 ):
     if len(group_indices) == 0:
         raise ValueError(f"group {group_label!r} is empty")
@@ -160,7 +159,7 @@ def evaluate_one_mask_group(
         if video_dir is not None:
             video_snapshot = snapshot_video_files(video_dir)
 
-        one_result = evaluate_mas_window(
+        one_result = evaluate_relative_action(
             valid_batch_size,
             agent,
             eval_envs,
@@ -179,7 +178,6 @@ def evaluate_one_mask_group(
             reset_seeds=batch_reset_seeds,
             return_progress_curves=batch_return_progress_curves,
             return_rollout_records=return_rollout_records,
-            inpainting=inpainting,
         )
 
         if batch_return_progress_curves and return_rollout_records:
@@ -261,7 +259,7 @@ def evaluate_one_mask_group(
     return grouped_metrics
 
 
-def evaluate_mas_window_mixed(
+def evaluate_relative_action_mixed(
     n: int,
     agent,
     eval_envs,
@@ -285,7 +283,6 @@ def evaluate_mas_window_mixed(
     video_dir: str | None = None,
     iteration: int | None = None,
     eval_traj_ids: list[int] | None = None,
-    inpainting: bool = False,
 ):
     if reset_seed is not None:
         raise ValueError("mixed eval expects reset_seeds instead of a single reset_seed")
@@ -346,7 +343,6 @@ def evaluate_mas_window_mixed(
             video_dir=video_dir,
             iteration=iteration,
             eval_traj_ids=eval_traj_ids,
-            inpainting=inpainting,
         )
 
         if return_progress_curves and return_rollout_records:

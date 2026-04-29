@@ -490,6 +490,8 @@ def build_dual_mas_window_condition_batch(
     short_window_horizon: int,
     device,
     dtype,
+    long_window_backward_length: int = 0,
+    long_window_forward_length: int | None = None,
 ):
     if current_progress.ndim != 2 or current_progress.shape[1] != 1:
         raise ValueError(
@@ -505,6 +507,21 @@ def build_dual_mas_window_condition_batch(
         raise ValueError(
             f"short_window_horizon must be non-negative, got {short_window_horizon}"
         )
+    if long_window_backward_length < 0:
+        raise ValueError(
+            "long_window_backward_length must be non-negative, "
+            f"got {long_window_backward_length}"
+        )
+    if long_window_forward_length is not None and long_window_forward_length < 0:
+        raise ValueError(
+            "long_window_forward_length must be non-negative, "
+            f"got {long_window_forward_length}"
+        )
+    effective_long_window_horizon = (
+        long_window_horizon
+        if long_window_forward_length is None
+        else long_window_backward_length + long_window_forward_length
+    )
 
     current_progress = current_progress.to(device=device, dtype=dtype)
     long_conds = []
@@ -529,12 +546,14 @@ def build_dual_mas_window_condition_batch(
         sample_short_windows = []
         for anchor_p in anchor_progress:
             nearest_idx = int(torch.argmin(torch.abs(progress_col - anchor_p)).item())
-            if long_window_horizon > 0:
+            if effective_long_window_horizon > 0:
                 sample_long_windows.append(
                     build_mas_long_window_from_future(
                         mas_t,
                         current_step=nearest_idx,
                         long_window_horizon=long_window_horizon,
+                        long_window_backward_length=long_window_backward_length,
+                        long_window_forward_length=long_window_forward_length,
                     )
                 )
             if short_window_horizon > 0:
@@ -545,7 +564,7 @@ def build_dual_mas_window_condition_batch(
                         short_window_horizon=short_window_horizon,
                     )
                 )
-        if long_window_horizon > 0:
+        if effective_long_window_horizon > 0:
             sample_long_windows = torch.stack(sample_long_windows, dim=0)
         else:
             sample_long_windows = mas_t.new_empty((obs_horizon, 0, mas_t.shape[-1]))

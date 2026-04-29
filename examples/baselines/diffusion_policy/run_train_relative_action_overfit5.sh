@@ -6,11 +6,11 @@ cd "${ROOT_DIR}"
 export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
 
 # -----------------------------------------------------------------------------
-# 1. Basic info 
+# 1. Basic info
 # -----------------------------------------------------------------------------
 
 ENV_ID="${ENV_ID:-PickCube-v1}"
-EXP_NAME="${EXP_NAME:-PickCube_window_mixed}"
+EXP_NAME="${EXP_NAME:-PickCube_relative_action_overfit5}"
 SEED="${SEED:-1}"
 TORCH_DETERMINISTIC="${TORCH_DETERMINISTIC:-true}"
 CUDA="${CUDA:-true}"
@@ -20,74 +20,32 @@ TRACK="${TRACK:-false}"
 CAPTURE_VIDEO="${CAPTURE_VIDEO:-false}"
 
 # -----------------------------------------------------------------------------
-# 2. Raw paths 
+# 2. Raw paths
 # -----------------------------------------------------------------------------
 
 RAW_DEMO_H5="${RAW_DEMO_H5:-demos/data_1/data_1.h5}"
 RAW_DEMO_JSON="${RAW_DEMO_JSON:-demos/data_1/data_1.json}"
 
 # -----------------------------------------------------------------------------
-# 3. Preprocess params (mask type) 
+# 3. Preprocess params
 # -----------------------------------------------------------------------------
 
 PREPROCESSED_ROOT_DIR="${PREPROCESSED_ROOT_DIR:-demos/data_1_preprocessed}"
 PREPROCESSED_DATA_DIR="${PREPROCESSED_DATA_DIR:-${PREPROCESSED_ROOT_DIR}/mixed}"
-PREPROCESSED_DATA_PREFIX="${PREPROCESSED_DATA_PREFIX:-data_1}" #预处理输出文件名基础前缀
+PREPROCESSED_DATA_PREFIX="${PREPROCESSED_DATA_PREFIX:-data_1}"
 PREPROCESS_MASK_VALUE="${PREPROCESS_MASK_VALUE:-0}"
 PREPROCESS_NUM_TRAJ="${PREPROCESS_NUM_TRAJ:-}"
-PREPROCESS_MASK_ASSIGN_MODE="${PREPROCESS_MASK_ASSIGN_MODE:-composition}" # composition 或 one_demo_multi_mask
+PREPROCESS_MASK_ASSIGN_MODE="${PREPROCESS_MASK_ASSIGN_MODE:-composition}"
 
-TRAIN_NUM_MASK_TYPE="${TRAIN_NUM_MASK_TYPE:-${NUM_MASK_TYPE:-2}}"
-TRAIN_MASK_TYPE_LIST=${TRAIN_MASK_TYPE_LIST:-${MASK_TYPE_LIST:-'["random_mask","points"]'}}
-TRAIN_MASK_COMPOSITION_LIST=${TRAIN_MASK_COMPOSITION_LIST:-${MASK_COMPOSITION_LIST:-'[0.5,0.5]'}}
-TRAIN_MASK_RATIO_LIST=${TRAIN_MASK_RATIO_LIST:-${MASK_RATIO_LIST:-'[0.2,0.2]'}}
+TRAIN_NUM_MASK_TYPE="${TRAIN_NUM_MASK_TYPE:-${NUM_MASK_TYPE:-1}}"
+TRAIN_MASK_TYPE_LIST=${TRAIN_MASK_TYPE_LIST:-${MASK_TYPE_LIST:-'["random_mask"]'}}
+TRAIN_MASK_COMPOSITION_LIST=${TRAIN_MASK_COMPOSITION_LIST:-${MASK_COMPOSITION_LIST:-'[1]'}}
+TRAIN_MASK_RATIO_LIST=${TRAIN_MASK_RATIO_LIST:-${MASK_RATIO_LIST:-'[0.2]'}}
 
 EVAL_NUM_MASK_TYPE="${EVAL_NUM_MASK_TYPE:-${TRAIN_NUM_MASK_TYPE}}"
 EVAL_MASK_TYPE_LIST=${EVAL_MASK_TYPE_LIST:-${TRAIN_MASK_TYPE_LIST}}
 EVAL_MASK_COMPOSITION_LIST=${EVAL_MASK_COMPOSITION_LIST:-${TRAIN_MASK_COMPOSITION_LIST}}
 EVAL_MASK_RATIO_LIST=${EVAL_MASK_RATIO_LIST:-${TRAIN_MASK_RATIO_LIST}}
-
-eval "$(
-TRAIN_MASK_TYPE_LIST="$TRAIN_MASK_TYPE_LIST" \
-EVAL_MASK_TYPE_LIST="$EVAL_MASK_TYPE_LIST" \
-TRAIN_MASK_RATIO_LIST="$TRAIN_MASK_RATIO_LIST" \
-EVAL_MASK_RATIO_LIST="$EVAL_MASK_RATIO_LIST" \
-python - <<'PY'
-import ast
-import os
-import shlex
-
-
-def parse_list(value):
-    try:
-        parsed = ast.literal_eval(value)
-    except Exception:
-        parsed = [value]
-    if isinstance(parsed, (str, bytes)):
-        parsed = [parsed]
-    return list(parsed)
-
-
-train_types = [str(v) for v in parse_list(os.environ.get("TRAIN_MASK_TYPE_LIST", "[]"))]
-eval_types = [str(v) for v in parse_list(os.environ.get("EVAL_MASK_TYPE_LIST", "[]"))]
-train_ratios = [float(v) for v in parse_list(os.environ.get("TRAIN_MASK_RATIO_LIST", "[]"))]
-eval_ratios = [float(v) for v in parse_list(os.environ.get("EVAL_MASK_RATIO_LIST", "[]"))]
-
-single = len(train_types) == 1 and len(eval_types) == 1 and train_types[0] == eval_types[0]
-if single:
-    ratio = train_ratios[0] if train_ratios else (eval_ratios[0] if eval_ratios else 0.2)
-    assignments = {
-        "SINGLE_MASK_COMPAT": "true",
-        "SINGLE_MASK_TYPE": train_types[0],
-        "SINGLE_MASK_RATIO": str(ratio),
-    }
-else:
-    assignments = {"SINGLE_MASK_COMPAT": "false"}
-
-for key, value in assignments.items():
-    print(f"{key}={shlex.quote(value)}")
-PY
-)"
 
 export \
   TRAIN_NUM_MASK_TYPE TRAIN_MASK_TYPE_LIST TRAIN_MASK_COMPOSITION_LIST TRAIN_MASK_RATIO_LIST \
@@ -95,40 +53,45 @@ export \
   PREPROCESSED_DATA_PREFIX PREPROCESS_MASK_ASSIGN_MODE
 
 # -----------------------------------------------------------------------------
-# 4. STPM params 
+# 4. STPM params
 # -----------------------------------------------------------------------------
 
 STPM_CONFIG_PATH="${STPM_CONFIG_PATH:-STPM_PickCube/pick up the cube and place it at the goal/config.yaml}"
 STPM_CKPT_PATH="${STPM_CKPT_PATH:-STPM_PickCube/pick up the cube and place it at the goal/checkpoints/reward_best.pt}"
 
 # -----------------------------------------------------------------------------
-# 5. Train basic params 
+# 5. Overfit train/eval params
 # -----------------------------------------------------------------------------
 
-NUM_DEMOS="${NUM_DEMOS:-100}"
-TOTAL_ITERS="${TOTAL_ITERS:-200}"
-BATCH_SIZE="${BATCH_SIZE:-32}"
+NUM_DEMOS="${NUM_DEMOS:-5}"
+NUM_EVAL_DEMOS="${NUM_EVAL_DEMOS:-5}"
+NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-5}"
+NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-5}"
+TOTAL_ITERS="${TOTAL_ITERS:-20000}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
 LR="${LR:-1e-4}"
 NUM_DATALOAD_WORKERS="${NUM_DATALOAD_WORKERS:-0}"
-CONTROL_MODE="${CONTROL_MODE:-pd_ee_pose}"
-OBS_MODE="${OBS_MODE:-rgb+depth}"  # rgb or rgb+depth; rgb ignores dataset depth for policy input
-DEMO_TYPE="${DEMO_TYPE:-}"
+CONTROL_MODE="${CONTROL_MODE:-pd_ee_delta_pose}"
+DEMO_TYPE="${DEMO_TYPE:-overfit5}"
 
 # -----------------------------------------------------------------------------
-# 6. MAS and diffusion-policy params 
+# 6. MAS and diffusion-policy params
 # -----------------------------------------------------------------------------
 
 OBS_HORIZON="${OBS_HORIZON:-2}"
 ACT_HORIZON="${ACT_HORIZON:-8}"
 PRED_HORIZON="${PRED_HORIZON:-16}"
-LONG_WINDOW_BACKWARD_LENGTH="${LONG_WINDOW_BACKWARD_LENGTH:-0}"
-LONG_WINDOW_FORWARD_LENGTH="${LONG_WINDOW_FORWARD_LENGTH:-${PRED_HORIZON}}"
+LONG_WINDOW_HORIZON="${LONG_WINDOW_HORIZON:-32}"
 DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-64}"
-SHORT_WINDOW_HORIZON="${SHORT_WINDOW_HORIZON:-2}"
+SHORT_WINDOW_HORIZON="${SHORT_WINDOW_HORIZON:-0}"
 MAS_LONG_ENCODE_MODE="${MAS_LONG_ENCODE_MODE:-2DConv}"
 MAS_LONG_CONV_OUTPUT_DIM="${MAS_LONG_CONV_OUTPUT_DIM:-64}"
-LOSS_MODE="${LOSS_MODE:-average}" #average or weighted
+LOSS_MODE="${LOSS_MODE:-average}"
 LOSS_MASK_AREA_WEIGHT="${LOSS_MASK_AREA_WEIGHT:-0.2}"
+RELATIVE_POS_SCALE="${RELATIVE_POS_SCALE:-0.2}"
+RELATIVE_ROT_SCALE="${RELATIVE_ROT_SCALE:-0.7}"
+DELTA_POS_SCALE="${DELTA_POS_SCALE:-0.1}"
+DELTA_ROT_SCALE="${DELTA_ROT_SCALE:-0.1}"
 
 # -----------------------------------------------------------------------------
 # 7. Eval, logging, and checkpoint params
@@ -136,73 +99,13 @@ LOSS_MASK_AREA_WEIGHT="${LOSS_MASK_AREA_WEIGHT:-0.2}"
 
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-100}"
 LOG_FREQ="${LOG_FREQ:-100}"
-EVAL_FREQ="${EVAL_FREQ:-100}"
+EVAL_FREQ="${EVAL_FREQ:-500}"
 SAVE_FREQ="${SAVE_FREQ:-100}"
-NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-100}"
-NUM_EVAL_DEMOS="${NUM_EVAL_DEMOS:-100}"
-NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-10}"
-INPAINTING="${INPAINTING:-false}"
-EVAL_PROGRESS_BAR="${EVAL_PROGRESS_BAR:-false}"
-CAPTURE_VIDEO_FREQ="${CAPTURE_VIDEO_FREQ:-10}"
+CAPTURE_VIDEO_FREQ="${CAPTURE_VIDEO_FREQ:-1}"
 SIM_BACKEND="${SIM_BACKEND:-gpu}"
 
-if [[ "$SINGLE_MASK_COMPAT" == "true" ]]; then
-  echo "[mixed-compat] single mask type detected: ${SINGLE_MASK_TYPE}; fallback to run_train_mas_window.sh"
-  exec env \
-    ENV_ID="$ENV_ID" \
-    EXP_NAME="${EXP_NAME:-PickCube_single_from_mixed}" \
-    SEED="$SEED" \
-    TORCH_DETERMINISTIC="$TORCH_DETERMINISTIC" \
-    CUDA="$CUDA" \
-    WANDB_PROJECT_NAME="$WANDB_PROJECT_NAME" \
-    WANDB_ENTITY="$WANDB_ENTITY" \
-    TRACK="$TRACK" \
-    CAPTURE_VIDEO="$CAPTURE_VIDEO" \
-    RAW_DEMO_H5="$RAW_DEMO_H5" \
-    RAW_DEMO_JSON="$RAW_DEMO_JSON" \
-    PREPROCESSED_ROOT_DIR="$PREPROCESSED_ROOT_DIR" \
-    PREPROCESSED_DATA_PREFIX="$PREPROCESSED_DATA_PREFIX" \
-    PREPROCESS_MASK_TYPE="$SINGLE_MASK_TYPE" \
-    PREPROCESS_RETAIN_RATIO="$SINGLE_MASK_RATIO" \
-    PREPROCESS_MASK_VALUE="$PREPROCESS_MASK_VALUE" \
-    PREPROCESS_NUM_TRAJ="$PREPROCESS_NUM_TRAJ" \
-    STPM_CONFIG_PATH="$STPM_CONFIG_PATH" \
-    STPM_CKPT_PATH="$STPM_CKPT_PATH" \
-    NUM_DEMOS="$NUM_DEMOS" \
-    TOTAL_ITERS="$TOTAL_ITERS" \
-    BATCH_SIZE="$BATCH_SIZE" \
-    LR="$LR" \
-    NUM_DATALOAD_WORKERS="$NUM_DATALOAD_WORKERS" \
-    CONTROL_MODE="$CONTROL_MODE" \
-    OBS_MODE="$OBS_MODE" \
-    DEMO_TYPE="$DEMO_TYPE" \
-    OBS_HORIZON="$OBS_HORIZON" \
-    ACT_HORIZON="$ACT_HORIZON" \
-    PRED_HORIZON="$PRED_HORIZON" \
-    LONG_WINDOW_BACKWARD_LENGTH="$LONG_WINDOW_BACKWARD_LENGTH" \
-    LONG_WINDOW_FORWARD_LENGTH="$LONG_WINDOW_FORWARD_LENGTH" \
-    DIFFUSION_STEP_EMBED_DIM="$DIFFUSION_STEP_EMBED_DIM" \
-    SHORT_WINDOW_HORIZON="$SHORT_WINDOW_HORIZON" \
-    MAS_LONG_ENCODE_MODE="$MAS_LONG_ENCODE_MODE" \
-    MAS_LONG_CONV_OUTPUT_DIM="$MAS_LONG_CONV_OUTPUT_DIM" \
-    LOSS_MODE="$LOSS_MODE" \
-    LOSS_MASK_AREA_WEIGHT="$LOSS_MASK_AREA_WEIGHT" \
-    MAX_EPISODE_STEPS="$MAX_EPISODE_STEPS" \
-    LOG_FREQ="$LOG_FREQ" \
-    EVAL_FREQ="$EVAL_FREQ" \
-    SAVE_FREQ="$SAVE_FREQ" \
-    NUM_EVAL_EPISODES="$NUM_EVAL_EPISODES" \
-    NUM_EVAL_DEMOS="$NUM_EVAL_DEMOS" \
-    NUM_EVAL_ENVS="$NUM_EVAL_ENVS" \
-    INPAINTING="$INPAINTING" \
-    EVAL_PROGRESS_BAR="$EVAL_PROGRESS_BAR" \
-    CAPTURE_VIDEO_FREQ="$CAPTURE_VIDEO_FREQ" \
-    SIM_BACKEND="$SIM_BACKEND" \
-    bash examples/baselines/diffusion_policy/run_train_mas_window.sh
-fi
-
 # -----------------------------------------------------------------------------
-# 8. Derived preprocessed paths 
+# 8. Derived preprocessed paths
 # -----------------------------------------------------------------------------
 
 compute_mixed_file_stem() {
@@ -237,30 +140,36 @@ eval_mask_specs = normalize_split_mask_config(
     "eval",
     mask_assign_mode=args.mask_assign_mode,
 )
-output_stem = build_output_stem(
-    os.environ["PREPROCESSED_DATA_PREFIX"],
-    train_mask_specs,
-    eval_mask_specs,
-    mask_assign_mode=args.mask_assign_mode,
+print(
+    build_output_stem(
+        os.environ["PREPROCESSED_DATA_PREFIX"],
+        train_mask_specs,
+        eval_mask_specs,
+        mask_assign_mode=args.mask_assign_mode,
+    )
 )
-print(output_stem)
 PY
 }
 
 PREPROCESSED_FILE_STEM="${PREPROCESSED_FILE_STEM:-$(compute_mixed_file_stem)}"
 DEMO_PATH="${DEMO_PATH:-${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_train.h5}"
-TEST_DEMO_PATH="${TEST_DEMO_PATH:-${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_eval.h5}"
-EVAL_DEMO_METADATA_PATH="${EVAL_DEMO_METADATA_PATH:-${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_eval.json}"
 TRAIN_DEMO_METADATA_PATH="${TRAIN_DEMO_METADATA_PATH:-${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_train.json}"
+
+# Overfit key: evaluation reuses exactly the selected train split and train metadata,
+# so reset seeds and MAS demos are aligned with the same source episodes.
+TEST_DEMO_PATH="${TEST_DEMO_PATH:-${DEMO_PATH}}"
+EVAL_DEMO_METADATA_PATH="${EVAL_DEMO_METADATA_PATH:-${TRAIN_DEMO_METADATA_PATH}}"
 ACTION_NORM_PATH="${ACTION_NORM_PATH:-${DEMO_PATH}}"
 
 # -----------------------------------------------------------------------------
-# 9. Preprocess helper 
+# 9. Preprocess helper
 # -----------------------------------------------------------------------------
 
 ensure_preprocessed_dataset() {
+  local eval_h5="${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_eval.h5"
+  local eval_json="${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_eval.json"
   local missing=0
-  for path in "$DEMO_PATH" "$TEST_DEMO_PATH" "$TRAIN_DEMO_METADATA_PATH" "$EVAL_DEMO_METADATA_PATH"; do
+  for path in "$DEMO_PATH" "$TRAIN_DEMO_METADATA_PATH" "$eval_h5" "$eval_json"; do
     if [[ ! -f "$path" ]]; then
       missing=1
       break
@@ -268,7 +177,7 @@ ensure_preprocessed_dataset() {
   done
 
   if [[ "$missing" -eq 0 ]]; then
-    echo "[mixed-preprocess] reuse existing dataset: ${PREPROCESSED_DATA_DIR}"
+    echo "[overfit-preprocess] reuse existing dataset: ${PREPROCESSED_DATA_DIR}"
     return
   fi
 
@@ -282,7 +191,7 @@ ensure_preprocessed_dataset() {
   fi
 
   mkdir -p "$PREPROCESSED_DATA_DIR"
-  echo "[mixed-preprocess] generating dataset into ${PREPROCESSED_DATA_DIR}"
+  echo "[overfit-preprocess] generating dataset into ${PREPROCESSED_DATA_DIR}"
   PREPROCESS_ARGS=(
     --input-h5 "$RAW_DEMO_H5"
     --input-json "$RAW_DEMO_JSON"
@@ -309,7 +218,33 @@ ensure_preprocessed_dataset() {
 ensure_preprocessed_dataset
 
 # -----------------------------------------------------------------------------
-# 10. Build train args 
+# 10. Validate required files
+# -----------------------------------------------------------------------------
+
+if [[ "$CONTROL_MODE" != "pd_ee_delta_pose" ]]; then
+  echo "ERROR: overfit5 expects CONTROL_MODE=pd_ee_delta_pose, got: $CONTROL_MODE" >&2
+  exit 1
+fi
+for path in "$DEMO_PATH" "$TEST_DEMO_PATH" "$TRAIN_DEMO_METADATA_PATH" "$EVAL_DEMO_METADATA_PATH" "$ACTION_NORM_PATH" "$STPM_CONFIG_PATH" "$STPM_CKPT_PATH"; do
+  if [[ ! -f "$path" ]]; then
+    echo "ERROR: required file not found: $path" >&2
+    exit 1
+  fi
+done
+
+if [[ "$TEST_DEMO_PATH" != "$DEMO_PATH" ]]; then
+  echo "WARNING: TEST_DEMO_PATH differs from DEMO_PATH; this is no longer a strict same-demo overfit run." >&2
+fi
+if [[ "$EVAL_DEMO_METADATA_PATH" != "$TRAIN_DEMO_METADATA_PATH" ]]; then
+  echo "WARNING: EVAL_DEMO_METADATA_PATH differs from TRAIN_DEMO_METADATA_PATH; reset seeds may not match train demos." >&2
+fi
+
+echo "[overfit5] train/eval demo path: $DEMO_PATH"
+echo "[overfit5] train/eval metadata: $TRAIN_DEMO_METADATA_PATH"
+echo "[overfit5] selected source demos: train=$NUM_DEMOS eval=$NUM_EVAL_DEMOS episodes=$NUM_EVAL_EPISODES envs=$NUM_EVAL_ENVS"
+
+# -----------------------------------------------------------------------------
+# 11. Build train args
 # -----------------------------------------------------------------------------
 
 ARGS=(
@@ -327,14 +262,17 @@ ARGS=(
   --obs-horizon "$OBS_HORIZON"
   --act-horizon "$ACT_HORIZON"
   --pred-horizon "$PRED_HORIZON"
-  --long-window-backward-length "$LONG_WINDOW_BACKWARD_LENGTH"
-  --long-window-forward-length "$LONG_WINDOW_FORWARD_LENGTH"
+  --long-window-horizon "$LONG_WINDOW_HORIZON"
   --diffusion-step-embed-dim "$DIFFUSION_STEP_EMBED_DIM"
   --short-window-horizon "$SHORT_WINDOW_HORIZON"
   --mas-long-encode-mode "$MAS_LONG_ENCODE_MODE"
   --mas-long-conv-output-dim "$MAS_LONG_CONV_OUTPUT_DIM"
   --loss-mode "$LOSS_MODE"
   --loss-mask-area-weight "$LOSS_MASK_AREA_WEIGHT"
+  --relative-pos-scale "$RELATIVE_POS_SCALE"
+  --relative-rot-scale "$RELATIVE_ROT_SCALE"
+  --delta-pos-scale "$DELTA_POS_SCALE"
+  --delta-rot-scale "$DELTA_ROT_SCALE"
   --log-freq "$LOG_FREQ"
   --eval-freq "$EVAL_FREQ"
   --num-eval-episodes "$NUM_EVAL_EPISODES"
@@ -345,10 +283,8 @@ ARGS=(
   --sim-backend "$SIM_BACKEND"
   --num-dataload-workers "$NUM_DATALOAD_WORKERS"
   --control-mode "$CONTROL_MODE"
-  --obs-mode "$OBS_MODE"
 )
 
-# bool/optional 参数单独追加，确保 tyro 能正确解析 true/false 开关。
 if [[ -n "$EXP_NAME" ]]; then
   ARGS+=(--exp-name "$EXP_NAME")
 fi
@@ -375,54 +311,9 @@ if [[ "$CAPTURE_VIDEO" == "true" ]]; then
 else
   ARGS+=(--no-capture-video)
 fi
-if [[ "$INPAINTING" == "true" ]]; then
-  ARGS+=(--inpainting)
-else
-  ARGS+=(--no-inpainting)
-fi
-if [[ "$EVAL_PROGRESS_BAR" == "true" ]]; then
-  ARGS+=(--eval-progress-bar)
-else
-  ARGS+=(--no-eval-progress-bar)
-fi
 if [[ -n "$NUM_DEMOS" ]]; then
   ARGS+=(--num-demos "$NUM_DEMOS")
 fi
-
-# -----------------------------------------------------------------------------
-# 11. Validate required files
-# -----------------------------------------------------------------------------
-
-if [[ ! -f "$DEMO_PATH" ]]; then
-  echo "ERROR: demo file not found: $DEMO_PATH" >&2
-  exit 1
-fi
-if [[ -z "$TEST_DEMO_PATH" ]]; then
-  echo "ERROR: TEST_DEMO_PATH is required" >&2
-  exit 1
-fi
-if [[ ! -f "$TEST_DEMO_PATH" ]]; then
-  echo "ERROR: test demo file not found: $TEST_DEMO_PATH" >&2
-  exit 1
-fi
-if [[ -n "$EVAL_DEMO_METADATA_PATH" && ! -f "$EVAL_DEMO_METADATA_PATH" ]]; then
-  echo "ERROR: eval demo metadata file not found: $EVAL_DEMO_METADATA_PATH" >&2
-  exit 1
-fi
-if [[ ! -f "$STPM_CONFIG_PATH" ]]; then
-  echo "ERROR: STPM config file not found: $STPM_CONFIG_PATH" >&2
-  exit 1
-fi
-if [[ ! -f "$STPM_CKPT_PATH" ]]; then
-  echo "ERROR: STPM checkpoint file not found: $STPM_CKPT_PATH" >&2
-  exit 1
-fi
-if [[ -z "$ACTION_NORM_PATH" || ! -f "$ACTION_NORM_PATH" ]]; then
-  echo "ERROR: action norm path not found: $ACTION_NORM_PATH" >&2
-  exit 1
-fi
-
-
 if [[ -n "$MAX_EPISODE_STEPS" ]]; then
   ARGS+=(--max-episode-steps "$MAX_EPISODE_STEPS")
 fi
@@ -433,5 +324,4 @@ if [[ -n "$DEMO_TYPE" ]]; then
   ARGS+=(--demo-type "$DEMO_TYPE")
 fi
 
-
-python examples/baselines/diffusion_policy/train_mas_window_mixed.py "${ARGS[@]}"
+python examples/baselines/diffusion_policy/train_relative_action_overfit5.py "${ARGS[@]}"

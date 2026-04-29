@@ -1,4 +1,4 @@
-ALGO_NAME = "BC_Diffusion_rgbd_DiT"
+ALGO_NAME = "BC_Diffusion_rgbd_DiT_DepthNorm"
 
 import os
 import random
@@ -30,7 +30,7 @@ from torch.utils.data.dataset import Dataset
 from torch.utils.data.sampler import BatchSampler, RandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
-# Allow running this file directly via `python .../train_rgbd.py`.
+# Allow running this file directly via `python .../train_rgbd_depth_norm.py`.
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -378,7 +378,7 @@ class Agent(nn.Module):
             rgb = obs_seq["rgb"].float() / 255.0  # (B, obs_horizon, 3*k, H, W)
             img_seq = rgb
         if self.include_depth:
-            depth = obs_seq["depth"].float() / 1024.0  # (B, obs_horizon, 1*k, H, W)
+            depth = obs_seq["depth"].float() / 512.0 - 1.0  # normalize uint depth to [-1, 1]
             img_seq = depth
         if self.include_rgb and self.include_depth:
             img_seq = torch.cat([rgb, depth], dim=2)  # (B, obs_horizon, C, H, W), C=4*k

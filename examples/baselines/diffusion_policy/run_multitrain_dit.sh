@@ -1,22 +1,31 @@
 #!/bin/bash
 set -euo pipefail
 
-# Train script for examples/baselines/diffusion_policy_old/train_rgbd_unet.py
-# Override any value by exporting the variable before running this script.
+# Multi-GPU train script for examples/baselines/diffusion_policy/multitrain_dit.py
+# Usage:
+#   NPROC_PER_NODE=4 bash examples/baselines/diffusion_policy/run_multitrain_dit.sh
+# Optional:
+#   MASTER_PORT=29600 CUDA_VISIBLE_DEVICES=0,1,2,3 ...
 
-EXP_NAME="${EXP_NAME:-benchmark-pose-unet-rgb}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+NNODES="${NNODES:-1}"
+NODE_RANK="${NODE_RANK:-0}"
+MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+MASTER_PORT="${MASTER_PORT:-29500}"
+
+EXP_NAME="${EXP_NAME:-PickCube_rgbd_ddp}"
 SEED="${SEED:-1}"
 TORCH_DETERMINISTIC="${TORCH_DETERMINISTIC:-true}"
 CUDA="${CUDA:-true}"
 TRACK="${TRACK:-false}"
 WANDB_PROJECT_NAME="${WANDB_PROJECT_NAME:-ManiSkill}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
-CAPTURE_VIDEO="${CAPTURE_VIDEO:-false}"
+CAPTURE_VIDEO="${CAPTURE_VIDEO:-true}"
 
 ENV_ID="${ENV_ID:-PickCube-v1}"
-DEMO_PATH="${DEMO_PATH:-demos/exp_4/PickCube-v1/motionplanning/experiment_4.rgb.pd_ee_pose.physx_cpu.h5}"
+DEMO_PATH="${DEMO_PATH:-demos/data_1/data_1_concat_train.h5}"
 NUM_DEMOS="${NUM_DEMOS:-100}"
-TOTAL_ITERS="${TOTAL_ITERS:-100000}"
+TOTAL_ITERS="${TOTAL_ITERS:-800000}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 
 LR="${LR:-1e-4}"
@@ -24,17 +33,15 @@ OBS_HORIZON="${OBS_HORIZON:-2}"
 ACT_HORIZON="${ACT_HORIZON:-8}"
 PRED_HORIZON="${PRED_HORIZON:-16}"
 DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-64}"
-UNET_DIMS="${UNET_DIMS:-64 128 256}"
-N_GROUPS="${N_GROUPS:-8}"
 
-OBS_MODE="${OBS_MODE:-rgb}"
-MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-100}"
+OBS_MODE="${OBS_MODE:-rgb+depth}"
+MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-160}"
 LOG_FREQ="${LOG_FREQ:-1000}"
 EVAL_FREQ="${EVAL_FREQ:-5000}"
-SAVE_FREQ="${SAVE_FREQ:-50000}"
+SAVE_FREQ="${SAVE_FREQ:-}"
 NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-100}"
 NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-10}"
-ACTION_NORM_PATH="${ACTION_NORM_PATH:-}"
+ACTION_NORM_PATH="${ACTION_NORM_PATH:-demos/data_1/data_1_norm.json}"
 SIM_BACKEND="${SIM_BACKEND:-physx_cpu}"
 NUM_DATALOAD_WORKERS="${NUM_DATALOAD_WORKERS:-0}"
 CONTROL_MODE="${CONTROL_MODE:-pd_ee_pose}"
@@ -52,8 +59,6 @@ ARGS=(
   --act-horizon "$ACT_HORIZON"
   --pred-horizon "$PRED_HORIZON"
   --diffusion-step-embed-dim "$DIFFUSION_STEP_EMBED_DIM"
-  --unet-dims $UNET_DIMS
-  --n-groups "$N_GROUPS"
   --obs-mode "$OBS_MODE"
   --log-freq "$LOG_FREQ"
   --eval-freq "$EVAL_FREQ"
@@ -93,9 +98,11 @@ fi
 if [[ -n "$NUM_DEMOS" ]]; then
   ARGS+=(--num-demos "$NUM_DEMOS")
 fi
-if [[ -n "$ACTION_NORM_PATH" ]]; then
-  ARGS+=(--action-norm-path "$ACTION_NORM_PATH")
+if [[ -z "$ACTION_NORM_PATH" ]]; then
+  echo "缺少 ACTION_NORM_PATH（动作归一化参数 json）。" >&2
+  exit 2
 fi
+ARGS+=(--action-norm-path "$ACTION_NORM_PATH")
 if [[ -n "$MAX_EPISODE_STEPS" ]]; then
   ARGS+=(--max-episode-steps "$MAX_EPISODE_STEPS")
 fi
@@ -106,4 +113,21 @@ if [[ -n "$DEMO_TYPE" ]]; then
   ARGS+=(--demo-type "$DEMO_TYPE")
 fi
 
-python examples/baselines/diffusion_policy_old/train_rgbd_unet.py "${ARGS[@]}"
+# if torchrun unavailable in PATH, fallback to python -m torch.distributed.run
+if command -v torchrun >/dev/null 2>&1; then
+  torchrun \
+    --nnodes "$NNODES" \
+    --nproc_per_node "$NPROC_PER_NODE" \
+    --node_rank "$NODE_RANK" \
+    --master_addr "$MASTER_ADDR" \
+    --master_port "$MASTER_PORT" \
+    examples/baselines/diffusion_policy/multitrain_dit.py "${ARGS[@]}"
+else
+  python -m torch.distributed.run \
+    --nnodes "$NNODES" \
+    --nproc_per_node "$NPROC_PER_NODE" \
+    --node_rank "$NODE_RANK" \
+    --master_addr "$MASTER_ADDR" \
+    --master_port "$MASTER_PORT" \
+    examples/baselines/diffusion_policy/multitrain_dit.py "${ARGS[@]}"
+fi

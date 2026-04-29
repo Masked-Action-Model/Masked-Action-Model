@@ -86,6 +86,7 @@ BATCH_SIZE="${BATCH_SIZE:-32}"
 LR="${LR:-1e-4}"
 NUM_DATALOAD_WORKERS="${NUM_DATALOAD_WORKERS:-0}"
 CONTROL_MODE="${CONTROL_MODE:-pd_ee_pose}"
+OBS_MODE="${OBS_MODE:-rgb+depth}"  # rgb or rgb+depth; rgb ignores dataset depth for policy input
 DEMO_TYPE="${DEMO_TYPE:-}"
 
 # -----------------------------------------------------------------------------
@@ -95,7 +96,8 @@ DEMO_TYPE="${DEMO_TYPE:-}"
 OBS_HORIZON="${OBS_HORIZON:-2}"
 ACT_HORIZON="${ACT_HORIZON:-8}"
 PRED_HORIZON="${PRED_HORIZON:-16}"
-LONG_WINDOW_HORIZON="${LONG_WINDOW_HORIZON:-${PRED_HORIZON}}"
+LONG_WINDOW_BACKWARD_LENGTH="${LONG_WINDOW_BACKWARD_LENGTH:-0}" #  look hisory
+LONG_WINDOW_FORWARD_LENGTH="${LONG_WINDOW_FORWARD_LENGTH:-${PRED_HORIZON}}"  #  look future
 DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-64}"
 SHORT_WINDOW_HORIZON="${SHORT_WINDOW_HORIZON:-8}"
 MAS_LONG_ENCODE_MODE="${MAS_LONG_ENCODE_MODE:-2DConv}"
@@ -114,6 +116,8 @@ SAVE_FREQ="${SAVE_FREQ:-}"
 NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-100}"
 NUM_EVAL_DEMOS="${NUM_EVAL_DEMOS:-100}"
 NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-10}"
+INPAINTING="${INPAINTING:-false}"
+EVAL_PROGRESS_BAR="${EVAL_PROGRESS_BAR:-false}"
 CAPTURE_VIDEO_FREQ="${CAPTURE_VIDEO_FREQ:-10}"
 ACTION_NORM_PATH="${ACTION_NORM_PATH:-${DEMO_PATH}}"
 SIM_BACKEND="${SIM_BACKEND:-physx_cpu}"
@@ -191,7 +195,8 @@ ARGS=(
   --obs-horizon "$OBS_HORIZON"
   --act-horizon "$ACT_HORIZON"
   --pred-horizon "$PRED_HORIZON"
-  --long-window-horizon "$LONG_WINDOW_HORIZON"
+  --long-window-backward-length "$LONG_WINDOW_BACKWARD_LENGTH"
+  --long-window-forward-length "$LONG_WINDOW_FORWARD_LENGTH"
   --diffusion-step-embed-dim "$DIFFUSION_STEP_EMBED_DIM"
   --short-window-horizon "$SHORT_WINDOW_HORIZON"
   --mas-long-encode-mode "$MAS_LONG_ENCODE_MODE"
@@ -208,6 +213,7 @@ ARGS=(
   --sim-backend "$SIM_BACKEND"
   --num-dataload-workers "$NUM_DATALOAD_WORKERS"
   --control-mode "$CONTROL_MODE"
+  --obs-mode "$OBS_MODE"
 )
 
 # bool/optional 参数单独追加，确保 tyro 能正确解析 true/false 开关。
@@ -236,6 +242,16 @@ if [[ "$CAPTURE_VIDEO" == "true" ]]; then
   ARGS+=(--capture-video)
 else
   ARGS+=(--no-capture-video)
+fi
+if [[ "$INPAINTING" == "true" ]]; then
+  ARGS+=(--inpainting)
+else
+  ARGS+=(--no-inpainting)
+fi
+if [[ "$EVAL_PROGRESS_BAR" == "true" ]]; then
+  ARGS+=(--eval-progress-bar)
+else
+  ARGS+=(--no-eval-progress-bar)
 fi
 if [[ -n "$NUM_DEMOS" ]]; then
   ARGS+=(--num-demos "$NUM_DEMOS")

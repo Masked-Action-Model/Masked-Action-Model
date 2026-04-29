@@ -133,8 +133,10 @@ class Args:
     pred_horizon: int = (
         16  # 16->8 leads to worse performance, maybe it is like generate a half image; 16->32, improvement is very marginal
     )
-    long_window_horizon: Optional[int] = None
-    """future MAS long window length; defaults to pred_horizon when unset"""
+    long_window_backward_length: Optional[int] = None
+    """MAS long window length before t; defaults to 0"""
+    long_window_forward_length: Optional[int] = None
+    """MAS long window length from t onward, including t; defaults to pred_horizon"""
     diffusion_step_embed_dim: int = 64  # not very important
     short_window_horizon: int = 8
     """future MAS short window length; set to 0 to disable the short-window branch"""
@@ -143,9 +145,9 @@ class Args:
     mas_long_conv_output_dim: int = 64
     """Output feature dim used by long-window conv encoders; set to 0 to disable the long-window branch."""
     loss_mode: Literal["average", "weighted"] = "average"
-    """average keeps plain MSE; weighted balances known mask area and unknown area"""
+    """average keeps plain MSE; weighted balances known area and unknown area"""
     loss_mask_area_weight: float = 0.2
-    """weight for known mask area when loss_mode=weighted; unknown area uses 1 - this value"""
+    """known area weight when loss_mode=weighted; unknown area uses 1 - this value"""
     # Environment/experiment specific arguments
     max_episode_steps: Optional[int] = None
     """Change the environments' max_episode_steps to this value. Sometimes necessary if the demonstrations being imitated are too short. Typically the default
@@ -162,6 +164,10 @@ class Args:
     """number of demo seeds to evaluate from the loaded demos"""
     num_eval_envs: int = 10
     """the number of parallel environments to evaluate the agent on"""
+    inpainting: bool = False
+    """whether to use online j=0,r=0 inpainting overwrite during each evaluation rollout"""
+    eval_progress_bar: bool = False
+    """whether to show per-eval episode progress bars inside evaluation"""
     action_norm_path: Optional[str] = None
     """Path to action normalization stats. Supports legacy json or preprocessed h5/meta; required for rollout denormalization."""
     sim_backend: str = "physx_cpu"
@@ -170,9 +176,27 @@ class Args:
     """the number of workers to use for loading the training data in the torch dataloader"""
     control_mode: str = "pd_ee_pose"
     """the control mode to use for the evaluation environments. Must match the control mode of the demonstration dataset."""
+    obs_mode: Literal["rgb", "rgb+depth"] = "rgb+depth"
+    """visual modality consumed by the policy. rgb ignores depth even when the dataset/eval env provide it."""
 
     # additional tags/configs for logging purposes to wandb and shared comparisons with other algorithms
     demo_type: Optional[str] = None
+
+
+def policy_uses_depth(obs_mode: str) -> bool:
+    if obs_mode == "rgb":
+        return False
+    if obs_mode == "rgb+depth":
+        return True
+    raise ValueError(f"Unsupported obs_mode={obs_mode!r}; expected 'rgb' or 'rgb+depth'.")
+
+
+def stpm_eval_env_obs_mode(policy_obs_mode: str) -> str:
+    if policy_obs_mode not in ("rgb", "rgb+depth"):
+        raise ValueError(
+            f"Unsupported obs_mode={policy_obs_mode!r}; expected 'rgb' or 'rgb+depth'."
+        )
+    return "rgb+depth"
 
 
 def reorder_keys(d, ref_dict):
@@ -271,6 +295,7 @@ def _load_state_norm_stats_from_meta(meta: dict):
 
 class SmallDemoDataset_MasWindowDiffusionPolicy(Dataset):  # Load everything into memory
     def __init__(self, data_path, obs_process_fn, obs_space, device, num_traj, traj_indices=None):
+        self.include_depth = policy_uses_depth(args.obs_mode)
 
         load_keys = ["observations", "actions", "mas", "mask", "env_states", "success", "terminated", "truncated"]
         trajectories = load_demo_dataset(
@@ -282,6 +307,10 @@ class SmallDemoDataset_MasWindowDiffusionPolicy(Dataset):  # Load everything int
         )
         dataset_meta = load_dataset_meta(data_path)
         self.state_is_normalized = _meta_flag(dataset_meta, "states_normalized", False)
+        print(
+            f"[obs-mode] policy obs_mode={args.obs_mode}, "
+            f"dataset depth used by policy={self.include_depth}"
+        )
         print(f"Loaded trajectory keys: {sorted(trajectories.keys())}")
         missing_keys = [k for k in load_keys if k not in trajectories]
         assert not missing_keys, f"Missing keys in loaded trajectories: {missing_keys}"
@@ -303,7 +332,10 @@ class SmallDemoDataset_MasWindowDiffusionPolicy(Dataset):  # Load everything int
             precomputed_state = obs_traj_dict.get("state", None)
             _obs_traj_dict = reorder_keys(obs_traj_dict, obs_space)  # key order in demo is different from key order in env obs
             _obs_traj_dict = obs_process_fn(_obs_traj_dict)
-            _obs_traj_dict["depth"] = torch.Tensor(_obs_traj_dict["depth"].astype(np.float32)).to(dtype=torch.float16)
+            if self.include_depth:
+                _obs_traj_dict["depth"] = torch.Tensor(
+                    _obs_traj_dict["depth"].astype(np.float32)
+                ).to(dtype=torch.float16)
             _obs_traj_dict["rgb"] = torch.from_numpy(_obs_traj_dict["rgb"])  # still uint8
             if precomputed_state is not None and self.state_is_normalized:
                 _obs_traj_dict["state"] = torch.from_numpy(
@@ -370,6 +402,8 @@ class SmallDemoDataset_MasWindowDiffusionPolicy(Dataset):  # Load everything int
 
         self.obs_horizon, self.pred_horizon = obs_horizon, pred_horizon = (args.obs_horizon,args.pred_horizon,)
         self.long_window_horizon = int(args.long_window_horizon)
+        self.long_window_backward_length = int(args.long_window_backward_length)
+        self.long_window_forward_length = int(args.long_window_forward_length)
         self.act_horizon = args.act_horizon
         self.short_window_horizon = args.short_window_horizon
         self.enable_long_window = args.mas_long_conv_output_dim > 0
@@ -428,6 +462,8 @@ class SmallDemoDataset_MasWindowDiffusionPolicy(Dataset):  # Load everything int
             obs_horizon=self.obs_horizon,
             long_window_horizon=self.long_window_horizon if self.enable_long_window else 0,
             short_window_horizon=self.short_window_horizon if self.enable_short_window else 0,
+            long_window_backward_length=self.long_window_backward_length if self.enable_long_window else 0,
+            long_window_forward_length=self.long_window_forward_length if self.enable_long_window else 0,
         )
         mas_long_window_mask, mas_short_window_mask = build_dual_mas_window_obs_horizon(
             mask_traj,
@@ -435,6 +471,8 @@ class SmallDemoDataset_MasWindowDiffusionPolicy(Dataset):  # Load everything int
             obs_horizon=self.obs_horizon,
             long_window_horizon=self.long_window_horizon if self.enable_long_window else 0,
             short_window_horizon=self.short_window_horizon if self.enable_short_window else 0,
+            long_window_backward_length=self.long_window_backward_length if self.enable_long_window else 0,
+            long_window_forward_length=self.long_window_forward_length if self.enable_long_window else 0,
         )
         obs_seq["mas_long_window"] = mas_long_window.reshape(self.obs_horizon, -1)
         obs_seq["mas_short_window"] = mas_short_window.reshape(self.obs_horizon, -1)
@@ -512,6 +550,8 @@ class Agent(nn.Module):
         self.act_horizon = args.act_horizon
         self.pred_horizon = args.pred_horizon
         self.long_window_horizon = int(args.long_window_horizon)
+        self.long_window_backward_length = int(args.long_window_backward_length)
+        self.long_window_forward_length = int(args.long_window_forward_length)
         self.short_window_horizon = int(args.short_window_horizon)
         self.enable_long_window = int(args.mas_long_conv_output_dim) > 0
         self.enable_short_window = self.short_window_horizon > 0
@@ -530,7 +570,17 @@ class Agent(nn.Module):
                 "mas_long_window_dim "
                 f"({self.mas_long_window_dim}) must be divisible by mas_step_dim ({self.mas_step_dim})"
             )
-        total_visual_channels = (env.single_observation_space["rgb"].shape[-1]+ env.single_observation_space["depth"].shape[-1])
+        self.include_depth = policy_uses_depth(args.obs_mode)
+        obs_space_keys = set(env.single_observation_space.spaces.keys())
+        if "rgb" not in obs_space_keys:
+            raise ValueError("MAS-window policy requires rgb observations.")
+        total_visual_channels = env.single_observation_space["rgb"].shape[-1]
+        if self.include_depth:
+            if "depth" not in obs_space_keys:
+                raise ValueError(
+                    "obs_mode='rgb+depth' requires depth observations from the eval env."
+                )
+            total_visual_channels += env.single_observation_space["depth"].shape[-1]
 
         visual_feature_dim = 256
         self.visual_encoder = PlainConv(in_channels=total_visual_channels, out_dim=visual_feature_dim, pool_feature_map=True)
@@ -743,8 +793,10 @@ class Agent(nn.Module):
 
     def obs_conditioning(self, obs_seq, eval_mode):
         rgb = obs_seq["rgb"].float() / 255.0
-        depth = obs_seq["depth"].float() / 1024.0
-        img_seq = torch.cat([rgb, depth], dim=2)
+        img_seq = rgb
+        if self.include_depth:
+            depth = obs_seq["depth"].float() / 1024.0
+            img_seq = torch.cat([rgb, depth], dim=2)
         batch_size = img_seq.shape[0]
         img_seq = img_seq.flatten(end_dim=1)
         if hasattr(self, "aug") and not eval_mode:
@@ -844,7 +896,8 @@ class Agent(nn.Module):
         with torch.no_grad():
             obs_seq = common.to_tensor(obs_seq, obs_seq["state"].device)
             obs_seq["rgb"] = obs_seq["rgb"].permute(0, 1, 4, 2, 3)
-            obs_seq["depth"] = obs_seq["depth"].permute(0, 1, 4, 2, 3)
+            if self.include_depth:
+                obs_seq["depth"] = obs_seq["depth"].permute(0, 1, 4, 2, 3)
 
             obs_cond = self.obs_conditioning(obs_seq, eval_mode=True)  # (B, obs_horizon, obs_dim)
 
@@ -1110,16 +1163,33 @@ if __name__ == "__main__":
         raise ValueError(
             f"loss_mask_area_weight must be in [0, 1], got {args.loss_mask_area_weight}"
         )
-    if args.long_window_horizon is None:
-        args.long_window_horizon = args.pred_horizon
-    args.long_window_horizon = int(args.long_window_horizon)
-    if args.long_window_horizon < 0:
+    if args.long_window_backward_length is None:
+        args.long_window_backward_length = 0
+    args.long_window_backward_length = int(args.long_window_backward_length)
+    if args.long_window_forward_length is None:
+        args.long_window_forward_length = args.pred_horizon
+    args.long_window_forward_length = int(args.long_window_forward_length)
+    if args.long_window_backward_length < 0:
         raise ValueError(
-            f"long_window_horizon must be non-negative, got {args.long_window_horizon}"
+            "long_window_backward_length must be non-negative, "
+            f"got {args.long_window_backward_length}"
         )
+    if args.long_window_forward_length < 0:
+        raise ValueError(
+            "long_window_forward_length must be non-negative, "
+            f"got {args.long_window_forward_length}"
+        )
+    args.long_window_horizon = (
+        args.long_window_backward_length + args.long_window_forward_length
+    )
     if int(args.mas_long_conv_output_dim) > 0 and args.long_window_horizon <= 0:
         raise ValueError(
-            "long_window_horizon must be positive when mas_long_conv_output_dim > 0"
+            "long_window_backward_length + long_window_forward_length must be positive "
+            "when mas_long_conv_output_dim > 0"
+        )
+    if int(args.mas_long_conv_output_dim) > 0 and args.long_window_forward_length <= 0:
+        raise ValueError(
+            "long_window_forward_length must be positive when long MAS window is enabled"
         )
 
     random.seed(args.seed)
@@ -1222,7 +1292,8 @@ if __name__ == "__main__":
         f"eval_mask_assign_mode={eval_mask_assign_mode}, "
         f"eval_demo_indices={eval_demo_indices}, "
         f"eval_reset_seeds={eval_reset_seeds if len(eval_reset_seeds) > 0 else None}, "
-        f"eval_traj_ids={eval_traj_ids if len(eval_traj_ids) > 0 else None}"
+        f"eval_traj_ids={eval_traj_ids if len(eval_traj_ids) > 0 else None}, "
+        f"inpainting={args.inpainting}"
     )
 
     # ------------------------------------------------------------------------ #
@@ -1241,7 +1312,7 @@ if __name__ == "__main__":
     env_kwargs = dict(
         control_mode=args.control_mode,
         reward_mode="sparse",
-        obs_mode="rgb+depth",
+        obs_mode=stpm_eval_env_obs_mode(args.obs_mode),
         render_mode="rgb_array",
         human_render_camera_configs=dict(shader_pack="default")
     )
@@ -1291,16 +1362,17 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------------ #
     # 5. Resolve observation preprocessing from a temporary single env
     # ------------------------------------------------------------------------ #
-    tmp_env = gym.make(args.env_id, **env_kwargs)
+    tmp_env_kwargs = dict(env_kwargs, obs_mode=args.obs_mode)
+    tmp_env = gym.make(args.env_id, **tmp_env_kwargs)
     orignal_obs_space = tmp_env.observation_space
     tmp_env.close()
 
     obs_process_fn = partial(
         convert_obs,
-        concat_fn=partial(np.concatenate, axis=-1),  # merge rgb/depth camera outputs
+        concat_fn=partial(np.concatenate, axis=-1),  # merge camera outputs
         transpose_fn=partial(np.transpose, axes=(0, 3, 1, 2)),  # (B, H, W, C) -> (B, C, H, W)
         state_obs_extractor=build_state_obs_extractor(args.env_id),
-        depth=True,
+        depth=policy_uses_depth(args.obs_mode),
     )
 
     # ------------------------------------------------------------------------ #
@@ -1449,11 +1521,17 @@ if __name__ == "__main__":
                 long_window_horizon=(
                     args.long_window_horizon if args.mas_long_conv_output_dim > 0 else 0
                 ),
+                long_window_backward_length=(
+                    args.long_window_backward_length if args.mas_long_conv_output_dim > 0 else 0
+                ),
+                long_window_forward_length=(
+                    args.long_window_forward_length if args.mas_long_conv_output_dim > 0 else 0
+                ),
                 short_window_horizon=args.short_window_horizon,
                 stpm_encoder=stpm_encoder,
                 stpm_n_obs_steps=stpm_n_obs_steps,
                 stpm_frame_gap=stpm_frame_gap,
-                progress_bar=False,
+                progress_bar=args.eval_progress_bar,
                 reset_seeds=eval_reset_seeds if len(eval_reset_seeds) > 0 else None,
                 return_progress_curves=args.capture_video,
                 return_rollout_records=True,
@@ -1461,6 +1539,7 @@ if __name__ == "__main__":
                 video_dir=video_dir if args.capture_video else None,
                 iteration=iteration,
                 eval_traj_ids=eval_traj_ids if len(eval_traj_ids) > 0 else None,
+                inpainting=args.inpainting,
             )
             if args.capture_video:
                 (

@@ -159,9 +159,27 @@ class Args:
     """the number of workers to use for loading the training data in the torch dataloader"""
     control_mode: str = "pd_ee_pose"
     """the control mode to use for the evaluation environments. Must match the control mode of the demonstration dataset."""
+    obs_mode: Literal["rgb", "rgb+depth"] = "rgb+depth"
+    """visual modality consumed by the policy. rgb ignores depth even when the dataset/eval env provide it."""
 
     # additional tags/configs for logging purposes to wandb and shared comparisons with other algorithms
     demo_type: Optional[str] = None
+
+
+def policy_uses_depth(obs_mode: str) -> bool:
+    if obs_mode == "rgb":
+        return False
+    if obs_mode == "rgb+depth":
+        return True
+    raise ValueError(f"Unsupported obs_mode={obs_mode!r}; expected 'rgb' or 'rgb+depth'.")
+
+
+def stpm_eval_env_obs_mode(policy_obs_mode: str) -> str:
+    if policy_obs_mode not in ("rgb", "rgb+depth"):
+        raise ValueError(
+            f"Unsupported obs_mode={policy_obs_mode!r}; expected 'rgb' or 'rgb+depth'."
+        )
+    return "rgb+depth"
 
 
 def reorder_keys(d, ref_dict):
@@ -260,11 +278,16 @@ def _load_state_norm_stats_from_meta(meta: dict):
 
 class SmallDemoDataset_MasWindowDiffusionPolicy(Dataset):  # Load everything into memory
     def __init__(self, data_path, obs_process_fn, obs_space, device, num_traj):
+        self.include_depth = policy_uses_depth(args.obs_mode)
 
         load_keys = ["observations", "actions", "mas", "mask", "env_states", "success", "terminated", "truncated"]
         trajectories = load_demo_dataset(data_path, keys=load_keys, num_traj=num_traj, concat=False)
         dataset_meta = load_dataset_meta(data_path)
         self.state_is_normalized = _meta_flag(dataset_meta, "states_normalized", False)
+        print(
+            f"[obs-mode] policy obs_mode={args.obs_mode}, "
+            f"dataset depth used by policy={self.include_depth}"
+        )
         print(f"Loaded trajectory keys: {sorted(trajectories.keys())}")
         missing_keys = [k for k in load_keys if k not in trajectories]
         assert not missing_keys, f"Missing keys in loaded trajectories: {missing_keys}"
@@ -286,7 +309,10 @@ class SmallDemoDataset_MasWindowDiffusionPolicy(Dataset):  # Load everything int
             precomputed_state = obs_traj_dict.get("state", None)
             _obs_traj_dict = reorder_keys(obs_traj_dict, obs_space)  # key order in demo is different from key order in env obs
             _obs_traj_dict = obs_process_fn(_obs_traj_dict)
-            _obs_traj_dict["depth"] = torch.Tensor(_obs_traj_dict["depth"].astype(np.float32)).to(dtype=torch.float16)
+            if self.include_depth:
+                _obs_traj_dict["depth"] = torch.Tensor(
+                    _obs_traj_dict["depth"].astype(np.float32)
+                ).to(dtype=torch.float16)
             _obs_traj_dict["rgb"] = torch.from_numpy(_obs_traj_dict["rgb"])  # still uint8
             if precomputed_state is not None and self.state_is_normalized:
                 _obs_traj_dict["state"] = torch.from_numpy(
@@ -498,7 +524,16 @@ class Agent(nn.Module):
                 "mas_long_window_dim "
                 f"({self.mas_long_window_dim}) must be divisible by mas_step_dim ({self.mas_step_dim})"
             )
-        total_visual_channels = (env.single_observation_space["rgb"].shape[-1]+ env.single_observation_space["depth"].shape[-1])
+        self.include_depth = policy_uses_depth(args.obs_mode)
+        if "rgb" not in env.single_observation_space:
+            raise ValueError("MAS-window policy requires rgb observations.")
+        total_visual_channels = env.single_observation_space["rgb"].shape[-1]
+        if self.include_depth:
+            if "depth" not in env.single_observation_space:
+                raise ValueError(
+                    "obs_mode='rgb+depth' requires depth observations from the eval env."
+                )
+            total_visual_channels += env.single_observation_space["depth"].shape[-1]
 
         visual_feature_dim = 256
         self.visual_encoder = PlainConv(in_channels=total_visual_channels, out_dim=visual_feature_dim, pool_feature_map=True)
@@ -711,8 +746,10 @@ class Agent(nn.Module):
 
     def obs_conditioning(self, obs_seq, eval_mode):
         rgb = obs_seq["rgb"].float() / 255.0
-        depth = obs_seq["depth"].float() / 1024.0
-        img_seq = torch.cat([rgb, depth], dim=2)
+        img_seq = rgb
+        if self.include_depth:
+            depth = obs_seq["depth"].float() / 1024.0
+            img_seq = torch.cat([rgb, depth], dim=2)
         batch_size = img_seq.shape[0]
         img_seq = img_seq.flatten(end_dim=1)
         if hasattr(self, "aug") and not eval_mode:
@@ -806,7 +843,8 @@ class Agent(nn.Module):
         with torch.no_grad():
             obs_seq = common.to_tensor(obs_seq, obs_seq["state"].device)
             obs_seq["rgb"] = obs_seq["rgb"].permute(0, 1, 4, 2, 3)
-            obs_seq["depth"] = obs_seq["depth"].permute(0, 1, 4, 2, 3)
+            if self.include_depth:
+                obs_seq["depth"] = obs_seq["depth"].permute(0, 1, 4, 2, 3)
 
             obs_cond = self.obs_conditioning(obs_seq, eval_mode=True)  # (B, obs_horizon, obs_dim)
 
@@ -981,7 +1019,7 @@ if __name__ == "__main__":
     env_kwargs = dict(
         control_mode=args.control_mode,
         reward_mode="sparse",
-        obs_mode="rgb+depth",
+        obs_mode=stpm_eval_env_obs_mode(args.obs_mode),
         render_mode="rgb_array",
         human_render_camera_configs=dict(shader_pack="default")
     )
@@ -1031,16 +1069,17 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------------ #
     # 5. Resolve observation preprocessing from a temporary single env
     # ------------------------------------------------------------------------ #
-    tmp_env = gym.make(args.env_id, **env_kwargs)
+    tmp_env_kwargs = dict(env_kwargs, obs_mode=args.obs_mode)
+    tmp_env = gym.make(args.env_id, **tmp_env_kwargs)
     orignal_obs_space = tmp_env.observation_space
     tmp_env.close()
 
     obs_process_fn = partial(
         convert_obs,
-        concat_fn=partial(np.concatenate, axis=-1),  # merge rgb/depth camera outputs
+        concat_fn=partial(np.concatenate, axis=-1),  # merge camera outputs
         transpose_fn=partial(np.transpose, axes=(0, 3, 1, 2)),  # (B, H, W, C) -> (B, C, H, W)
         state_obs_extractor=build_state_obs_extractor(args.env_id),
-        depth=True,
+        depth=policy_uses_depth(args.obs_mode),
     )
 
     # ------------------------------------------------------------------------ #

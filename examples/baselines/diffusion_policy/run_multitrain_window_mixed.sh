@@ -1,6 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
+# Multi-GPU train script for examples/baselines/diffusion_policy/multitrain_mas_window_mixed.py
+# Usage:
+#   NPROC_PER_NODE=4 bash examples/baselines/diffusion_policy/run_multitrain_window_mixed.sh
+# Optional:
+#   MASTER_PORT=29600 CUDA_VISIBLE_DEVICES=0,1,2,3 ...
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "${ROOT_DIR}"
 export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
@@ -10,7 +16,7 @@ export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
 # -----------------------------------------------------------------------------
 
 ENV_ID="${ENV_ID:-PickCube-v1}"
-EXP_NAME="${EXP_NAME:-PickCube_window_mixed}"
+EXP_NAME="${EXP_NAME:-PickCube_window_mixed_ddp}"
 SEED="${SEED:-1}"
 TORCH_DETERMINISTIC="${TORCH_DETERMINISTIC:-true}"
 CUDA="${CUDA:-true}"
@@ -18,6 +24,11 @@ WANDB_PROJECT_NAME="${WANDB_PROJECT_NAME:-ManiSkill}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
 TRACK="${TRACK:-false}"
 CAPTURE_VIDEO="${CAPTURE_VIDEO:-false}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+NNODES="${NNODES:-1}"
+NODE_RANK="${NODE_RANK:-0}"
+MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+MASTER_PORT="${MASTER_PORT:-29500}"
 
 # -----------------------------------------------------------------------------
 # 2. Raw paths 
@@ -47,47 +58,6 @@ EVAL_MASK_TYPE_LIST=${EVAL_MASK_TYPE_LIST:-${TRAIN_MASK_TYPE_LIST}}
 EVAL_MASK_COMPOSITION_LIST=${EVAL_MASK_COMPOSITION_LIST:-${TRAIN_MASK_COMPOSITION_LIST}}
 EVAL_MASK_RATIO_LIST=${EVAL_MASK_RATIO_LIST:-${TRAIN_MASK_RATIO_LIST}}
 
-eval "$(
-TRAIN_MASK_TYPE_LIST="$TRAIN_MASK_TYPE_LIST" \
-EVAL_MASK_TYPE_LIST="$EVAL_MASK_TYPE_LIST" \
-TRAIN_MASK_RATIO_LIST="$TRAIN_MASK_RATIO_LIST" \
-EVAL_MASK_RATIO_LIST="$EVAL_MASK_RATIO_LIST" \
-python - <<'PY'
-import ast
-import os
-import shlex
-
-
-def parse_list(value):
-    try:
-        parsed = ast.literal_eval(value)
-    except Exception:
-        parsed = [value]
-    if isinstance(parsed, (str, bytes)):
-        parsed = [parsed]
-    return list(parsed)
-
-
-train_types = [str(v) for v in parse_list(os.environ.get("TRAIN_MASK_TYPE_LIST", "[]"))]
-eval_types = [str(v) for v in parse_list(os.environ.get("EVAL_MASK_TYPE_LIST", "[]"))]
-train_ratios = [float(v) for v in parse_list(os.environ.get("TRAIN_MASK_RATIO_LIST", "[]"))]
-eval_ratios = [float(v) for v in parse_list(os.environ.get("EVAL_MASK_RATIO_LIST", "[]"))]
-
-single = len(train_types) == 1 and len(eval_types) == 1 and train_types[0] == eval_types[0]
-if single:
-    ratio = train_ratios[0] if train_ratios else (eval_ratios[0] if eval_ratios else 0.2)
-    assignments = {
-        "SINGLE_MASK_COMPAT": "true",
-        "SINGLE_MASK_TYPE": train_types[0],
-        "SINGLE_MASK_RATIO": str(ratio),
-    }
-else:
-    assignments = {"SINGLE_MASK_COMPAT": "false"}
-
-for key, value in assignments.items():
-    print(f"{key}={shlex.quote(value)}")
-PY
-)"
 
 export \
   TRAIN_NUM_MASK_TYPE TRAIN_MASK_TYPE_LIST TRAIN_MASK_COMPOSITION_LIST TRAIN_MASK_RATIO_LIST \
@@ -121,8 +91,7 @@ DEMO_TYPE="${DEMO_TYPE:-}"
 OBS_HORIZON="${OBS_HORIZON:-2}"
 ACT_HORIZON="${ACT_HORIZON:-8}"
 PRED_HORIZON="${PRED_HORIZON:-16}"
-LONG_WINDOW_BACKWARD_LENGTH="${LONG_WINDOW_BACKWARD_LENGTH:-0}"
-LONG_WINDOW_FORWARD_LENGTH="${LONG_WINDOW_FORWARD_LENGTH:-${PRED_HORIZON}}"
+LONG_WINDOW_HORIZON="${LONG_WINDOW_HORIZON:-${PRED_HORIZON}}"
 DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-64}"
 SHORT_WINDOW_HORIZON="${SHORT_WINDOW_HORIZON:-2}"
 MAS_LONG_ENCODE_MODE="${MAS_LONG_ENCODE_MODE:-2DConv}"
@@ -141,65 +110,8 @@ SAVE_FREQ="${SAVE_FREQ:-100}"
 NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-100}"
 NUM_EVAL_DEMOS="${NUM_EVAL_DEMOS:-100}"
 NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-10}"
-INPAINTING="${INPAINTING:-false}"
-EVAL_PROGRESS_BAR="${EVAL_PROGRESS_BAR:-false}"
 CAPTURE_VIDEO_FREQ="${CAPTURE_VIDEO_FREQ:-10}"
 SIM_BACKEND="${SIM_BACKEND:-gpu}"
-
-if [[ "$SINGLE_MASK_COMPAT" == "true" ]]; then
-  echo "[mixed-compat] single mask type detected: ${SINGLE_MASK_TYPE}; fallback to run_train_mas_window.sh"
-  exec env \
-    ENV_ID="$ENV_ID" \
-    EXP_NAME="${EXP_NAME:-PickCube_single_from_mixed}" \
-    SEED="$SEED" \
-    TORCH_DETERMINISTIC="$TORCH_DETERMINISTIC" \
-    CUDA="$CUDA" \
-    WANDB_PROJECT_NAME="$WANDB_PROJECT_NAME" \
-    WANDB_ENTITY="$WANDB_ENTITY" \
-    TRACK="$TRACK" \
-    CAPTURE_VIDEO="$CAPTURE_VIDEO" \
-    RAW_DEMO_H5="$RAW_DEMO_H5" \
-    RAW_DEMO_JSON="$RAW_DEMO_JSON" \
-    PREPROCESSED_ROOT_DIR="$PREPROCESSED_ROOT_DIR" \
-    PREPROCESSED_DATA_PREFIX="$PREPROCESSED_DATA_PREFIX" \
-    PREPROCESS_MASK_TYPE="$SINGLE_MASK_TYPE" \
-    PREPROCESS_RETAIN_RATIO="$SINGLE_MASK_RATIO" \
-    PREPROCESS_MASK_VALUE="$PREPROCESS_MASK_VALUE" \
-    PREPROCESS_NUM_TRAJ="$PREPROCESS_NUM_TRAJ" \
-    STPM_CONFIG_PATH="$STPM_CONFIG_PATH" \
-    STPM_CKPT_PATH="$STPM_CKPT_PATH" \
-    NUM_DEMOS="$NUM_DEMOS" \
-    TOTAL_ITERS="$TOTAL_ITERS" \
-    BATCH_SIZE="$BATCH_SIZE" \
-    LR="$LR" \
-    NUM_DATALOAD_WORKERS="$NUM_DATALOAD_WORKERS" \
-    CONTROL_MODE="$CONTROL_MODE" \
-    OBS_MODE="$OBS_MODE" \
-    DEMO_TYPE="$DEMO_TYPE" \
-    OBS_HORIZON="$OBS_HORIZON" \
-    ACT_HORIZON="$ACT_HORIZON" \
-    PRED_HORIZON="$PRED_HORIZON" \
-    LONG_WINDOW_BACKWARD_LENGTH="$LONG_WINDOW_BACKWARD_LENGTH" \
-    LONG_WINDOW_FORWARD_LENGTH="$LONG_WINDOW_FORWARD_LENGTH" \
-    DIFFUSION_STEP_EMBED_DIM="$DIFFUSION_STEP_EMBED_DIM" \
-    SHORT_WINDOW_HORIZON="$SHORT_WINDOW_HORIZON" \
-    MAS_LONG_ENCODE_MODE="$MAS_LONG_ENCODE_MODE" \
-    MAS_LONG_CONV_OUTPUT_DIM="$MAS_LONG_CONV_OUTPUT_DIM" \
-    LOSS_MODE="$LOSS_MODE" \
-    LOSS_MASK_AREA_WEIGHT="$LOSS_MASK_AREA_WEIGHT" \
-    MAX_EPISODE_STEPS="$MAX_EPISODE_STEPS" \
-    LOG_FREQ="$LOG_FREQ" \
-    EVAL_FREQ="$EVAL_FREQ" \
-    SAVE_FREQ="$SAVE_FREQ" \
-    NUM_EVAL_EPISODES="$NUM_EVAL_EPISODES" \
-    NUM_EVAL_DEMOS="$NUM_EVAL_DEMOS" \
-    NUM_EVAL_ENVS="$NUM_EVAL_ENVS" \
-    INPAINTING="$INPAINTING" \
-    EVAL_PROGRESS_BAR="$EVAL_PROGRESS_BAR" \
-    CAPTURE_VIDEO_FREQ="$CAPTURE_VIDEO_FREQ" \
-    SIM_BACKEND="$SIM_BACKEND" \
-    bash examples/baselines/diffusion_policy/run_train_mas_window.sh
-fi
 
 # -----------------------------------------------------------------------------
 # 8. Derived preprocessed paths 
@@ -327,8 +239,7 @@ ARGS=(
   --obs-horizon "$OBS_HORIZON"
   --act-horizon "$ACT_HORIZON"
   --pred-horizon "$PRED_HORIZON"
-  --long-window-backward-length "$LONG_WINDOW_BACKWARD_LENGTH"
-  --long-window-forward-length "$LONG_WINDOW_FORWARD_LENGTH"
+  --long-window-horizon "$LONG_WINDOW_HORIZON"
   --diffusion-step-embed-dim "$DIFFUSION_STEP_EMBED_DIM"
   --short-window-horizon "$SHORT_WINDOW_HORIZON"
   --mas-long-encode-mode "$MAS_LONG_ENCODE_MODE"
@@ -374,16 +285,6 @@ if [[ "$CAPTURE_VIDEO" == "true" ]]; then
   ARGS+=(--capture-video)
 else
   ARGS+=(--no-capture-video)
-fi
-if [[ "$INPAINTING" == "true" ]]; then
-  ARGS+=(--inpainting)
-else
-  ARGS+=(--no-inpainting)
-fi
-if [[ "$EVAL_PROGRESS_BAR" == "true" ]]; then
-  ARGS+=(--eval-progress-bar)
-else
-  ARGS+=(--no-eval-progress-bar)
 fi
 if [[ -n "$NUM_DEMOS" ]]; then
   ARGS+=(--num-demos "$NUM_DEMOS")
@@ -434,4 +335,20 @@ if [[ -n "$DEMO_TYPE" ]]; then
 fi
 
 
-python examples/baselines/diffusion_policy/train_mas_window_mixed.py "${ARGS[@]}"
+if command -v torchrun >/dev/null 2>&1; then
+  torchrun \
+    --nnodes "$NNODES" \
+    --nproc_per_node "$NPROC_PER_NODE" \
+    --node_rank "$NODE_RANK" \
+    --master_addr "$MASTER_ADDR" \
+    --master_port "$MASTER_PORT" \
+    examples/baselines/diffusion_policy/multitrain_mas_window_mixed.py "${ARGS[@]}"
+else
+  python -m torch.distributed.run \
+    --nnodes "$NNODES" \
+    --nproc_per_node "$NPROC_PER_NODE" \
+    --node_rank "$NODE_RANK" \
+    --master_addr "$MASTER_ADDR" \
+    --master_port "$MASTER_PORT" \
+    examples/baselines/diffusion_policy/multitrain_mas_window_mixed.py "${ARGS[@]}"
+fi

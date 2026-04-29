@@ -204,10 +204,12 @@ def dp_repaint_inference(
     jump_length: int,
     num_resample: int,
 ):
-    if jump_length < 1:
-        raise ValueError(f"jump_length must be >= 1, got {jump_length}")
+    if jump_length < 0:
+        raise ValueError(f"jump_length must be >= 0, got {jump_length}")
     if num_resample < 0:
         raise ValueError(f"num_resample must be >= 0, got {num_resample}")
+    if jump_length == 0 and num_resample != 0:
+        raise ValueError("num_resample must be 0 when jump_length is 0")
 
     obs_seq = _prepare_obs_for_agent(obs_seq)
     batch_size = obs_seq["state"].shape[0]
@@ -236,6 +238,40 @@ def dp_repaint_inference(
         )
         t = max_t
         no_known_action = bool(torch.count_nonzero(action_mask).item() == 0)
+
+        if jump_length == 0:
+            for k in agent.noise_scheduler.timesteps:
+                t = int(k)
+                t_batch = torch.full(
+                    (batch_size,),
+                    t,
+                    dtype=torch.long,
+                    device=a_t.device,
+                )
+                noise_pred = agent.noise_pred_net(a_t, t_batch, obs_cond)
+                a_prev = agent.noise_scheduler.step(
+                    model_output=noise_pred,
+                    timestep=t,
+                    sample=a_t,
+                ).prev_sample
+
+                if not no_known_action:
+                    if t > 0:
+                        a_prev = overwrite_known_action(
+                            a_unknown_t=a_prev,
+                            action_known_0=action_known_0,
+                            action_mask=action_mask,
+                            timestep=t - 1,
+                            scheduler=agent.noise_scheduler,
+                        )
+                    else:
+                        a_prev = overwrite_known_action_clean(
+                            a_unknown_0=a_prev,
+                            action_known_0=action_known_0,
+                            action_mask=action_mask,
+                        )
+                a_t = a_prev
+            return a_t
 
         while t >= 0:
             steps_down = min(int(jump_length), t + 1)

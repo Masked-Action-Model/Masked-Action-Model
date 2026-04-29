@@ -1,4 +1,5 @@
 import os
+import argparse
 from pathlib import Path
 from omegaconf import OmegaConf
 from datetime import datetime
@@ -34,7 +35,13 @@ class ReWiNDWorkspace:
         print(f"[Init] Using device: {self.device}")
         set_seed(cfg.general.seed)
         self.camera_names = cfg.general.camera_names
-        self.save_dir = Path(f'{cfg.general.project_name}/{cfg.general.task_name}')
+        self.task_description = str(
+            getattr(cfg.general, "task_description", cfg.general.task_name)
+        )
+        self.save_dir = Path(
+            getattr(cfg.general, "output_dir", "")
+            or f"{cfg.general.project_name}/{cfg.general.task_name}"
+        )
         self.save_dir.mkdir(parents=True, exist_ok=True)
         print(f"[Init] Logging & ckpts to: {self.save_dir}")
 
@@ -60,7 +67,8 @@ class ReWiNDWorkspace:
             n_obs_steps=cfg.model.n_obs_steps,
             frame_gap=cfg.model.frame_gap,
             image_names=cfg.general.camera_names,
-            task_name=cfg.general.task_name,
+            task_description=self.task_description,
+            state_paths=list(getattr(cfg.general, "state_paths", [])) or None,
         )
 
         dataset_val = FrameManiskillDataset(
@@ -69,7 +77,8 @@ class ReWiNDWorkspace:
             n_obs_steps=cfg.model.n_obs_steps,
             frame_gap=cfg.model.frame_gap,
             image_names=cfg.general.camera_names,
-            task_name=cfg.general.task_name,
+            task_description=self.task_description,
+            state_paths=list(getattr(cfg.general, "state_paths", [])) or None,
         )
 
         dataloader_train = torch.utils.data.DataLoader(dataset_train, **cfg.dataloader)
@@ -238,6 +247,14 @@ class ReWiNDWorkspace:
 
 
 if __name__ == "__main__":
-    config_path = Path(__file__).resolve().parent / "config" / "rewind_maniskill.yaml"
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path(__file__).resolve().parent / "config" / "rewind_maniskill.yaml",
+        help="Path to STPM config yaml.",
+    )
+    args = parser.parse_args()
+    config_path = args.config
     workspace = ReWiNDWorkspace(cfg=OmegaConf.load(config_path))
     workspace.train()

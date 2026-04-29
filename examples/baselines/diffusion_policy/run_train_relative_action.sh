@@ -10,7 +10,7 @@ export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
 # -----------------------------------------------------------------------------
 
 ENV_ID="${ENV_ID:-PickCube-v1}"
-EXP_NAME="${EXP_NAME:-PickCube_window_mixed}"
+EXP_NAME="${EXP_NAME:-PickCube_relative_action_mixed}"
 SEED="${SEED:-1}"
 TORCH_DETERMINISTIC="${TORCH_DETERMINISTIC:-true}"
 CUDA="${CUDA:-true}"
@@ -38,9 +38,9 @@ PREPROCESS_NUM_TRAJ="${PREPROCESS_NUM_TRAJ:-}"
 PREPROCESS_MASK_ASSIGN_MODE="${PREPROCESS_MASK_ASSIGN_MODE:-composition}" # composition 或 one_demo_multi_mask
 
 TRAIN_NUM_MASK_TYPE="${TRAIN_NUM_MASK_TYPE:-${NUM_MASK_TYPE:-2}}"
-TRAIN_MASK_TYPE_LIST=${TRAIN_MASK_TYPE_LIST:-${MASK_TYPE_LIST:-'["random_mask","points"]'}}
-TRAIN_MASK_COMPOSITION_LIST=${TRAIN_MASK_COMPOSITION_LIST:-${MASK_COMPOSITION_LIST:-'[0.5,0.5]'}}
-TRAIN_MASK_RATIO_LIST=${TRAIN_MASK_RATIO_LIST:-${MASK_RATIO_LIST:-'[0.2,0.2]'}}
+TRAIN_MASK_TYPE_LIST=${TRAIN_MASK_TYPE_LIST:-${MASK_TYPE_LIST:-'["random_mask"]'}}
+TRAIN_MASK_COMPOSITION_LIST=${TRAIN_MASK_COMPOSITION_LIST:-${MASK_COMPOSITION_LIST:-'[1]'}}
+TRAIN_MASK_RATIO_LIST=${TRAIN_MASK_RATIO_LIST:-${MASK_RATIO_LIST:-'[0.2]'}}
 
 EVAL_NUM_MASK_TYPE="${EVAL_NUM_MASK_TYPE:-${TRAIN_NUM_MASK_TYPE}}"
 EVAL_MASK_TYPE_LIST=${EVAL_MASK_TYPE_LIST:-${TRAIN_MASK_TYPE_LIST}}
@@ -68,18 +68,27 @@ def parse_list(value):
     return list(parsed)
 
 
+def shell_array(values):
+    return "[" + ",".join(repr(v) for v in values) + "]"
+
+
 train_types = [str(v) for v in parse_list(os.environ.get("TRAIN_MASK_TYPE_LIST", "[]"))]
 eval_types = [str(v) for v in parse_list(os.environ.get("EVAL_MASK_TYPE_LIST", "[]"))]
 train_ratios = [float(v) for v in parse_list(os.environ.get("TRAIN_MASK_RATIO_LIST", "[]"))]
 eval_ratios = [float(v) for v in parse_list(os.environ.get("EVAL_MASK_RATIO_LIST", "[]"))]
 
 single = len(train_types) == 1 and len(eval_types) == 1 and train_types[0] == eval_types[0]
+assignments = {}
 if single:
     ratio = train_ratios[0] if train_ratios else (eval_ratios[0] if eval_ratios else 0.2)
     assignments = {
         "SINGLE_MASK_COMPAT": "true",
-        "SINGLE_MASK_TYPE": train_types[0],
-        "SINGLE_MASK_RATIO": str(ratio),
+        "TRAIN_NUM_MASK_TYPE": "1",
+        "EVAL_NUM_MASK_TYPE": "1",
+        "TRAIN_MASK_COMPOSITION_LIST": "[1.0]",
+        "EVAL_MASK_COMPOSITION_LIST": "[1.0]",
+        "TRAIN_MASK_RATIO_LIST": shell_array([ratio]),
+        "EVAL_MASK_RATIO_LIST": shell_array([ratio]),
     }
 else:
     assignments = {"SINGLE_MASK_COMPAT": "false"}
@@ -88,6 +97,10 @@ for key, value in assignments.items():
     print(f"{key}={shlex.quote(value)}")
 PY
 )"
+
+if [[ "$SINGLE_MASK_COMPAT" == "true" ]]; then
+  echo "[relative-compat] single mask type detected; normalized mixed config to num_mask_type=1"
+fi
 
 export \
   TRAIN_NUM_MASK_TYPE TRAIN_MASK_TYPE_LIST TRAIN_MASK_COMPOSITION_LIST TRAIN_MASK_RATIO_LIST \
@@ -110,8 +123,7 @@ TOTAL_ITERS="${TOTAL_ITERS:-200}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 LR="${LR:-1e-4}"
 NUM_DATALOAD_WORKERS="${NUM_DATALOAD_WORKERS:-0}"
-CONTROL_MODE="${CONTROL_MODE:-pd_ee_pose}"
-OBS_MODE="${OBS_MODE:-rgb+depth}"  # rgb or rgb+depth; rgb ignores dataset depth for policy input
+CONTROL_MODE="${CONTROL_MODE:-pd_ee_delta_pose}"
 DEMO_TYPE="${DEMO_TYPE:-}"
 
 # -----------------------------------------------------------------------------
@@ -129,6 +141,10 @@ MAS_LONG_ENCODE_MODE="${MAS_LONG_ENCODE_MODE:-2DConv}"
 MAS_LONG_CONV_OUTPUT_DIM="${MAS_LONG_CONV_OUTPUT_DIM:-64}"
 LOSS_MODE="${LOSS_MODE:-average}" #average or weighted
 LOSS_MASK_AREA_WEIGHT="${LOSS_MASK_AREA_WEIGHT:-0.2}"
+RELATIVE_POS_SCALE="${RELATIVE_POS_SCALE:-0.1}"
+RELATIVE_ROT_SCALE="${RELATIVE_ROT_SCALE:-0.1}"
+DELTA_POS_SCALE="${DELTA_POS_SCALE:-0.1}"
+DELTA_ROT_SCALE="${DELTA_ROT_SCALE:-0.1}"
 
 # -----------------------------------------------------------------------------
 # 7. Eval, logging, and checkpoint params
@@ -141,65 +157,8 @@ SAVE_FREQ="${SAVE_FREQ:-100}"
 NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-100}"
 NUM_EVAL_DEMOS="${NUM_EVAL_DEMOS:-100}"
 NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-10}"
-INPAINTING="${INPAINTING:-false}"
-EVAL_PROGRESS_BAR="${EVAL_PROGRESS_BAR:-false}"
 CAPTURE_VIDEO_FREQ="${CAPTURE_VIDEO_FREQ:-10}"
 SIM_BACKEND="${SIM_BACKEND:-gpu}"
-
-if [[ "$SINGLE_MASK_COMPAT" == "true" ]]; then
-  echo "[mixed-compat] single mask type detected: ${SINGLE_MASK_TYPE}; fallback to run_train_mas_window.sh"
-  exec env \
-    ENV_ID="$ENV_ID" \
-    EXP_NAME="${EXP_NAME:-PickCube_single_from_mixed}" \
-    SEED="$SEED" \
-    TORCH_DETERMINISTIC="$TORCH_DETERMINISTIC" \
-    CUDA="$CUDA" \
-    WANDB_PROJECT_NAME="$WANDB_PROJECT_NAME" \
-    WANDB_ENTITY="$WANDB_ENTITY" \
-    TRACK="$TRACK" \
-    CAPTURE_VIDEO="$CAPTURE_VIDEO" \
-    RAW_DEMO_H5="$RAW_DEMO_H5" \
-    RAW_DEMO_JSON="$RAW_DEMO_JSON" \
-    PREPROCESSED_ROOT_DIR="$PREPROCESSED_ROOT_DIR" \
-    PREPROCESSED_DATA_PREFIX="$PREPROCESSED_DATA_PREFIX" \
-    PREPROCESS_MASK_TYPE="$SINGLE_MASK_TYPE" \
-    PREPROCESS_RETAIN_RATIO="$SINGLE_MASK_RATIO" \
-    PREPROCESS_MASK_VALUE="$PREPROCESS_MASK_VALUE" \
-    PREPROCESS_NUM_TRAJ="$PREPROCESS_NUM_TRAJ" \
-    STPM_CONFIG_PATH="$STPM_CONFIG_PATH" \
-    STPM_CKPT_PATH="$STPM_CKPT_PATH" \
-    NUM_DEMOS="$NUM_DEMOS" \
-    TOTAL_ITERS="$TOTAL_ITERS" \
-    BATCH_SIZE="$BATCH_SIZE" \
-    LR="$LR" \
-    NUM_DATALOAD_WORKERS="$NUM_DATALOAD_WORKERS" \
-    CONTROL_MODE="$CONTROL_MODE" \
-    OBS_MODE="$OBS_MODE" \
-    DEMO_TYPE="$DEMO_TYPE" \
-    OBS_HORIZON="$OBS_HORIZON" \
-    ACT_HORIZON="$ACT_HORIZON" \
-    PRED_HORIZON="$PRED_HORIZON" \
-    LONG_WINDOW_BACKWARD_LENGTH="$LONG_WINDOW_BACKWARD_LENGTH" \
-    LONG_WINDOW_FORWARD_LENGTH="$LONG_WINDOW_FORWARD_LENGTH" \
-    DIFFUSION_STEP_EMBED_DIM="$DIFFUSION_STEP_EMBED_DIM" \
-    SHORT_WINDOW_HORIZON="$SHORT_WINDOW_HORIZON" \
-    MAS_LONG_ENCODE_MODE="$MAS_LONG_ENCODE_MODE" \
-    MAS_LONG_CONV_OUTPUT_DIM="$MAS_LONG_CONV_OUTPUT_DIM" \
-    LOSS_MODE="$LOSS_MODE" \
-    LOSS_MASK_AREA_WEIGHT="$LOSS_MASK_AREA_WEIGHT" \
-    MAX_EPISODE_STEPS="$MAX_EPISODE_STEPS" \
-    LOG_FREQ="$LOG_FREQ" \
-    EVAL_FREQ="$EVAL_FREQ" \
-    SAVE_FREQ="$SAVE_FREQ" \
-    NUM_EVAL_EPISODES="$NUM_EVAL_EPISODES" \
-    NUM_EVAL_DEMOS="$NUM_EVAL_DEMOS" \
-    NUM_EVAL_ENVS="$NUM_EVAL_ENVS" \
-    INPAINTING="$INPAINTING" \
-    EVAL_PROGRESS_BAR="$EVAL_PROGRESS_BAR" \
-    CAPTURE_VIDEO_FREQ="$CAPTURE_VIDEO_FREQ" \
-    SIM_BACKEND="$SIM_BACKEND" \
-    bash examples/baselines/diffusion_policy/run_train_mas_window.sh
-fi
 
 # -----------------------------------------------------------------------------
 # 8. Derived preprocessed paths 
@@ -335,6 +294,10 @@ ARGS=(
   --mas-long-conv-output-dim "$MAS_LONG_CONV_OUTPUT_DIM"
   --loss-mode "$LOSS_MODE"
   --loss-mask-area-weight "$LOSS_MASK_AREA_WEIGHT"
+  --relative-pos-scale "$RELATIVE_POS_SCALE"
+  --relative-rot-scale "$RELATIVE_ROT_SCALE"
+  --delta-pos-scale "$DELTA_POS_SCALE"
+  --delta-rot-scale "$DELTA_ROT_SCALE"
   --log-freq "$LOG_FREQ"
   --eval-freq "$EVAL_FREQ"
   --num-eval-episodes "$NUM_EVAL_EPISODES"
@@ -345,7 +308,6 @@ ARGS=(
   --sim-backend "$SIM_BACKEND"
   --num-dataload-workers "$NUM_DATALOAD_WORKERS"
   --control-mode "$CONTROL_MODE"
-  --obs-mode "$OBS_MODE"
 )
 
 # bool/optional 参数单独追加，确保 tyro 能正确解析 true/false 开关。
@@ -375,16 +337,6 @@ if [[ "$CAPTURE_VIDEO" == "true" ]]; then
 else
   ARGS+=(--no-capture-video)
 fi
-if [[ "$INPAINTING" == "true" ]]; then
-  ARGS+=(--inpainting)
-else
-  ARGS+=(--no-inpainting)
-fi
-if [[ "$EVAL_PROGRESS_BAR" == "true" ]]; then
-  ARGS+=(--eval-progress-bar)
-else
-  ARGS+=(--no-eval-progress-bar)
-fi
 if [[ -n "$NUM_DEMOS" ]]; then
   ARGS+=(--num-demos "$NUM_DEMOS")
 fi
@@ -393,6 +345,10 @@ fi
 # 11. Validate required files
 # -----------------------------------------------------------------------------
 
+if [[ "$CONTROL_MODE" != "pd_ee_delta_pose" ]]; then
+  echo "ERROR: run_train_relative_action.sh expects CONTROL_MODE=pd_ee_delta_pose, got: $CONTROL_MODE" >&2
+  exit 1
+fi
 if [[ ! -f "$DEMO_PATH" ]]; then
   echo "ERROR: demo file not found: $DEMO_PATH" >&2
   exit 1
@@ -434,4 +390,4 @@ if [[ -n "$DEMO_TYPE" ]]; then
 fi
 
 
-python examples/baselines/diffusion_policy/train_mas_window_mixed.py "${ARGS[@]}"
+python examples/baselines/diffusion_policy/train_relative_action.py "${ARGS[@]}"

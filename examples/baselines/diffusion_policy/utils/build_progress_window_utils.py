@@ -117,9 +117,58 @@ def build_mas_window_from_future(
     return mas_window
 
 
-def build_mas_long_window_from_future(
-    mas_t: torch.Tensor, current_step: int, long_window_horizon: int
+def build_mas_window_around_step(
+    mas_t: torch.Tensor,
+    current_step: int,
+    backward_length: int,
+    forward_length: int,
 ) -> torch.Tensor:
+    if mas_t.ndim != 2 or mas_t.shape[-1] != MAS_STEP_DIM:
+        raise ValueError(
+            f"Expected augmented mas shape (T, {MAS_STEP_DIM}), got {tuple(mas_t.shape)}"
+        )
+    if backward_length < 0:
+        raise ValueError(f"backward_length must be non-negative, got {backward_length}")
+    if forward_length <= 0:
+        raise ValueError(f"forward_length must be positive, got {forward_length}")
+    if mas_t.shape[0] <= 0:
+        raise ValueError(f"mas length must be positive, got shape {tuple(mas_t.shape)}")
+
+    current_idx = min(max(int(current_step), 0), mas_t.shape[0] - 1)
+    offsets = range(-backward_length, forward_length)
+    indices = [
+        min(max(current_idx + offset, 0), mas_t.shape[0] - 1)
+        for offset in offsets
+    ]
+    mas_window = mas_t[indices].clone()
+    expected_horizon = backward_length + forward_length
+    if mas_window.shape != (expected_horizon, MAS_STEP_DIM):
+        raise ValueError(
+            "Expected bidirectional mas-window shape "
+            f"{(expected_horizon, MAS_STEP_DIM)}, got {tuple(mas_window.shape)}"
+        )
+    return mas_window
+
+
+def build_mas_long_window_from_future(
+    mas_t: torch.Tensor,
+    current_step: int,
+    long_window_horizon: int,
+    long_window_backward_length: int = 0,
+    long_window_forward_length: int | None = None,
+) -> torch.Tensor:
+    if long_window_forward_length is not None or long_window_backward_length > 0:
+        forward_length = (
+            long_window_horizon
+            if long_window_forward_length is None
+            else long_window_forward_length
+        )
+        return build_mas_window_around_step(
+            mas_t=mas_t,
+            current_step=current_step,
+            backward_length=long_window_backward_length,
+            forward_length=forward_length,
+        )
     return build_mas_window_from_future(
         mas_t=mas_t, current_step=current_step, mas_horizon=long_window_horizon
     )
@@ -168,6 +217,8 @@ def build_dual_mas_window_obs_horizon(
     obs_horizon: int,
     long_window_horizon: int,
     short_window_horizon: int,
+    long_window_backward_length: int = 0,
+    long_window_forward_length: int | None = None,
 ):
     if obs_horizon <= 0:
         raise ValueError(f"obs_horizon must be positive, got {obs_horizon}")
@@ -179,6 +230,21 @@ def build_dual_mas_window_obs_horizon(
         raise ValueError(
             f"short_window_horizon must be non-negative, got {short_window_horizon}"
         )
+    if long_window_backward_length < 0:
+        raise ValueError(
+            "long_window_backward_length must be non-negative, "
+            f"got {long_window_backward_length}"
+        )
+    if long_window_forward_length is not None and long_window_forward_length < 0:
+        raise ValueError(
+            "long_window_forward_length must be non-negative, "
+            f"got {long_window_forward_length}"
+        )
+    effective_long_window_horizon = (
+        long_window_horizon
+        if long_window_forward_length is None
+        else long_window_backward_length + long_window_forward_length
+    )
 
     current_idx = min(max(int(current_step), 0), mas_t.shape[0] - 1)
     start = current_idx - obs_horizon + 1
@@ -186,12 +252,14 @@ def build_dual_mas_window_obs_horizon(
     short_windows = []
     for h_offset in range(obs_horizon):
         anchor_idx = min(max(start + h_offset, 0), mas_t.shape[0] - 1)
-        if long_window_horizon > 0:
+        if effective_long_window_horizon > 0:
             long_windows.append(
                 build_mas_long_window_from_future(
                     mas_t,
                     current_step=anchor_idx,
                     long_window_horizon=long_window_horizon,
+                    long_window_backward_length=long_window_backward_length,
+                    long_window_forward_length=long_window_forward_length,
                 )
             )
         if short_window_horizon > 0:
@@ -203,7 +271,7 @@ def build_dual_mas_window_obs_horizon(
                 )
             )
 
-    if long_window_horizon > 0:
+    if effective_long_window_horizon > 0:
         long_window = torch.stack(long_windows, dim=0)
     else:
         long_window = mas_t.new_empty((obs_horizon, 0, MAS_STEP_DIM))
@@ -211,10 +279,10 @@ def build_dual_mas_window_obs_horizon(
         short_window = torch.stack(short_windows, dim=0)
     else:
         short_window = mas_t.new_empty((obs_horizon, 0, MAS_STEP_DIM))
-    if long_window.shape != (obs_horizon, long_window_horizon, MAS_STEP_DIM):
+    if long_window.shape != (obs_horizon, effective_long_window_horizon, MAS_STEP_DIM):
         raise ValueError(
             "Expected long-window horizon shape "
-            f"{(obs_horizon, long_window_horizon, MAS_STEP_DIM)}, got {tuple(long_window.shape)}"
+            f"{(obs_horizon, effective_long_window_horizon, MAS_STEP_DIM)}, got {tuple(long_window.shape)}"
         )
     if short_window.shape != (obs_horizon, short_window_horizon, MAS_STEP_DIM):
         raise ValueError(

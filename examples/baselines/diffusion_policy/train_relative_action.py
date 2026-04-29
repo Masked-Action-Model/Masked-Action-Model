@@ -1,10 +1,11 @@
-ALGO_NAME = "BC_Diffusion_rgbd_DiT_OnlyMAS"
+ALGO_NAME = "BC_Diffusion_rgbd_DiT_RelativeAction_Mixed"
 MAS_STEP_DIM = 8
 
 import os
 import random
 import time
 import sys
+import json
 from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import partial
@@ -31,34 +32,37 @@ from torch.utils.data.dataset import Dataset
 from torch.utils.data.sampler import BatchSampler, RandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
-from evaluate.evaluate_only_mas import evaluate_only_mas
+from evaluate.evaluate_relative_action_mixed import evaluate_relative_action_mixed
 from models.mas_conv1d import MasConv1D
 from models.mas_conv2d import MasConv
 from models.modeling_ditdp import DiTNoiseNet
 from models.plain_conv import PlainConv
-from models.progress_mlp import ProgressMLP
 from utils.add_progress_to_mas_utils import (
-    pad_mas_to_length,
-    pad_mask_to_length,
+    augment_mask_with_progress,
+    augment_mas_with_progress,
 )
 from utils.build_progress_window_utils import (
-    build_action_progress_window,
-    build_mas_horizon_window,
-    build_progress_mlp_horizon_window,
+    build_dual_mas_window_obs_horizon,
 )
 from utils.denormalize_utils import (compute_state_min_max,
                                      load_action_denorm_stats)
-from utils.draw_p_t_curve_utils import save_progress_curve_for_video
+from utils.control_error_utils import (
+    aggregate_control_error,
+    compute_control_error_results_from_rollouts,
+    load_ce_eval_data,
+    load_source_episode_ids,
+)
+from utils.draw_p_t_curve_utils import (
+    save_control_error_curve,
+)
 from utils.eval_video_sampling_utils import (
     build_capture_indices,
-    build_eval_batches,
     validate_eval_video_config,
 )
 from utils.load_eval_data_utils import (infer_eval_reset_seeds_from_demo,
                                   infer_eval_traj_ids_from_demo,
-                                  load_eval_only_mas_data,
-                                  read_augmented_mas_length,
-                                  select_eval_demo_indices,
+                                  load_traj_mask_type_slots,
+                                  load_traj_mask_types,
                                   subset_eval_data)
 from utils.load_train_data_utils import load_dataset_meta, load_demo_dataset
 from utils.loss_utils import (
@@ -66,13 +70,22 @@ from utils.loss_utils import (
     slice_action_mask_sequence,
 )
 from utils.make_env import make_eval_envs
+from utils.relative_action_utils import (
+    absolute_action_sequence_to_relative,
+    convert_masked_mas_to_relative,
+    denormalize_abs_action,
+    denormalize_relative_action,
+    extract_pickcube_tcp_pose_from_state,
+    normalize_relative_action,
+    relative_action_sequence_to_absolute,
+    relative_sequence_to_delta_actions,
+    normalize_delta_for_pd_ee_delta_pose,
+    tcp_pose_to_panda_base_abs_euler,
+)
 from utils.utils import (IterationBasedBatchSampler, build_state_obs_extractor,
                          convert_obs, worker_init_fn)
 from utils.video_utils import (
-    collect_failed_video,
-    collect_success_video,
-    delete_new_video_files,
-    snapshot_video_files,
+    clear_iteration_artifacts,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -132,24 +145,21 @@ class Args:
     pred_horizon: int = (
         16  # 16->8 leads to worse performance, maybe it is like generate a half image; 16->32, improvement is very marginal
     )
-    long_window_horizon: Optional[int] = None
-    """optional padded MAS horizon for only-mas conditioning; when unset uses max(train, eval) trajectory length"""
+    long_window_backward_length: Optional[int] = None
+    """MAS long window length before t; defaults to 0"""
+    long_window_forward_length: Optional[int] = None
+    """MAS long window length from t onward, including t; defaults to pred_horizon"""
     diffusion_step_embed_dim: int = 64  # not very important
-    mas_encode_mode: Literal[
-        "no_encode",
-        "1D",
-        "2D",
-    ] = "no_encode"
-    """how to encode mas input before concatenating it into the observation conditioning"""
-    mas_encode_output_dim: int = 64
-    """Output feature dim used by MAS conv encoders; ignored when mas_encode_mode=no_encode."""
-    progress_mode: Literal["MLP8", "MAS8", "AP8"] = "AP8"
-    """how to convert progress into the observation conditioning branch"""
+    short_window_horizon: int = 8
+    """future MAS short window length; set to 0 to disable the short-window branch"""
+    mas_long_encode_mode: Literal["1DConv", "2DConv"] = "2DConv"
+    """how to encode the long MAS window before concatenating it into the observation conditioning"""
+    mas_long_conv_output_dim: int = 64
+    """Output feature dim used by long-window conv encoders; set to 0 to disable the long-window branch."""
     loss_mode: Literal["average", "weighted"] = "average"
     """average keeps plain MSE; weighted balances known area and unknown area"""
     loss_mask_area_weight: float = 0.2
     """known area weight when loss_mode=weighted; unknown area uses 1 - this value"""
-
     # Environment/experiment specific arguments
     max_episode_steps: Optional[int] = None
     """Change the environments' max_episode_steps to this value. Sometimes necessary if the demonstrations being imitated are too short. Typically the default
@@ -172,8 +182,16 @@ class Args:
     """the simulation backend to use for evaluation environments. can be "cpu" or "gpu"""
     num_dataload_workers: int = 0
     """the number of workers to use for loading the training data in the torch dataloader"""
-    control_mode: str = "pd_ee_pose"
-    """the control mode to use for the evaluation environments. Must match the control mode of the demonstration dataset."""
+    control_mode: str = "pd_ee_delta_pose"
+    """the control mode to use for the evaluation environments."""
+    relative_pos_scale: float = 0.1
+    """position scale used to normalize relative action targets."""
+    relative_rot_scale: float = 0.1
+    """rotation scale used to normalize relative action targets."""
+    delta_pos_scale: float = 0.1
+    """position scale used to normalize pd_ee_delta_pose actions."""
+    delta_rot_scale: float = 0.1
+    """rotation scale used to normalize pd_ee_delta_pose actions."""
 
     # additional tags/configs for logging purposes to wandb and shared comparisons with other algorithms
     demo_type: Optional[str] = None
@@ -194,7 +212,7 @@ def build_eval_stpm_encoder(
 ):
     if len(stpm_ckpt_path.strip()) == 0:
         raise ValueError(
-            "stpm_ckpt_path is required for only-mas evaluation. "
+            "stpm_ckpt_path is required for mas-window evaluation. "
             "Please pass --stpm-ckpt-path."
         )
 
@@ -235,7 +253,7 @@ def validate_only_mas_eval_layout(envs: VectorEnv, stpm_encoder):
     if rgb_shape[-1] != 3 or depth_shape[-1] != 1:
         raise ValueError(
             "Only single-camera rollout observations are supported for STPM-driven "
-            f"only-mas evaluation, got rgb shape {rgb_shape} and depth shape {depth_shape}."
+            f"mas-window evaluation, got rgb shape {rgb_shape} and depth shape {depth_shape}."
         )
     if state_shape[-1] != int(stpm_encoder.state_dim):
         raise ValueError(
@@ -273,13 +291,29 @@ def _load_state_norm_stats_from_meta(meta: dict):
         np.asarray(meta["state_max"], dtype=np.float32),
     )
 
-class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
-    def __init__(self, data_path, obs_process_fn, obs_space, device, num_traj, target_mas_length=None):
+class SmallDemoDataset_MasWindowDiffusionPolicy(Dataset):  # Load everything into memory
+    def __init__(self, data_path, obs_process_fn, obs_space, device, num_traj, traj_indices=None):
 
         load_keys = ["observations", "actions", "mas", "mask", "env_states", "success", "terminated", "truncated"]
-        trajectories = load_demo_dataset(data_path, keys=load_keys, num_traj=num_traj, concat=False)
+        trajectories = load_demo_dataset(
+            data_path,
+            keys=load_keys,
+            num_traj=num_traj if traj_indices is None else None,
+            concat=False,
+            traj_indices=traj_indices,
+        )
         dataset_meta = load_dataset_meta(data_path)
         self.state_is_normalized = _meta_flag(dataset_meta, "states_normalized", False)
+        if "action_min" not in dataset_meta or "action_max" not in dataset_meta:
+            raise ValueError(
+                f"{data_path} is missing meta/action_min or meta/action_max, "
+                "which are required to reconstruct relative action space."
+            )
+        self.action_min = torch.as_tensor(dataset_meta["action_min"], dtype=torch.float32)
+        self.action_max = torch.as_tensor(dataset_meta["action_max"], dtype=torch.float32)
+        self.mask_value = float(np.asarray(dataset_meta.get("mask_value", 0.0)).reshape(-1)[0])
+        self.relative_pos_scale = float(args.relative_pos_scale)
+        self.relative_rot_scale = float(args.relative_rot_scale)
         print(f"Loaded trajectory keys: {sorted(trajectories.keys())}")
         missing_keys = [k for k in load_keys if k not in trajectories]
         assert not missing_keys, f"Missing keys in loaded trajectories: {missing_keys}"
@@ -297,7 +331,15 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
 
         # Pre-process the observations, make them align with the obs returned by the obs_wrapper
         obs_traj_dict_list = []
+        tcp_pose_traj_list = []
         for obs_traj_dict in trajectories["observations"]:
+            if "extra" not in obs_traj_dict or "tcp_pose" not in obs_traj_dict["extra"]:
+                raise ValueError(
+                    "relative-action training requires obs/extra/tcp_pose in the dataset"
+                )
+            tcp_pose_traj_list.append(
+                torch.as_tensor(obs_traj_dict["extra"]["tcp_pose"], dtype=torch.float32)
+            )
             precomputed_state = obs_traj_dict.get("state", None)
             _obs_traj_dict = reorder_keys(obs_traj_dict, obs_space)  # key order in demo is different from key order in env obs
             _obs_traj_dict = obs_process_fn(_obs_traj_dict)
@@ -311,6 +353,7 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
                 _obs_traj_dict["state"] = torch.from_numpy(_obs_traj_dict["state"]).to(dtype=torch.float32)
             obs_traj_dict_list.append(_obs_traj_dict)
         trajectories["observations"] = obs_traj_dict_list
+        trajectories["tcp_pose"] = tcp_pose_traj_list
         self.obs_keys = list(_obs_traj_dict.keys())
         state_meta_min, state_meta_max = _load_state_norm_stats_from_meta(dataset_meta)
         if self.state_is_normalized:
@@ -331,46 +374,20 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
                 f"[state_norm] computed state min/max from dataset, dim={self.state_min.shape[0]}"
             )
         
-        # only_mas keeps raw-length MAS in HDF5 and pads only after loading into memory
-        # so the fixed-length only_mas branch can still flatten a global-length tensor.
+        # Pre-process the actions and mas
         for i in range(len(trajectories["actions"])):
             trajectories["actions"][i] = torch.as_tensor(trajectories["actions"][i], dtype=torch.float32)
-        if "mas" in trajectories and len(trajectories["mas"]) > 0:
-            if target_mas_length is not None:
-                self.mas_max_timestep = int(target_mas_length)
-            else:
-                self.mas_max_timestep = max(
-                    int(np.asarray(mas_array).shape[0]) for mas_array in trajectories["mas"]
-                )
-        else:
-            self.mas_max_timestep = 0
         if "mas" in trajectories:
             for i in range(len(trajectories["mas"])):
                 raw_mas_t = torch.as_tensor(trajectories["mas"][i], dtype=torch.float32)
                 raw_mask_t = torch.as_tensor(trajectories["mask"][i], dtype=torch.float32)
                 traj_len = int(trajectories["actions"][i].shape[0])
-                if raw_mas_t.ndim != 2 or raw_mas_t.shape[0] != traj_len:
-                    raise ValueError(
-                        f"[check1] raw mas traj {i} must keep real action length {traj_len}, "
-                        f"got shape {tuple(raw_mas_t.shape)}"
-                    )
-                if raw_mask_t.ndim != 2 or raw_mask_t.shape[0] != traj_len:
-                    raise ValueError(
-                        f"[check1] raw mask traj {i} must keep real action length {traj_len}, "
-                        f"got shape {tuple(raw_mask_t.shape)}"
-                    )
-                if self.mas_max_timestep < traj_len:
-                    raise ValueError(
-                        f"[check1] target mas length {self.mas_max_timestep} is smaller than raw traj length {traj_len}"
-                    )
-                trajectories["mas"][i] = pad_mas_to_length(
-                    raw_mas_t,
-                    target_len=self.mas_max_timestep,
-                    traj_len=traj_len,
-                )
-                trajectories["mask"][i] = pad_mask_to_length(
+                if raw_mas_t.shape[-1] == MAS_STEP_DIM:
+                    trajectories["mas"][i] = raw_mas_t
+                else:
+                    trajectories["mas"][i] = augment_mas_with_progress(raw_mas_t, traj_len)
+                trajectories["mask"][i] = augment_mask_with_progress(
                     raw_mask_t,
-                    target_len=self.mas_max_timestep,
                     traj_len=traj_len,
                     mas_t=raw_mas_t,
                 )
@@ -384,24 +401,22 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
                         f"[check1] mask/mas shape mismatch at traj {i}: "
                         f"mask={tuple(trajectories['mask'][i].shape)} vs mas={tuple(trajectories['mas'][i].shape)}"
                     )
-                if trajectories["mas"][i].shape[0] != self.mas_max_timestep:
-                    raise ValueError(
-                        f"[check1] padded mas traj {i} expected length {self.mas_max_timestep}, "
-                        f"got shape {tuple(trajectories['mas'][i].shape)}"
-                    )
                 if i == 0:
                     print(
-                        f"[check1] only_mas keeps raw HDF5 length and pads after load: "
-                        f"raw_len={traj_len}, target_len={self.mas_max_timestep}, "
-                        f"padded_shape={tuple(trajectories['mas'][i].shape)}"
+                        f"[check1] augment_mas_with_progress output shape="
+                        f"{tuple(trajectories['mas'][i].shape)}"
                     )
-        self.mas_flat_dim = int(self.mas_max_timestep * MAS_STEP_DIM)
         print("Obs/action pre-processing is done, start to pre-compute the slice indices...")
         self._printed_dataset_checks = False
 
         self.obs_horizon, self.pred_horizon = obs_horizon, pred_horizon = (args.obs_horizon,args.pred_horizon,)
+        self.long_window_horizon = int(args.long_window_horizon)
+        self.long_window_backward_length = int(args.long_window_backward_length)
+        self.long_window_forward_length = int(args.long_window_forward_length)
         self.act_horizon = args.act_horizon
-        self.progress_mode = args.progress_mode
+        self.short_window_horizon = args.short_window_horizon
+        self.enable_long_window = args.mas_long_conv_output_dim > 0
+        self.enable_short_window = args.short_window_horizon > 0
         self.slices = []
         num_traj = len(trajectories["actions"])
         total_transitions = 0
@@ -447,45 +462,64 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
                     # repeat the first frame for visual obs to avoid uint8 underflow/overflow
                     pad_obs_seq = torch.stack([obs_seq[k][0]] * pad_len, dim=0)
                     obs_seq[k] = torch.cat((pad_obs_seq, obs_seq[k]), dim=0)
-        
-        
-        mas_traj = self.trajectories["mas"][traj_idx]  # (T, mas_step_dim)
-        mask_traj = self.trajectories["mask"][traj_idx]  # (T, mas_step_dim)
-        mas_flat = mas_traj.reshape(-1)  # (T*mas_step_dim,)
-        mas_mask_flat = mask_traj.reshape(-1)  # (T*mas_step_dim,)
-        mas_seq = mas_flat.unsqueeze(0).repeat(self.obs_horizon, 1)  # (obs_horizon, T*mas_step_dim)
-        mas_mask_seq = mas_mask_flat.unsqueeze(0).repeat(self.obs_horizon, 1)
-        obs_seq["mas"] = mas_seq
-        obs_seq["mas_mask"] = mas_mask_seq
         current_step = start + self.obs_horizon - 1
-        if self.progress_mode == "MLP8":
-            obs_seq["progress"] = build_progress_mlp_horizon_window(
-                mas_traj, current_step=current_step, obs_horizon=self.obs_horizon
+        tcp_pose_traj = self.trajectories["tcp_pose"][traj_idx]
+        ref_idx = int(min(max(current_step, 0), tcp_pose_traj.shape[0] - 1))
+        ref_pose = tcp_pose_to_panda_base_abs_euler(tcp_pose_traj[ref_idx])
+        mas_traj = self.trajectories["mas"][traj_idx]
+        mask_traj = self.trajectories["mask"][traj_idx]
+        mas_long_window, mas_short_window = build_dual_mas_window_obs_horizon(
+            mas_traj,
+            current_step=current_step,
+            obs_horizon=self.obs_horizon,
+            long_window_horizon=self.long_window_horizon if self.enable_long_window else 0,
+            short_window_horizon=self.short_window_horizon if self.enable_short_window else 0,
+            long_window_backward_length=self.long_window_backward_length if self.enable_long_window else 0,
+            long_window_forward_length=self.long_window_forward_length if self.enable_long_window else 0,
+        )
+        mas_long_window_mask, mas_short_window_mask = build_dual_mas_window_obs_horizon(
+            mask_traj,
+            current_step=current_step,
+            obs_horizon=self.obs_horizon,
+            long_window_horizon=self.long_window_horizon if self.enable_long_window else 0,
+            short_window_horizon=self.short_window_horizon if self.enable_short_window else 0,
+            long_window_backward_length=self.long_window_backward_length if self.enable_long_window else 0,
+            long_window_forward_length=self.long_window_forward_length if self.enable_long_window else 0,
+        )
+        if self.enable_long_window and mas_long_window.numel() > 0:
+            mas_long_window = convert_masked_mas_to_relative(
+                mas_long_window,
+                mas_long_window_mask,
+                ref_pose=ref_pose,
+                action_min=self.action_min,
+                action_max=self.action_max,
+                relative_pos_scale=self.relative_pos_scale,
+                relative_rot_scale=self.relative_rot_scale,
+                mask_value=self.mask_value,
             )
-        elif self.progress_mode == "MAS8":
-            obs_seq["progress"] = build_mas_horizon_window(
-                mas_traj, current_step=current_step, obs_horizon=self.obs_horizon
+        if self.enable_short_window and mas_short_window.numel() > 0:
+            mas_short_window = convert_masked_mas_to_relative(
+                mas_short_window,
+                mas_short_window_mask,
+                ref_pose=ref_pose,
+                action_min=self.action_min,
+                action_max=self.action_max,
+                relative_pos_scale=self.relative_pos_scale,
+                relative_rot_scale=self.relative_rot_scale,
+                mask_value=self.mask_value,
             )
-            obs_seq["progress_mask"] = build_mas_horizon_window(
-                mask_traj, current_step=current_step, obs_horizon=self.obs_horizon
-            )
-        elif self.progress_mode == "AP8":
-            obs_seq["progress"] = build_action_progress_window(
-                mas_traj,
-                current_step=current_step,
-                act_horizon=self.act_horizon,
-                obs_horizon=self.obs_horizon,
-            )
-        else:
-            raise ValueError(f"Unsupported progress_mode: {self.progress_mode}")
+        obs_seq["mas_long_window"] = mas_long_window.reshape(self.obs_horizon, -1)
+        obs_seq["mas_short_window"] = mas_short_window.reshape(self.obs_horizon, -1)
+        obs_seq["mas_long_window_mask"] = mas_long_window_mask.reshape(self.obs_horizon, -1)
+        obs_seq["mas_short_window_mask"] = mas_short_window_mask.reshape(self.obs_horizon, -1)
         if not self._printed_dataset_checks:
             print(
-                f"[check2] dataset obs['mas'] shape={tuple(obs_seq['mas'].shape)} "
-                f"(expected ({self.obs_horizon}, {self.mas_flat_dim}))"
+                f"[check2] dataset obs['mas_long_window'] shape={tuple(obs_seq['mas_long_window'].shape)} "
+                f"(enabled={self.enable_long_window}, expected ({self.obs_horizon}, {MAS_STEP_DIM * (self.long_window_horizon if self.enable_long_window else 0)}))"
             )
             print(
-                f"[check3] dataset obs['progress'] shape={tuple(obs_seq['progress'].shape)} "
-                f"for progress_mode={self.progress_mode}"
+                f"[check2] dataset obs['mas_short_window'] shape={tuple(obs_seq['mas_short_window'].shape)} "
+                f"(enabled={self.enable_short_window}, expected ({self.obs_horizon}, {MAS_STEP_DIM * (self.short_window_horizon if self.enable_short_window else 0)}))"
             )
             self._printed_dataset_checks = True
         obs_seq["state_is_normalized"] = torch.tensor(self.state_is_normalized, dtype=torch.bool)
@@ -508,6 +542,18 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             pad_action = act_seq[-1]
             act_seq = torch.cat([act_seq, pad_action.repeat(end - L, 1)], dim=0)
             # making the robot (arm and gripper) stay still
+        abs_act_seq = denormalize_abs_action(
+            act_seq,
+            action_min=self.action_min,
+            action_max=self.action_max,
+        )
+        relative_act_seq = absolute_action_sequence_to_relative(abs_act_seq, ref_pose)
+        act_seq = normalize_relative_action(
+            relative_act_seq,
+            pos_scale=self.relative_pos_scale,
+            rot_scale=self.relative_rot_scale,
+            clip=True,
+        )
         
         assert (
             obs_seq["state"].shape[0] == self.obs_horizon
@@ -544,65 +590,63 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
 
 
 class Agent(nn.Module):
-    def __init__(self, env: VectorEnv, args: Args, obs_mas_dim: int):
+    def __init__(self, env: VectorEnv, args: Args):
         super().__init__()
         self.obs_horizon = args.obs_horizon
         self.act_horizon = args.act_horizon
         self.pred_horizon = args.pred_horizon
-        self.include_mas = True
-        self.progress_mode = args.progress_mode
+        self.long_window_horizon = int(args.long_window_horizon)
+        self.long_window_backward_length = int(args.long_window_backward_length)
+        self.long_window_forward_length = int(args.long_window_forward_length)
+        self.short_window_horizon = int(args.short_window_horizon)
+        self.enable_long_window = int(args.mas_long_conv_output_dim) > 0
+        self.enable_short_window = self.short_window_horizon > 0
         self.loss_mode = args.loss_mode
         self.loss_mask_area_weight = float(args.loss_mask_area_weight)
+        self.relative_pos_scale = float(args.relative_pos_scale)
+        self.relative_rot_scale = float(args.relative_rot_scale)
+        self.delta_pos_scale = float(args.delta_pos_scale)
+        self.delta_rot_scale = float(args.delta_rot_scale)
+        self.mas_long_window_dim = self.long_window_horizon * MAS_STEP_DIM
+        self.mas_short_window_dim = self.short_window_horizon * MAS_STEP_DIM
+        self.mas_long_encode_mode = args.mas_long_encode_mode
         assert (len(env.single_observation_space["state"].shape) == 2)  # (obs_horizon, obs_dim)
         assert len(env.single_action_space.shape) == 1  # (act_dim, )
         self.act_dim = env.single_action_space.shape[0]
         obs_state_dim = env.single_observation_space["state"].shape[1]
-        assert obs_mas_dim > 0, "obs_mas_dim must be > 0 for MAM conditioning"
-        self.obs_mas_dim = obs_mas_dim
-        self.mas_encode_mode = args.mas_encode_mode
         self.mas_step_dim = MAS_STEP_DIM
-        if self.obs_mas_dim % self.mas_step_dim != 0:
+        if self.mas_long_window_dim % self.mas_step_dim != 0:
             raise ValueError(
-                f"obs_mas_dim ({self.obs_mas_dim}) must be divisible by mas_step_dim ({self.mas_step_dim})"
+                "mas_long_window_dim "
+                f"({self.mas_long_window_dim}) must be divisible by mas_step_dim ({self.mas_step_dim})"
             )
-        self.mas_max_timestep = self.obs_mas_dim // self.mas_step_dim
         total_visual_channels = (env.single_observation_space["rgb"].shape[-1]+ env.single_observation_space["depth"].shape[-1])
 
-        # instantiate encoders
         visual_feature_dim = 256
         self.visual_encoder = PlainConv(in_channels=total_visual_channels, out_dim=visual_feature_dim, pool_feature_map=True)
-        
-        if self.mas_encode_mode == "no_encode":
-            mas_feature_dim = obs_mas_dim * 2
-            self.mas_encoder = None
-        elif self.mas_encode_mode == "2D":
-            mas_feature_dim = int(args.mas_encode_output_dim)
-            if mas_feature_dim <= 0:
-                raise ValueError(
-                    f"mas_encode_output_dim must be positive for 2D mode, got {mas_feature_dim}"
+
+        mas_long_feature_dim = max(0, int(args.mas_long_conv_output_dim))
+        if self.enable_long_window:
+            if self.mas_long_encode_mode == "2DConv":
+                self.mas_long_window_encoder = MasConv(
+                    in_channels=2, out_dim=mas_long_feature_dim
                 )
-            self.mas_encoder = MasConv(in_channels=2, out_dim=mas_feature_dim)
-        elif self.mas_encode_mode == "1D":
-            mas_feature_dim = int(args.mas_encode_output_dim)
-            if mas_feature_dim <= 0:
-                raise ValueError(
-                    f"mas_encode_output_dim must be positive for 1D mode, got {mas_feature_dim}"
+            elif self.mas_long_encode_mode == "1DConv":
+                self.mas_long_window_encoder = MasConv1D(
+                    in_channels=2, mas_dim=self.mas_step_dim, out_dim=mas_long_feature_dim
                 )
-            self.mas_encoder = MasConv1D(
-                in_channels=2, mas_dim=self.mas_step_dim, out_dim=mas_feature_dim
-            )
+            else:
+                raise ValueError(
+                    f"Unsupported mas_long_encode_mode: {self.mas_long_encode_mode}"
+                )
         else:
-            raise ValueError(f"Unsupported mas_encode_mode: {self.mas_encode_mode}")
-        
-        if self.progress_mode == "MAS8":
-            self.progress_feature_dim = MAS_STEP_DIM * 2
-        else:
-            self.progress_feature_dim = 8
-        self.progress_encoder = ProgressMLP(in_dim=1, hidden_dim=32, out_dim=self.progress_feature_dim)
+            self.mas_long_window_encoder = None
+        mas_short_feature_dim = self.mas_short_window_dim if self.enable_short_window else 0
+
         self.noise_pred_net = DiTNoiseNet(
             ac_dim=self.act_dim,
             ac_chunk=self.pred_horizon,
-            obs_dim=visual_feature_dim + obs_state_dim + mas_feature_dim + self.progress_feature_dim,
+            obs_dim=visual_feature_dim + obs_state_dim + mas_long_feature_dim + mas_short_feature_dim,
             time_dim=args.diffusion_step_embed_dim,
             use_mask=False,
         )
@@ -634,49 +678,42 @@ class Agent(nn.Module):
             torch.tensor(False, dtype=torch.bool),
         )
         self.expected_obs_cond_dim = (
-            visual_feature_dim + obs_state_dim + mas_feature_dim + self.progress_feature_dim
+            visual_feature_dim + obs_state_dim + mas_long_feature_dim + mas_short_feature_dim
         )
-        self._printed_progress_check = False
         self._printed_obs_cond_check = False
-        self._printed_action_denorm_check = False
+        self._printed_relative_action_check = False
+        self._last_absolute_action_chunk = None
+        self._last_delta_action_chunk = None
 
-    def _reshape_mas_value_and_mask(
+    def _reshape_mas_window_value_and_mask(
         self,
-        mas: torch.Tensor,
-        mas_mask: torch.Tensor,
+        mas_window: torch.Tensor,
+        mas_window_mask: torch.Tensor,
+        window_horizon: int,
+        expected_dim: int,
         state_dtype: torch.dtype,
     ):
-        if mas.shape[-1] != self.obs_mas_dim:
+        if mas_window.shape[-1] != expected_dim:
             raise ValueError(
-                f"Expected mas last dim {self.obs_mas_dim}, got shape {tuple(mas.shape)}"
+                f"Expected mas window last dim {expected_dim}, got shape {tuple(mas_window.shape)}"
             )
-        if mas_mask.shape != mas.shape:
+        if mas_window_mask.shape != mas_window.shape:
             raise ValueError(
-                f"Expected mas_mask shape {tuple(mas.shape)}, got {tuple(mas_mask.shape)}"
+                f"Expected mas_window_mask shape {tuple(mas_window.shape)}, got {tuple(mas_window_mask.shape)}"
             )
-        mas_value = mas.to(dtype=state_dtype)
-        mas_mask = mas_mask.to(dtype=state_dtype)
-
+        mas_value = mas_window.to(dtype=state_dtype)
+        mas_mask = mas_window_mask.to(dtype=state_dtype)
         mas_value = mas_value.reshape(
-            mas.shape[0],
-            self.obs_horizon,
-            self.mas_max_timestep,
-            self.mas_step_dim,
+            mas_window.shape[0], self.obs_horizon, window_horizon, self.mas_step_dim
         )
         mas_mask = mas_mask.reshape(
-            mas.shape[0],
-            self.obs_horizon,
-            self.mas_max_timestep,
-            self.mas_step_dim,
+            mas_window.shape[0], self.obs_horizon, window_horizon, self.mas_step_dim
         )
-        raw_mas = mas.reshape(
-            mas.shape[0],
-            self.obs_horizon,
-            self.mas_max_timestep,
-            self.mas_step_dim,
+        raw_mas_window = mas_window.reshape(
+            mas_window.shape[0], self.obs_horizon, window_horizon, self.mas_step_dim
         )
         mas_value[..., :-1] = mas_value[..., :-1] * mas_mask[..., :-1]
-        mas_mask[..., -1] = raw_mas[..., -1].to(dtype=state_dtype)
+        mas_mask[..., -1] = raw_mas_window[..., -1].to(dtype=state_dtype)
         return mas_value, mas_mask
 
     def set_action_denormalizer(self, mins: np.ndarray, maxs: np.ndarray, device):
@@ -723,196 +760,135 @@ class Agent(nn.Module):
             return state
         return self.normalize_state(state)
 
-    def encode_mas(self, raw_mas, raw_mas_mask, state: torch.Tensor):
+    def encode_mas_long_window(self, raw_mas_long_window, raw_mas_long_window_mask, state: torch.Tensor):
         batch_size = state.shape[0]
-        if raw_mas is None or raw_mas_mask is None:
-            mas = torch.zeros(
-                (batch_size, self.obs_horizon, self.obs_mas_dim),
+        if not self.enable_long_window:
+            return state.new_empty((batch_size, self.obs_horizon, 0))
+        if raw_mas_long_window is None or raw_mas_long_window_mask is None:
+            mas_long_window = torch.zeros(
+                (batch_size, self.obs_horizon, self.mas_long_window_dim),
                 device=state.device,
                 dtype=state.dtype,
             )
-            mas_mask = torch.zeros_like(mas)
-            mas_is_missing = True
+            mas_long_window_mask = torch.zeros_like(mas_long_window)
+            mas_long_window_is_missing = True
         else:
-            mas = raw_mas.to(device=state.device, dtype=state.dtype)
-            mas_mask = raw_mas_mask.to(device=state.device, dtype=state.dtype)
-            mas_is_missing = False
-        if self.mas_encode_mode == "no_encode":
-            mas_value, mas_mask = self._reshape_mas_value_and_mask(
-                mas, mas_mask, state.dtype
+            mas_long_window = raw_mas_long_window.to(
+                device=state.device, dtype=state.dtype
             )
-            mas_value = mas_value.reshape(batch_size, self.obs_horizon, -1)
-            mas_mask = mas_mask.reshape(batch_size, self.obs_horizon, -1)
-            return torch.cat((mas_value, mas_mask), dim=-1)
-        elif self.mas_encode_mode in ("2D", "1D"):
-            if mas_is_missing:
-                mas_value = mas.reshape(
-                    batch_size,
-                    self.obs_horizon,
-                    self.mas_max_timestep,
-                    self.mas_step_dim,
-                )
-                mas_mask = mas_mask.reshape(
-                    batch_size,
-                    self.obs_horizon,
-                    self.mas_max_timestep,
-                    self.mas_step_dim,
-                )
-            else:
-                mas_value, mas_mask = self._reshape_mas_value_and_mask(
-                    mas, mas_mask, state.dtype
-                )
-            mas_value = mas_value.permute(0, 1, 3, 2)
-            mas_mask = mas_mask.permute(0, 1, 3, 2)
-            mas_and_mask = torch.stack((mas_value, mas_mask), dim=2)
-            mas_and_mask = mas_and_mask.reshape(
-                batch_size * self.obs_horizon,
-                2,
-                self.mas_step_dim,
-                self.mas_max_timestep,
+            mas_long_window_mask = raw_mas_long_window_mask.to(
+                device=state.device, dtype=state.dtype
             )
-            return self.mas_encoder(mas_and_mask).reshape(batch_size, self.obs_horizon, -1)
+            mas_long_window_is_missing = False
+        if mas_long_window_is_missing:
+            mas_value = mas_long_window.reshape(
+                batch_size, self.obs_horizon, self.long_window_horizon, self.mas_step_dim
+            )
+            mas_mask = mas_long_window_mask.reshape(
+                batch_size, self.obs_horizon, self.long_window_horizon, self.mas_step_dim
+            )
         else:
-            raise ValueError(f"Unsupported mas_encode_mode: {self.mas_encode_mode}")
+            mas_value, mas_mask = self._reshape_mas_window_value_and_mask(
+                mas_long_window,
+                mas_long_window_mask,
+                window_horizon=self.long_window_horizon,
+                expected_dim=self.mas_long_window_dim,
+                state_dtype=state.dtype,
+            )
+        mas_value = mas_value.permute(0, 1, 3, 2)
+        mas_mask = mas_mask.permute(0, 1, 3, 2)
+        mas_and_mask = torch.stack((mas_value, mas_mask), dim=2)
+        mas_and_mask = mas_and_mask.reshape(
+            batch_size * self.obs_horizon, 2, self.mas_step_dim, self.long_window_horizon
+        )
+        return self.mas_long_window_encoder(mas_and_mask).reshape(
+            batch_size, self.obs_horizon, -1
+        )
 
-    def encode_progress(self, raw_progress, raw_progress_mask, state: torch.Tensor):
+    def encode_mas_short_window(self, raw_mas_short_window, raw_mas_short_window_mask, state: torch.Tensor):
         batch_size = state.shape[0]
-        if self.progress_mode == "MLP8":
-            if raw_progress is None:
-                progress = torch.zeros(
-                    (batch_size, self.obs_horizon, 1), device=state.device, dtype=state.dtype
-                )
-            else:
-                progress = raw_progress.to(device=state.device, dtype=state.dtype)
-                if progress.ndim == 1:
-                    progress = progress.unsqueeze(-1).unsqueeze(1).repeat(1, self.obs_horizon, 1)
-                elif progress.ndim == 2:
-                    if progress.shape == (batch_size, 1):
-                        progress = progress.unsqueeze(1).repeat(1, self.obs_horizon, 1)
-                    elif progress.shape == (batch_size, self.obs_horizon):
-                        progress = progress.unsqueeze(-1)
-                    else:
-                        raise ValueError(
-                            f"Expected 2D progress shape {(batch_size, 1)} or {(batch_size, self.obs_horizon)}, got {tuple(progress.shape)}"
-                        )
-                elif progress.ndim != 3:
-                    raise ValueError(
-                        f"Expected progress to have 1, 2, or 3 dims, got shape {tuple(progress.shape)}"
-                    )
-                if progress.shape != (batch_size, self.obs_horizon, 1):
-                    raise ValueError(
-                        f"Expected progress shape {(batch_size, self.obs_horizon, 1)}, got {tuple(progress.shape)}"
-                    )
-            progress = progress.reshape(batch_size * self.obs_horizon, 1)
-            progress_feature = self.progress_encoder(progress)
-            progress_feature = progress_feature.reshape(batch_size, self.obs_horizon, -1)
-            if not self._printed_progress_check:
-                print(
-                    f"[check3] progress_mode=MLP8, input_shape={(batch_size, self.obs_horizon, 1)}, "
-                    f"output_shape={tuple(progress_feature.shape)}"
-                )
-                self._printed_progress_check = True
-            return progress_feature
-
-        if raw_progress is None:
-            progress = torch.zeros(
-                (batch_size, self.obs_horizon, MAS_STEP_DIM),
+        if not self.enable_short_window:
+            return state.new_empty((batch_size, self.obs_horizon, 0))
+        if raw_mas_short_window is None or raw_mas_short_window_mask is None:
+            mas_short_window = torch.zeros(
+                (batch_size, self.obs_horizon, self.mas_short_window_dim),
                 device=state.device,
                 dtype=state.dtype,
             )
+            mas_short_window_mask = torch.zeros_like(mas_short_window)
         else:
-            progress = raw_progress.to(device=state.device, dtype=state.dtype)
-            if progress.ndim == 2 and progress.shape == (batch_size, MAS_STEP_DIM):
-                progress = progress.unsqueeze(1).repeat(1, self.obs_horizon, 1)
-            elif progress.ndim != 3:
-                raise ValueError(
-                    f"Expected {self.progress_mode} progress to have 2 or 3 dims, got shape {tuple(progress.shape)}"
-                )
-            if progress.shape != (batch_size, self.obs_horizon, MAS_STEP_DIM):
-                raise ValueError(
-                    f"Expected {self.progress_mode} progress shape {(batch_size, self.obs_horizon, MAS_STEP_DIM)}, got {tuple(progress.shape)}"
-                )
-        if self.progress_mode == "MAS8":
-            if raw_progress_mask is None:
-                progress_mask = torch.zeros_like(progress)
-            else:
-                progress_mask = raw_progress_mask.to(
-                    device=state.device, dtype=state.dtype
-                )
-                if progress_mask.ndim == 2 and progress_mask.shape == (batch_size, MAS_STEP_DIM):
-                    progress_mask = progress_mask.unsqueeze(1).repeat(1, self.obs_horizon, 1)
-                elif progress_mask.ndim != 3:
-                    raise ValueError(
-                        f"Expected MAS8 progress_mask to have 2 or 3 dims, got shape {tuple(progress_mask.shape)}"
-                    )
-                if progress_mask.shape != (batch_size, self.obs_horizon, MAS_STEP_DIM):
-                    raise ValueError(
-                        f"Expected MAS8 progress_mask shape {(batch_size, self.obs_horizon, MAS_STEP_DIM)}, got {tuple(progress_mask.shape)}"
-                    )
-            progress[..., :-1] = progress[..., :-1] * progress_mask[..., :-1]
-            progress_mask[..., -1] = progress[..., -1]
-            progress = torch.cat((progress, progress_mask), dim=-1)
-        if not self._printed_progress_check:
-            print(
-                f"[check3] progress_mode={self.progress_mode}, "
-                f"input/output_shape={tuple(progress.shape)}"
+            mas_short_window = raw_mas_short_window.to(
+                device=state.device, dtype=state.dtype
             )
-            self._printed_progress_check = True
-        return progress
+            mas_short_window_mask = raw_mas_short_window_mask.to(
+                device=state.device, dtype=state.dtype
+            )
+        mas_value, mas_mask = self._reshape_mas_window_value_and_mask(
+            mas_short_window,
+            mas_short_window_mask,
+            window_horizon=self.short_window_horizon,
+            expected_dim=self.mas_short_window_dim,
+            state_dtype=state.dtype,
+        )
+        del mas_mask
+        return mas_value.reshape(batch_size, self.obs_horizon, -1)
 
     def obs_conditioning(self, obs_seq, eval_mode):
-        # visual encoding
-        rgb = obs_seq["rgb"].float() / 255.0  # (B, obs_horizon, 3*k, H, W)
-        depth = obs_seq["depth"].float() / 1024.0  # (B, obs_horizon, 1*k, H, W)
-        img_seq = torch.cat([rgb, depth], dim=2)  # (B, obs_horizon, C, H, W)
+        rgb = obs_seq["rgb"].float() / 255.0
+        depth = obs_seq["depth"].float() / 1024.0
+        img_seq = torch.cat([rgb, depth], dim=2)
         batch_size = img_seq.shape[0]
-        img_seq = img_seq.flatten(end_dim=1)  # (B*obs_horizon, C, H, W)
+        img_seq = img_seq.flatten(end_dim=1)
         if hasattr(self, "aug") and not eval_mode:
-            img_seq = self.aug(img_seq)  # (B*obs_horizon, C, H, W)
-        visual_feature = self.visual_encoder(img_seq)  # (B*obs_horizon, D)
-        visual_feature = visual_feature.reshape(batch_size, self.obs_horizon, visual_feature.shape[1])  # (B, obs_horizon, D)y
-        
-        # mas encoding
-        mas_feature = obs_seq.get("mas_feature", None)
-        if mas_feature is None:
-            mas_feature = self.encode_mas(
-                obs_seq.get("mas", None),
-                obs_seq.get("mas_mask", None),
+            img_seq = self.aug(img_seq)
+        visual_feature = self.visual_encoder(img_seq)
+        visual_feature = visual_feature.reshape(batch_size, self.obs_horizon, visual_feature.shape[1])
+
+        mas_long_window_feature = obs_seq.get("mas_long_window_feature", None)
+        if mas_long_window_feature is None:
+            mas_long_window_feature = self.encode_mas_long_window(
+                obs_seq.get("mas_long_window", None),
+                obs_seq.get("mas_long_window_mask", None),
                 obs_seq["state"],
             )
         else:
-            mas_feature = mas_feature.to(
+            mas_long_window_feature = mas_long_window_feature.to(
                 device=obs_seq["state"].device, dtype=obs_seq["state"].dtype
             )
-        
-        # progress encoding
-        progress_feature = self.encode_progress(
-            obs_seq.get("progress", None),
-            obs_seq.get("progress_mask", None),
-            obs_seq["state"],
-        )
-        
-        # state normalization
+        mas_short_window_feature = obs_seq.get("mas_short_window_feature", None)
+        if mas_short_window_feature is None:
+            mas_short_window_feature = self.encode_mas_short_window(
+                obs_seq.get("mas_short_window", None),
+                obs_seq.get("mas_short_window_mask", None),
+                obs_seq["state"],
+            )
+        else:
+            mas_short_window_feature = mas_short_window_feature.to(
+                device=obs_seq["state"].device, dtype=obs_seq["state"].dtype
+            )
         state = self.maybe_normalize_state(obs_seq)
-        
-        feature = torch.cat((visual_feature, state, mas_feature, progress_feature), dim=-1)
+
+        feature = torch.cat(
+            (visual_feature, state, mas_long_window_feature, mas_short_window_feature),
+            dim=-1,
+        )
         if feature.shape[-1] != self.expected_obs_cond_dim:
             raise ValueError(
                 f"[check4] obs_conditioning dim mismatch: got {feature.shape[-1]}, "
                 f"expected {self.expected_obs_cond_dim}"
             )
         if not self._printed_obs_cond_check:
-            raw_mas = obs_seq.get("mas", None)
-            raw_mas_shape = tuple(raw_mas.shape) if raw_mas is not None else None
-            raw_progress = obs_seq.get("progress", None)
-            raw_progress_shape = (
-                tuple(raw_progress.shape) if raw_progress is not None else None
+            print(
+                f"[check2] obs['mas_long_window'] batch shape before encoding="
+                f"{tuple(obs_seq['mas_long_window'].shape) if obs_seq.get('mas_long_window', None) is not None else None}"
             )
             print(
-                f"[check2] obs['mas'] batch shape before encoding={raw_mas_shape}"
+                f"[check2] obs['mas_short_window'] batch shape before encoding="
+                f"{tuple(obs_seq['mas_short_window'].shape) if obs_seq.get('mas_short_window', None) is not None else None}"
             )
             print(
-                f"[check3] obs['progress'] batch shape before encoding={raw_progress_shape}"
+                f"[check2] long_window_enabled={self.enable_long_window}, "
+                f"short_window_enabled={self.enable_short_window}"
             )
             print(
                 f"[check4] obs_conditioning output shape={tuple(feature.shape)}, "
@@ -985,29 +961,37 @@ class Agent(nn.Module):
         # only take act_horizon number of actions
         start = self.obs_horizon - 1
         end = start + self.act_horizon
-        action_seq = noisy_action_seq[:, start:end]  # (B, act_horizon, act_dim)
-        if (
-            self.action_denorm_dims <= 0
-            or self.action_denorm_min is None
-            or self.action_denorm_max is None
-        ):
-            raise RuntimeError(
-                "Action denormalizer must be configured before get_action() is used "
-                "for only-mas evaluation."
-            )
-        d = min(self.action_denorm_dims, action_seq.shape[-1])
-        mins = self.action_denorm_min[:d]
-        maxs = self.action_denorm_max[:d]
-        action_seq = action_seq.clone()
-        action_seq[..., :d] = mins + 0.5 * (action_seq[..., :d] + 1.0) * (maxs - mins)
-        if not self._printed_action_denorm_check:
+        relative_action_norm_seq = noisy_action_seq[:, start:end]  # (B, act_horizon, act_dim)
+        relative_action_seq = denormalize_relative_action(
+            relative_action_norm_seq,
+            pos_scale=self.relative_pos_scale,
+            rot_scale=self.relative_rot_scale,
+        )
+        ref_pose = tcp_pose_to_panda_base_abs_euler(
+            extract_pickcube_tcp_pose_from_state(obs_seq["state"][:, -1])
+        )
+        absolute_action_seq = relative_action_sequence_to_absolute(
+            relative_action_seq,
+            ref_pose=ref_pose,
+        )
+        delta_action_seq = relative_sequence_to_delta_actions(relative_action_seq)
+        action_seq = normalize_delta_for_pd_ee_delta_pose(
+            delta_action_seq,
+            pos_scale=self.delta_pos_scale,
+            rot_scale=self.delta_rot_scale,
+            clip=True,
+        )
+        self._last_absolute_action_chunk = absolute_action_seq.detach()
+        self._last_delta_action_chunk = delta_action_seq.detach()
+        if not self._printed_relative_action_check:
             print(
-                f"[check7] action denormalization applied: denorm_dims={d}, "
-                f"output_shape={tuple(action_seq.shape)}, "
-                f"min={float(action_seq[..., :d].min().item()):.6f}, "
-                f"max={float(action_seq[..., :d].max().item()):.6f}"
+                f"[check7] relative action decoded to pd_ee_delta_pose actions: "
+                f"relative_shape={tuple(relative_action_seq.shape)}, "
+                f"delta_env_shape={tuple(action_seq.shape)}, "
+                f"delta_env_min={float(action_seq[..., :6].min().item()):.6f}, "
+                f"delta_env_max={float(action_seq[..., :6].max().item()):.6f}"
             )
-            self._printed_action_denorm_check = True
+            self._printed_relative_action_check = True
         return action_seq
 
 def save_ckpt(run_name, tag):
@@ -1020,6 +1004,191 @@ def save_ckpt(run_name, tag):
         },
         f"runs/{run_name}/checkpoints/{tag}.pt",
     )
+
+
+def summarize_label_counts(labels):
+    counts = defaultdict(int)
+    for label in labels:
+        counts[str(label)] += 1
+    return dict(sorted(counts.items(), key=lambda item: item[0]))
+
+
+def _decode_meta_string(value):
+    value = np.asarray(value)
+    if value.shape == ():
+        value = value.item()
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def load_target_mask_composition_entries(data_path: str) -> list[tuple[str, float]] | None:
+    meta = load_dataset_meta(data_path)
+    mixed_enabled = _meta_flag(meta, "mixed_mask_enabled", False)
+    if not mixed_enabled:
+        return None
+    if "mask_slot_name_list_json" in meta and "mask_slot_ratio_list_json" in meta:
+        labels = json.loads(_decode_meta_string(meta["mask_slot_name_list_json"]))
+        ratios = json.loads(_decode_meta_string(meta["mask_slot_ratio_list_json"]))
+        if len(labels) != len(ratios):
+            raise ValueError(
+                f"mask_slot_name_list_json/mask_slot_ratio_list_json length mismatch in {data_path}"
+            )
+        return [(str(label), float(ratio)) for label, ratio in zip(labels, ratios)]
+    if "mask_type_list_json" in meta and "mask_composition_list_json" in meta:
+        labels = json.loads(_decode_meta_string(meta["mask_type_list_json"]))
+        ratios = json.loads(_decode_meta_string(meta["mask_composition_list_json"]))
+        if len(labels) != len(ratios):
+            raise ValueError(
+                f"mask_type_list_json/mask_composition_list_json length mismatch in {data_path}"
+            )
+        return [(str(label), float(ratio)) for label, ratio in zip(labels, ratios)]
+    return None
+
+
+def load_mask_assign_mode(data_path: str) -> str:
+    meta = load_dataset_meta(data_path)
+    if "mask_assign_mode" not in meta:
+        return "composition"
+    mode = _decode_meta_string(meta["mask_assign_mode"])
+    if mode not in {"composition", "one_demo_multi_mask"}:
+        raise ValueError(f"unsupported mask_assign_mode={mode!r} in {data_path}")
+    return mode
+
+
+def largest_remainder_counts(total_items: int, ratios: list[float]) -> list[int]:
+    if total_items < 0:
+        raise ValueError(f"total_items must be non-negative, got {total_items}")
+    if len(ratios) == 0:
+        raise ValueError("ratios must be non-empty")
+    if total_items == 0:
+        return [0 for _ in ratios]
+    raw = np.asarray(ratios, dtype=np.float64) * float(total_items)
+    counts = np.floor(raw).astype(np.int64)
+    remaining = int(total_items - int(counts.sum()))
+    if remaining > 0:
+        remainders = raw - counts.astype(np.float64)
+        order = sorted(range(len(ratios)), key=lambda idx: (-remainders[idx], idx))
+        for idx in order[:remaining]:
+            counts[idx] += 1
+    return [int(v) for v in counts.tolist()]
+
+
+def select_source_demo_indices(
+    source_episode_ids: list[int],
+    num_source_demos: int | None,
+    seed: int,
+) -> list[int]:
+    if len(source_episode_ids) == 0:
+        return []
+
+    source_to_indices = defaultdict(list)
+    ordered_source_ids = []
+    for local_idx, source_episode_id in enumerate(source_episode_ids):
+        source_episode_id = int(source_episode_id)
+        if source_episode_id not in source_to_indices:
+            ordered_source_ids.append(source_episode_id)
+        source_to_indices[source_episode_id].append(int(local_idx))
+
+    if num_source_demos is None or num_source_demos >= len(ordered_source_ids):
+        selected_source_ids = set(ordered_source_ids)
+    elif num_source_demos <= 0:
+        selected_source_ids = set()
+    else:
+        rng = np.random.default_rng(seed)
+        shuffled_source_ids = list(ordered_source_ids)
+        rng.shuffle(shuffled_source_ids)
+        selected_source_ids = set(shuffled_source_ids[:num_source_demos])
+
+    selected_indices = []
+    for source_episode_id in ordered_source_ids:
+        if source_episode_id in selected_source_ids:
+            selected_indices.extend(source_to_indices[source_episode_id])
+    return sorted(selected_indices)
+
+
+def select_demo_indices_by_mask_assign_mode(
+    labels: list[str],
+    source_episode_ids: list[int],
+    num_select: int | None,
+    seed: int,
+    target_composition_entries: list[tuple[str, float]] | None,
+    mask_assign_mode: str,
+) -> list[int]:
+    if mask_assign_mode == "composition":
+        return stratified_select_demo_indices(
+            labels=labels,
+            num_select=num_select,
+            seed=seed,
+            target_composition_entries=target_composition_entries,
+        )
+    if mask_assign_mode == "one_demo_multi_mask":
+        return select_source_demo_indices(
+            source_episode_ids=source_episode_ids,
+            num_source_demos=num_select,
+            seed=seed,
+        )
+    raise ValueError(f"unsupported mask_assign_mode={mask_assign_mode!r}")
+
+
+def stratified_select_demo_indices(
+    labels: list[str],
+    num_select: int | None,
+    seed: int,
+    target_composition_entries: list[tuple[str, float]] | None = None,
+) -> list[int]:
+    total_items = len(labels)
+    if num_select is None or num_select >= total_items:
+        return list(range(total_items))
+    if num_select <= 0:
+        return []
+
+    grouped_indices = defaultdict(list)
+    for idx, label in enumerate(labels):
+        grouped_indices[str(label)].append(int(idx))
+
+    if target_composition_entries is None:
+        ordered_labels = sorted(grouped_indices.keys())
+        target_items = [
+            (label, len(grouped_indices[label]) / float(total_items))
+            for label in ordered_labels
+        ]
+    else:
+        target_items = []
+        for label, composition in target_composition_entries:
+            label = str(label)
+            if label not in grouped_indices:
+                raise ValueError(
+                    f"label={label!r} from meta composition not found in dataset selection"
+                )
+            target_items.append((label, float(composition)))
+
+    target_counts = largest_remainder_counts(
+        num_select, [ratio for _, ratio in target_items]
+    )
+    rng = np.random.default_rng(seed)
+    shuffled_grouped_indices = {}
+    for label, candidates in grouped_indices.items():
+        shuffled_candidates = list(candidates)
+        rng.shuffle(shuffled_candidates)
+        shuffled_grouped_indices[label] = shuffled_candidates
+
+    selected = []
+    for (label, _), target_count in zip(target_items, target_counts):
+        candidates = shuffled_grouped_indices[label]
+        if target_count > len(candidates):
+            raise ValueError(
+                f"Cannot sample {target_count} demos for label={label!r}; "
+                f"only {len(candidates)} available"
+            )
+        selected.extend(candidates[:target_count])
+        del candidates[:target_count]
+
+    if len(selected) != num_select:
+        raise AssertionError(
+            f"stratified selection size mismatch: expected {num_select}, got {len(selected)}"
+        )
+    return sorted(selected)
 
 
 if __name__ == "__main__":
@@ -1041,12 +1210,39 @@ if __name__ == "__main__":
         raise ValueError(
             f"loss_mask_area_weight must be in [0, 1], got {args.loss_mask_area_weight}"
         )
-    if args.long_window_horizon is not None:
-        args.long_window_horizon = int(args.long_window_horizon)
-        if args.long_window_horizon <= 0:
-            raise ValueError(
-                f"long_window_horizon must be positive when provided, got {args.long_window_horizon}"
-            )
+    if args.long_window_backward_length is None:
+        args.long_window_backward_length = 0
+    args.long_window_backward_length = int(args.long_window_backward_length)
+    if args.long_window_forward_length is None:
+        args.long_window_forward_length = args.pred_horizon
+    args.long_window_forward_length = int(args.long_window_forward_length)
+    if args.long_window_backward_length < 0:
+        raise ValueError(
+            "long_window_backward_length must be non-negative, "
+            f"got {args.long_window_backward_length}"
+        )
+    if args.long_window_forward_length < 0:
+        raise ValueError(
+            "long_window_forward_length must be non-negative, "
+            f"got {args.long_window_forward_length}"
+        )
+    args.long_window_horizon = (
+        args.long_window_backward_length + args.long_window_forward_length
+    )
+    if int(args.mas_long_conv_output_dim) > 0 and args.long_window_horizon <= 0:
+        raise ValueError(
+            "long_window_backward_length + long_window_forward_length must be positive "
+            "when mas_long_conv_output_dim > 0"
+        )
+    if int(args.mas_long_conv_output_dim) > 0 and args.long_window_forward_length <= 0:
+        raise ValueError(
+            "long_window_forward_length must be positive when long MAS window is enabled"
+        )
+    if args.control_mode != "pd_ee_delta_pose":
+        raise ValueError(
+            "train_relative_action.py expects --control-mode pd_ee_delta_pose for "
+            f"rollout execution, got {args.control_mode!r}"
+        )
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -1054,13 +1250,21 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    print(
+        "[runtime] "
+        f"torch_device={device}, "
+        f"cuda_enabled={args.cuda}, "
+        f"cuda_available={torch.cuda.is_available()}, "
+        f"eval_sim_backend={args.sim_backend}, "
+        f"num_eval_envs={args.num_eval_envs}"
+    )
 
     # ------------------------------------------------------------------------ #
     # 2. Evaluation demo alignment: demo path, reset seeds, traj ids, subsets
     # ------------------------------------------------------------------------ #
     if args.test_demo_path is None:
         raise ValueError(
-            "train_only_mas.py requires --test-demo-path. "
+            "train_relative_action.py requires --test-demo-path. "
             "Evaluation must use an explicit eval demo dataset and cannot reuse demo_path."
         )
     eval_demo_path = args.test_demo_path
@@ -1072,16 +1276,48 @@ if __name__ == "__main__":
     eval_traj_ids = infer_eval_traj_ids_from_demo(
         eval_demo_path, num_traj=None
     )
+    eval_mask_types_all = load_traj_mask_types(
+        eval_demo_path,
+        num_traj=None,
+    )
+    eval_mask_type_slots_all = load_traj_mask_type_slots(
+        eval_demo_path,
+        num_traj=None,
+    )
+    eval_source_episode_ids_all = load_source_episode_ids(
+        eval_demo_path,
+        num_traj=None,
+    )
+    eval_mask_assign_mode = load_mask_assign_mode(eval_demo_path)
+    eval_target_composition_entries = load_target_mask_composition_entries(eval_demo_path)
     if len(eval_reset_seeds) == 0:
         raise ValueError(
             "Failed to infer evaluation reset seeds from eval demo metadata. "
-            "only-mas evaluation requires demo-aligned reset seeds to keep MAS conditioning aligned."
+            "mas-window evaluation requires demo-aligned reset seeds to keep MAS conditioning aligned."
         )
     print(f"[seed-infer] auto inferred {len(eval_reset_seeds)} eval seeds")
     total_eval_demos = len(eval_traj_ids) if len(eval_traj_ids) > 0 else len(eval_reset_seeds)
-    eval_demo_indices = select_eval_demo_indices(
-        total_demos=total_eval_demos,
-        num_eval_demos=args.num_eval_demos,
+    eval_selection_labels = (
+        eval_mask_type_slots_all
+        if len(eval_mask_type_slots_all) == len(eval_mask_types_all)
+        else eval_mask_types_all
+    )
+    eval_num_select = (
+        min(total_eval_demos, args.num_eval_demos)
+        if eval_mask_assign_mode == "composition"
+        else args.num_eval_demos
+    )
+    eval_demo_indices = select_demo_indices_by_mask_assign_mode(
+        labels=eval_selection_labels[:total_eval_demos],
+        source_episode_ids=eval_source_episode_ids_all[:total_eval_demos],
+        num_select=eval_num_select,
+        seed=args.seed,
+        target_composition_entries=(
+            eval_target_composition_entries
+            if eval_mask_assign_mode == "composition"
+            else None
+        ),
+        mask_assign_mode=eval_mask_assign_mode,
     )
     if len(eval_reset_seeds) > 0:
         eval_reset_seeds = [
@@ -1102,9 +1338,10 @@ if __name__ == "__main__":
         capture_video_freq=args.capture_video_freq,
     )
     print(
-        f"[only-mas] num_demos={args.num_demos}, demo_path={args.demo_path}, "
+        f"[mas-window] num_demos={args.num_demos}, demo_path={args.demo_path}, "
         f"test_demo_path={args.test_demo_path}, eval_demo_path={eval_demo_path}, "
         f"eval_demo_metadata_path={args.eval_demo_metadata_path}, "
+        f"eval_mask_assign_mode={eval_mask_assign_mode}, "
         f"eval_demo_indices={eval_demo_indices}, "
         f"eval_reset_seeds={eval_reset_seeds if len(eval_reset_seeds) > 0 else None}, "
         f"eval_traj_ids={eval_traj_ids if len(eval_traj_ids) > 0 else None}"
@@ -1114,7 +1351,10 @@ if __name__ == "__main__":
     # 3. Evaluation-only runtime requirements: action denormalization and STPM
     # ------------------------------------------------------------------------ #
     denorm_mins, denorm_maxs = load_action_denorm_stats(args.action_norm_path)
-    print("[denorm] eval actions will be denormalized before env.step().")
+    print(
+        "[relative-action] absolute pd_ee_pose actions/MAS will be converted to "
+        "relative targets; env.step receives pd_ee_delta_pose actions."
+    )
 
     stpm_encoder, stpm_n_obs_steps, stpm_frame_gap = build_eval_stpm_encoder(
         args.stpm_ckpt_path, args.stpm_config_path, device
@@ -1191,29 +1431,46 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------------ #
     # 6. Load training dataset and dataloader
     # ------------------------------------------------------------------------ #
-    train_mas_length = read_augmented_mas_length(args.demo_path, mas_step_dim=MAS_STEP_DIM)
-    eval_mas_length = read_augmented_mas_length(eval_demo_path, mas_step_dim=MAS_STEP_DIM)
-    target_mas_length = max(train_mas_length, eval_mas_length)
-    if args.long_window_horizon is not None:
-        if args.long_window_horizon < target_mas_length:
-            raise ValueError(
-                "only-mas long_window_horizon must be at least the longest raw MAS length, "
-                f"got long_window_horizon={args.long_window_horizon}, "
-                f"required>={target_mas_length}"
-            )
-        target_mas_length = args.long_window_horizon
-
-    dataset = SmallDemoDataset_DiffusionPolicy(
+    train_mask_types_all = load_traj_mask_types(
+        data_path=args.demo_path,
+        num_traj=None,
+    )
+    train_mask_type_slots_all = load_traj_mask_type_slots(
+        data_path=args.demo_path,
+        num_traj=None,
+    )
+    train_source_episode_ids_all = load_source_episode_ids(
+        data_path=args.demo_path,
+        num_traj=None,
+    )
+    train_mask_assign_mode = load_mask_assign_mode(args.demo_path)
+    train_target_composition_entries = load_target_mask_composition_entries(args.demo_path)
+    train_selection_labels = (
+        train_mask_type_slots_all
+        if len(train_mask_type_slots_all) == len(train_mask_types_all)
+        else train_mask_types_all
+    )
+    train_demo_indices = select_demo_indices_by_mask_assign_mode(
+        labels=train_selection_labels,
+        source_episode_ids=train_source_episode_ids_all,
+        num_select=args.num_demos,
+        seed=args.seed,
+        target_composition_entries=(
+            train_target_composition_entries
+            if train_mask_assign_mode == "composition"
+            else None
+        ),
+        mask_assign_mode=train_mask_assign_mode,
+    )
+    selected_train_mask_types = [train_mask_types_all[i] for i in train_demo_indices]
+    selected_train_mask_type_slots = [train_mask_type_slots_all[i] for i in train_demo_indices]
+    dataset = SmallDemoDataset_MasWindowDiffusionPolicy(
         data_path=args.demo_path,
         obs_process_fn=obs_process_fn,
         obs_space=orignal_obs_space,
         device=device,
-        num_traj=args.num_demos,
-        target_mas_length=target_mas_length,
-    )
-    obs_mas_dim = target_mas_length * MAS_STEP_DIM
-    assert obs_mas_dim == dataset.mas_flat_dim, (
-        f"target obs_mas_dim ({obs_mas_dim}) != flattened mas dim from data ({dataset.mas_flat_dim})"
+        num_traj=None,
+        traj_indices=train_demo_indices,
     )
 
     dataset.debug_print_sample(0)
@@ -1232,19 +1489,35 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------------ #
     # 7. Load evaluation-only MAS conditioning data
     # ------------------------------------------------------------------------ #
-    eval_mam_data = load_eval_only_mas_data(
+    eval_mam_data = load_ce_eval_data(
         data_path=eval_demo_path,
         device=device,
-        expected_mas_flat_dim=obs_mas_dim,
         num_traj=None,
     )
     if len(eval_demo_indices) > 0:
         eval_mam_data = subset_eval_data(eval_mam_data, eval_demo_indices)
+    eval_mask_type_counts = summarize_label_counts(eval_mam_data.get("mask_types", []))
+    eval_mask_slot_counts = summarize_label_counts(eval_mam_data.get("mask_type_slots", []))
+    train_mask_type_counts = summarize_label_counts(selected_train_mask_types)
+    train_mask_slot_counts = summarize_label_counts(selected_train_mask_type_slots)
+    train_total_mask_type_counts = summarize_label_counts(train_mask_types_all)
+    train_total_mask_slot_counts = summarize_label_counts(train_mask_type_slots_all)
+    print(f"[mixed-train] train mask type counts: {train_mask_type_counts}")
+    print(f"[mixed-train] train mask slot counts: {train_mask_slot_counts}")
+    print(f"[mixed-train] train total mask type counts: {train_total_mask_type_counts}")
+    print(f"[mixed-train] train total mask slot counts: {train_total_mask_slot_counts}")
+    print(f"[mixed-train] eval mask type counts: {eval_mask_type_counts}")
+    print(f"[mixed-train] eval mask slot counts: {eval_mask_slot_counts}")
+    print(
+        f"[mixed-train] mask_assign_mode: train={train_mask_assign_mode}, "
+        f"eval={eval_mask_assign_mode}, selected_train={len(train_demo_indices)}, "
+        f"selected_eval={len(eval_demo_indices)}"
+    )
 
     # ------------------------------------------------------------------------ #
     # 8. Build agent, EMA agent, optimizer, and LR scheduler
     # ------------------------------------------------------------------------ #
-    agent = Agent(envs, args, obs_mas_dim=obs_mas_dim).to(device)
+    agent = Agent(envs, args).to(device)
     agent.set_action_denormalizer(denorm_mins, denorm_maxs, device)
     if dataset.state_min is not None and dataset.state_max is not None:
         agent.set_state_normalizer(dataset.state_min, dataset.state_max, device)
@@ -1261,7 +1534,7 @@ if __name__ == "__main__":
     )
 
     ema = EMAModel(parameters=agent.parameters(), power=0.75)
-    ema_agent = Agent(envs, args, obs_mas_dim=obs_mas_dim).to(device)
+    ema_agent = Agent(envs, args).to(device)
     ema_agent.set_action_denormalizer(denorm_mins, denorm_maxs, device)
     if dataset.state_min is not None and dataset.state_max is not None:
         ema_agent.set_state_normalizer(dataset.state_min, dataset.state_max, device)
@@ -1271,6 +1544,10 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------------ #
     best_eval_metrics = defaultdict(float)
     timings = defaultdict(float)
+    ce_curve_iters = []
+    ce_curve_all = []
+    ce_curve_success = []
+    ce_curve_failed = []
     capture_indices = (
         build_capture_indices(args.num_eval_episodes, args.capture_video_freq)
         if args.capture_video
@@ -1281,106 +1558,98 @@ if __name__ == "__main__":
         if iteration % args.eval_freq == 0:
             last_tick = time.time()
             ema.copy_to(ema_agent.parameters())
-            if len(eval_reset_seeds) > 0:
-                eval_metrics = defaultdict(list)
-                eval_batches = build_eval_batches(
-                    len(eval_reset_seeds),
-                    args.num_eval_envs,
-                    capture_indices=capture_indices if args.capture_video else None,
-                )
-                for eval_batch in eval_batches:
-                    batch_indices = eval_batch.indices
-                    valid_batch_size = eval_batch.valid_count
-                    should_save_eval_artifacts = (
-                        args.capture_video and eval_batch.capture_index is not None
-                    )
-                    video_snapshot = None
-                    if args.capture_video:
-                        video_snapshot = snapshot_video_files(video_dir)
-                    batch_reset_seeds = [eval_reset_seeds[idx] for idx in batch_indices]
-                    one_eval_data = subset_eval_data(eval_mam_data, batch_indices)
-                    one_eval_result = evaluate_only_mas(
-                        valid_batch_size,
-                        ema_agent,
-                        envs,
-                        device,
-                        args.sim_backend,
-                        eval_mam_data=one_eval_data,
-                        obs_horizon=args.obs_horizon,
-                        pred_horizon=args.pred_horizon,
-                        progress_mode=args.progress_mode,
-                        stpm_encoder=stpm_encoder,
-                        stpm_n_obs_steps=stpm_n_obs_steps,
-                        stpm_frame_gap=stpm_frame_gap,
-                        progress_bar=False,
-                        reset_seeds=batch_reset_seeds,
-                        return_progress_curves=should_save_eval_artifacts,
-                    )
-                    if should_save_eval_artifacts:
-                        one_metrics, progress_curve_records = one_eval_result
-                    else:
-                        one_metrics = one_eval_result
-                        progress_curve_records = None
-                    if args.capture_video:
-                        if should_save_eval_artifacts:
-                            recorded_env_idx = 0
-                            local_idx = int(eval_batch.capture_index)
-                            success_at_end = bool(
-                                np.asarray(one_metrics["success_at_end"]).reshape(-1)[recorded_env_idx]
-                            )
-                            if success_at_end:
-                                archived_video_path = collect_success_video(
-                                    video_dir=video_dir,
-                                    previous_snapshot=video_snapshot,
-                                    iteration=iteration,
-                                    demo_idx=eval_traj_ids[local_idx],
-                                )
-                            else:
-                                archived_video_path = collect_failed_video(
-                                    video_dir=video_dir,
-                                    previous_snapshot=video_snapshot,
-                                    iteration=iteration,
-                                    demo_idx=eval_traj_ids[local_idx],
-                                )
-                            if (
-                                archived_video_path is not None
-                                and progress_curve_records is not None
-                                and recorded_env_idx < len(progress_curve_records)
-                            ):
-                                save_progress_curve_for_video(
-                                    video_path=archived_video_path,
-                                    video_dir=video_dir,
-                                    timesteps=progress_curve_records[recorded_env_idx]["steps"],
-                                    progress=progress_curve_records[recorded_env_idx]["progress"],
-                                )
-                        else:
-                            delete_new_video_files(video_dir, video_snapshot)
-                    for k, v in one_metrics.items():
-                        metric_values = np.asarray(v).reshape(-1)[:valid_batch_size]
-                        eval_metrics[k].extend(metric_values.tolist())
-                for k in list(eval_metrics.keys()):
-                    eval_metrics[k] = np.asarray(eval_metrics[k])
+            ce_summary = None
+            per_mask_type_summary = {}
+            per_mask_slot_summary = {}
+            if args.capture_video:
+                clear_iteration_artifacts(video_dir=video_dir, iteration=iteration)
+            mixed_eval_result = evaluate_relative_action_mixed(
+                args.num_eval_episodes,
+                ema_agent,
+                envs,
+                device,
+                args.sim_backend,
+                eval_mas_window_data=eval_mam_data,
+                obs_horizon=args.obs_horizon,
+                long_window_horizon=(
+                    args.long_window_horizon if args.mas_long_conv_output_dim > 0 else 0
+                ),
+                long_window_backward_length=(
+                    args.long_window_backward_length if args.mas_long_conv_output_dim > 0 else 0
+                ),
+                long_window_forward_length=(
+                    args.long_window_forward_length if args.mas_long_conv_output_dim > 0 else 0
+                ),
+                short_window_horizon=args.short_window_horizon,
+                stpm_encoder=stpm_encoder,
+                stpm_n_obs_steps=stpm_n_obs_steps,
+                stpm_frame_gap=stpm_frame_gap,
+                progress_bar=False,
+                reset_seeds=eval_reset_seeds if len(eval_reset_seeds) > 0 else None,
+                return_progress_curves=args.capture_video,
+                return_rollout_records=True,
+                capture_indices=capture_indices if args.capture_video else None,
+                video_dir=video_dir if args.capture_video else None,
+                iteration=iteration,
+                eval_traj_ids=eval_traj_ids if len(eval_traj_ids) > 0 else None,
+            )
+            if args.capture_video:
+                (
+                    eval_metrics,
+                    per_mask_type_summary,
+                    per_mask_slot_summary,
+                    progress_curve_records,
+                    rollout_records,
+                ) = mixed_eval_result
             else:
-                eval_metrics = evaluate_only_mas(
-                    args.num_eval_episodes,
-                    ema_agent,
-                    envs,
-                    device,
-                    args.sim_backend,
-                    eval_mam_data=eval_mam_data,
-                    obs_horizon=args.obs_horizon,
-                    pred_horizon=args.pred_horizon,
-                    progress_mode=args.progress_mode,
-                    stpm_encoder=stpm_encoder,
-                    stpm_n_obs_steps=stpm_n_obs_steps,
-                    stpm_frame_gap=stpm_frame_gap,
+                (
+                    eval_metrics,
+                    per_mask_type_summary,
+                    per_mask_slot_summary,
+                    rollout_records,
+                ) = mixed_eval_result
+                progress_curve_records = None
+            ce_summary = aggregate_control_error(
+                compute_control_error_results_from_rollouts(
+                    eval_data=eval_mam_data,
+                    rollout_records=rollout_records,
+                    action_min=denorm_mins,
+                    action_max=denorm_maxs,
+                    save_per_traj=False,
                 )
+            )
             timings["eval"] += time.time() - last_tick
 
             for k, v in eval_metrics.items():
                 metric_value = float(np.mean(v)) if isinstance(v, np.ndarray) else float(v)
                 writer.add_scalar(f"eval/{k}", metric_value, iteration)
                 print(f"{k}: {metric_value:.6f}")
+            for mask_type, one_summary in per_mask_type_summary.items():
+                for key, value in one_summary.items():
+                    metric_value = float(value)
+                    writer.add_scalar(f"eval_by_mask_type/{mask_type}/{key}", metric_value, iteration)
+                    print(f"[{mask_type}] {key}: {metric_value:.6f}")
+            for mask_slot, one_summary in per_mask_slot_summary.items():
+                for key, value in one_summary.items():
+                    metric_value = float(value)
+                    writer.add_scalar(f"eval_by_mask_slot/{mask_slot}/{key}", metric_value, iteration)
+                    print(f"[{mask_slot}] {key}: {metric_value:.6f}")
+            if ce_summary is not None:
+                for k in ["ce_all", "ce_success", "ce_failed"]:
+                    metric_value = float(ce_summary[k])
+                    writer.add_scalar(f"eval/{k}", metric_value, iteration)
+                    print(f"{k}: {metric_value:.6f}")
+                ce_curve_iters.append(int(iteration))
+                ce_curve_all.append(float(ce_summary["ce_all"]))
+                ce_curve_success.append(float(ce_summary["ce_success"]))
+                ce_curve_failed.append(float(ce_summary["ce_failed"]))
+                save_control_error_curve(
+                    run_dir=writer.log_dir,
+                    iterations=ce_curve_iters,
+                    ce_all=ce_curve_all,
+                    ce_success=ce_curve_success,
+                    ce_failed=ce_curve_failed,
+                )
             for k in ["success_once", "success_at_end"]:
                 if k in eval_metrics:
                     metric_value = float(np.mean(eval_metrics[k]))

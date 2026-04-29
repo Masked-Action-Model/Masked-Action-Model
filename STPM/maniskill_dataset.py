@@ -9,6 +9,15 @@ import numpy as np
 import torch
 
 
+DEFAULT_STATE_PATHS = [
+    "obs/agent/qpos",
+    "obs/agent/qvel",
+    "obs/extra/goal_pos",
+    "obs/extra/tcp_pose",
+    "obs/extra/is_grasped",
+]
+
+
 class FrameManiskillDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -18,6 +27,8 @@ class FrameManiskillDataset(torch.utils.data.Dataset):
         frame_gap: int = 1,
         image_names: list[str] | None = None,
         task_name: str = "",
+        task_description: str | None = None,
+        state_paths: list[str] | None = None,
     ):
         self.repo_id = repo_id
         self.path = Path(repo_id)
@@ -29,7 +40,7 @@ class FrameManiskillDataset(torch.utils.data.Dataset):
         self.n_obs_steps = int(n_obs_steps)
         self.frame_gap = int(frame_gap)
         self.image_names = image_names or ["base_camera"]
-        self.task_name = task_name
+        self.task_description = task_description if task_description is not None else task_name
         self.sequence_length = self.n_obs_steps + 1
         self.frame_relative_indices = np.arange(
             -self.n_obs_steps * self.frame_gap,
@@ -44,6 +55,7 @@ class FrameManiskillDataset(torch.utils.data.Dataset):
                 f"Only 'base_camera' is supported by FrameManiskillDataset for now. "
                 f"Got unsupported image_names={unsupported}"
             )
+        self.state_paths = list(state_paths or DEFAULT_STATE_PATHS)
 
         self._h5_file: h5py.File | None = None
         self.episode_lengths: dict[int, int] = {}
@@ -107,19 +119,31 @@ class FrameManiskillDataset(torch.utils.data.Dataset):
         camera = np.concatenate([rgb, depth], axis=1)
         return torch.from_numpy(camera)
 
+    def _load_state_path(
+        self, traj_group: h5py.Group, path: str, sampled_indices: np.ndarray
+    ) -> np.ndarray:
+        try:
+            dataset = traj_group[path]
+        except KeyError:
+            raise KeyError(
+                f"Configured STPM state path {path!r} is missing from trajectory. "
+                f"Available state paths must be under this traj group in {self.path}."
+            ) from None
+        value = self._take_rows(dataset, sampled_indices).astype(np.float32)
+        if value.ndim == 1:
+            value = value.reshape(-1, 1)
+        elif value.ndim > 2:
+            value = value.reshape(value.shape[0], -1)
+        return value
+
     def _load_state_tensor(self, traj_group: h5py.Group, sampled_indices: np.ndarray) -> torch.Tensor:
-        agent_group = traj_group["obs"]["agent"]
-        extra_group = traj_group["obs"]["extra"]
         state = np.concatenate(
             [
-                self._take_rows(agent_group["qpos"], sampled_indices).astype(np.float32),
-                self._take_rows(agent_group["qvel"], sampled_indices).astype(np.float32),
-                self._take_rows(extra_group["goal_pos"], sampled_indices).astype(np.float32),
-                self._take_rows(extra_group["tcp_pose"], sampled_indices).astype(np.float32),
-                self._take_rows(extra_group["is_grasped"], sampled_indices).astype(np.float32).reshape(-1, 1),
+                self._load_state_path(traj_group, path, sampled_indices)
+                for path in self.state_paths
             ],
             axis=-1,
-        )
+        ).astype(np.float32)
         return torch.from_numpy(state)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
@@ -139,7 +163,7 @@ class FrameManiskillDataset(torch.utils.data.Dataset):
             "targets": torch.from_numpy(targets),
             "lengths": torch.tensor([self.sequence_length], dtype=torch.long),
             "frame_relative_indices": torch.from_numpy(self.frame_relative_indices.copy()),
-            "task": self.task_name,
+            "task": self.task_description,
             "episode_index": episode_index,
             "anchor_index": anchor_index,
         }

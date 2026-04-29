@@ -4,10 +4,6 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from utils.inpainting_utils import (
-    build_current_inpaint_mas_mask,
-    sample_inpaint_action_chunk,
-)
 from utils.stpm_utils import (
     append_episode_metrics,
     append_latest_rollout_frame,
@@ -16,6 +12,11 @@ from utils.stpm_utils import (
     predict_current_progress_from_histories,
     prepare_batched_rollout_obs,
     validate_stpm_eval_setup,
+)
+from utils.relative_action_utils import (
+    convert_masked_mas_to_relative,
+    extract_pickcube_tcp_pose_from_state,
+    tcp_pose_to_panda_base_abs_euler,
 )
 
 
@@ -77,7 +78,7 @@ def _extract_final_episode_records(info: dict, num_envs: int | None = None) -> l
 # --------------------------------------------------------------------------- #
 # Main evaluation loop
 # --------------------------------------------------------------------------- #
-def evaluate_mas_window(
+def evaluate_relative_action(
     n: int,
     agent,
     eval_envs,
@@ -97,9 +98,8 @@ def evaluate_mas_window(
     reset_seeds: list[int] | None = None,
     return_progress_curves: bool = False,
     return_rollout_records: bool = False,
-    inpainting: bool = False,
 ):
-    """Evaluate dual-window MAS conditioning with online STPM progress inference."""
+    """Evaluate dual-window MRAS conditioning with online STPM progress inference."""
 
     validate_stpm_eval_setup(stpm_encoder, stpm_n_obs_steps, stpm_frame_gap)
 
@@ -140,7 +140,7 @@ def evaluate_mas_window(
             else:
                 if num_envs > 1:
                     print(
-                        f"[eval-mas-window] reset_seed={reset_seed} with num_envs={num_envs}: "
+                        f"[eval-relative-action] reset_seed={reset_seed} with num_envs={num_envs}: "
                         "only env 0 uses that exact seed; other envs will use derived seeds."
                     )
                 obs, info = eval_envs.reset(seed=reset_seed)
@@ -198,10 +198,49 @@ def evaluate_mas_window(
                 long_window_backward_length=long_window_backward_length,
                 long_window_forward_length=long_window_forward_length,
             )
+            if agent.action_denorm_min is None or agent.action_denorm_max is None:
+                raise RuntimeError(
+                    "agent action denormalizer is required to convert absolute MAS to MRAS"
+                )
+            ref_pose = tcp_pose_to_panda_base_abs_euler(
+                extract_pickcube_tcp_pose_from_state(obs["state"][:, -1])
+            )
             obs["mas_long_window"] = dual_window_cond["mas_long_window"]
             obs["mas_short_window"] = dual_window_cond["mas_short_window"]
             obs["mas_long_window_mask"] = dual_window_mask_cond["mas_long_window"]
             obs["mas_short_window_mask"] = dual_window_mask_cond["mas_short_window"]
+            if long_window_horizon > 0:
+                mas_long = obs["mas_long_window"].reshape(
+                    num_envs, obs_horizon, long_window_horizon, 8
+                )
+                mask_long = obs["mas_long_window_mask"].reshape(
+                    num_envs, obs_horizon, long_window_horizon, 8
+                )
+                obs["mas_long_window"] = convert_masked_mas_to_relative(
+                    mas_long,
+                    mask_long,
+                    ref_pose=ref_pose,
+                    action_min=agent.action_denorm_min,
+                    action_max=agent.action_denorm_max,
+                    relative_pos_scale=agent.relative_pos_scale,
+                    relative_rot_scale=agent.relative_rot_scale,
+                ).reshape(num_envs, obs_horizon, -1)
+            if short_window_horizon > 0:
+                mas_short = obs["mas_short_window"].reshape(
+                    num_envs, obs_horizon, short_window_horizon, 8
+                )
+                mask_short = obs["mas_short_window_mask"].reshape(
+                    num_envs, obs_horizon, short_window_horizon, 8
+                )
+                obs["mas_short_window"] = convert_masked_mas_to_relative(
+                    mas_short,
+                    mask_short,
+                    ref_pose=ref_pose,
+                    action_min=agent.action_denorm_min,
+                    action_max=agent.action_denorm_max,
+                    relative_pos_scale=agent.relative_pos_scale,
+                    relative_rot_scale=agent.relative_rot_scale,
+                ).reshape(num_envs, obs_horizon, -1)
 
             if return_progress_curves:
                 for env_idx in range(num_envs):
@@ -210,27 +249,12 @@ def evaluate_mas_window(
                         float(current_progress_for_curve[env_idx].item())
                     )
 
-            if inpainting:
-                mas_inpaint, mas_inpaint_mask = build_current_inpaint_mas_mask(
-                    mas_list=eval_mas_window_data["mas"],
-                    mas_mask_list=eval_mas_window_data["mas_mask"],
-                    traj_ids=traj_ids,
-                    current_progress=current_progress,
-                    pred_horizon=agent.pred_horizon,
-                    device=obs["state"].device,
-                    dtype=obs["state"].dtype,
-                )
-                action_seq = sample_inpaint_action_chunk(
-                    agent=agent,
-                    obs_seq=obs,
-                    mas_inpaint=mas_inpaint,
-                    mas_inpaint_mask=mas_inpaint_mask,
-                    jump_length=0,
-                    num_resample=0,
-                )
-            else:
-                action_seq = agent.get_action(obs)
+            action_seq = agent.get_action(obs)
             action_seq_np = _to_numpy(action_seq).astype(np.float32)
+            absolute_action_seq = getattr(agent, "_last_absolute_action_chunk", None)
+            if absolute_action_seq is None:
+                raise RuntimeError("agent did not expose _last_absolute_action_chunk")
+            absolute_action_seq_np = _to_numpy(absolute_action_seq).astype(np.float32)
             action_seq_env = action_seq_np if sim_backend == "physx_cpu" else action_seq
 
             executed_steps = 0
@@ -248,7 +272,7 @@ def evaluate_mas_window(
             if return_rollout_records and executed_steps > 0:
                 for env_idx in range(num_envs):
                     executed_action_chunks[env_idx].append(
-                        action_seq_np[env_idx, :executed_steps].copy()
+                        absolute_action_seq_np[env_idx, :executed_steps].copy()
                     )
 
             obs = next_obs

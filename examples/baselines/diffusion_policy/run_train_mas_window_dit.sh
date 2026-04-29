@@ -77,6 +77,7 @@ ACTION_NORM_PATH="${ACTION_NORM_PATH:-${DEMO_PATH}}"
 SIM_BACKEND="${SIM_BACKEND:-physx_cpu}"
 NUM_DATALOAD_WORKERS="${NUM_DATALOAD_WORKERS:-4}"
 CONTROL_MODE="${CONTROL_MODE:-pd_ee_pose}"
+OBS_MODE="${OBS_MODE:-rgb+depth}"  # rgb or rgb+depth; rgb ignores dataset depth for policy input
 DEMO_TYPE="${DEMO_TYPE:-}"
 
 ensure_preprocessed_dataset() {
@@ -158,6 +159,7 @@ ARGS=(
   --sim-backend "$SIM_BACKEND"
   --num-dataload-workers "$NUM_DATALOAD_WORKERS"
   --control-mode "$CONTROL_MODE"
+  --obs-mode "$OBS_MODE"
 )
 
 if [[ -n "$EXP_NAME" ]]; then

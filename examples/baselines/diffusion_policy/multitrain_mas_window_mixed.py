@@ -1,10 +1,11 @@
-ALGO_NAME = "BC_Diffusion_rgbd_DiT_MASWindow_BlankWindow"
+ALGO_NAME = "BC_Diffusion_rgbd_DiT_MASWindow_Mixed_DDP"
 MAS_STEP_DIM = 8
 
 import os
 import random
 import time
 import sys
+import json
 from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import partial
@@ -16,8 +17,8 @@ from gymnasium.vector.vector_env import VectorEnv
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
+import torch.distributed as dist
 from tqdm import tqdm
 import tyro
 from diffusers.optimization import get_scheduler
@@ -27,12 +28,14 @@ from h5py import File
 from gymnasium import spaces
 from mani_skill.utils import common
 from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.dataset import Dataset
-from torch.utils.data.sampler import BatchSampler, RandomSampler
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data.sampler import BatchSampler
 from torch.utils.tensorboard import SummaryWriter
 
-from evaluate.evaluate_mas_window import evaluate_mas_window
+from evaluate.evaluate_mas_window_mixed import evaluate_mas_window_mixed
 from models.mas_conv1d import MasConv1D
 from models.mas_conv2d import MasConv
 from models.modeling_ditdp import DiTNoiseNet
@@ -46,21 +49,34 @@ from utils.build_progress_window_utils import (
 )
 from utils.denormalize_utils import (compute_state_min_max,
                                      load_action_denorm_stats)
-from utils.draw_p_t_curve_utils import save_progress_curve_for_video
+from utils.control_error_utils import (
+    aggregate_control_error,
+    compute_control_error_results_from_rollouts,
+    load_ce_eval_data,
+    load_source_episode_ids,
+)
+from utils.draw_p_t_curve_utils import (
+    save_control_error_curve,
+)
+from utils.eval_video_sampling_utils import (
+    build_capture_indices,
+    validate_eval_video_config,
+)
 from utils.load_eval_data_utils import (infer_eval_reset_seeds_from_demo,
                                   infer_eval_traj_ids_from_demo,
-                                  load_eval_mas_window_data,
-                                  select_eval_demo_indices,
+                                  load_traj_mask_type_slots,
+                                  load_traj_mask_types,
                                   subset_eval_data)
 from utils.load_train_data_utils import load_dataset_meta, load_demo_dataset
+from utils.loss_utils import (
+    compute_mask_weighted_noise_mse,
+    slice_action_mask_sequence,
+)
 from utils.make_env import make_eval_envs
 from utils.utils import (IterationBasedBatchSampler, build_state_obs_extractor,
                          convert_obs, worker_init_fn)
 from utils.video_utils import (
     clear_iteration_artifacts,
-    collect_failed_video,
-    collect_success_video,
-    snapshot_video_files,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -88,6 +104,8 @@ class Args:
     """the entity (team) of wandb's project"""
     capture_video: bool = True
     """whether to capture videos of the agent performances (check out `videos` folder)"""
+    capture_video_freq: int = 10
+    """archive one eval video every capture_video_freq eval episodes"""
 
     env_id: str = "PegInsertionSide-v1"
     """the id of the environment"""
@@ -127,11 +145,10 @@ class Args:
     """how to encode the long MAS window before concatenating it into the observation conditioning"""
     mas_long_conv_output_dim: int = 64
     """Output feature dim used by long-window conv encoders; set to 0 to disable the long-window branch."""
-    blank_window_white_noise: bool = True
-    """whether to replace MAS window values with white noise before feeding them into the model"""
-    blank_window_noise_std: float = 1.0
-    """standard deviation of the injected white noise"""
-
+    loss_mode: Literal["average", "weighted"] = "average"
+    """average keeps plain MSE; weighted balances known area and unknown area"""
+    loss_mask_area_weight: float = 0.2
+    """known area weight when loss_mode=weighted; unknown area uses 1 - this value"""
     # Environment/experiment specific arguments
     max_episode_steps: Optional[int] = None
     """Change the environments' max_episode_steps to this value. Sometimes necessary if the demonstrations being imitated are too short. Typically the default
@@ -256,6 +273,31 @@ def move_batch_to_device(batch, device):
     return out
 
 
+def setup_distributed(args: Args):
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world_size > 1
+
+    if distributed:
+        backend = "nccl" if args.cuda and torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://")
+
+    if args.cuda and torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cpu")
+
+    is_main_process = rank == 0
+    return distributed, world_size, rank, local_rank, is_main_process, device
+
+
+def cleanup_distributed(distributed: bool):
+    if distributed and dist.is_initialized():
+        dist.destroy_process_group()
+
+
 def _meta_flag(meta: dict, key: str, default: bool = False) -> bool:
     if key not in meta:
         return default
@@ -274,11 +316,17 @@ def _load_state_norm_stats_from_meta(meta: dict):
     )
 
 class SmallDemoDataset_MasWindowDiffusionPolicy(Dataset):  # Load everything into memory
-    def __init__(self, data_path, obs_process_fn, obs_space, device, num_traj):
+    def __init__(self, data_path, obs_process_fn, obs_space, device, num_traj, traj_indices=None):
         self.include_depth = policy_uses_depth(args.obs_mode)
 
         load_keys = ["observations", "actions", "mas", "mask", "env_states", "success", "terminated", "truncated"]
-        trajectories = load_demo_dataset(data_path, keys=load_keys, num_traj=num_traj, concat=False)
+        trajectories = load_demo_dataset(
+            data_path,
+            keys=load_keys,
+            num_traj=num_traj if traj_indices is None else None,
+            concat=False,
+            traj_indices=traj_indices,
+        )
         dataset_meta = load_dataset_meta(data_path)
         self.state_is_normalized = _meta_flag(dataset_meta, "states_normalized", False)
         print(
@@ -460,6 +508,14 @@ class SmallDemoDataset_MasWindowDiffusionPolicy(Dataset):  # Load everything int
 
         # Slice action window directly from full trajectory length.
         act_seq = self.trajectories["actions"][traj_idx][max(0, start) : end]
+        action_mask_seq = slice_action_mask_sequence(
+            mask_traj=mask_traj,
+            start=start,
+            end=end,
+            action_len=L,
+            act_dim=act_dim,
+            pred_horizon=self.pred_horizon,
+        )
         if start < 0:  # pad before the trajectory
             pad_len = -start
             pad_actions = act_seq[0].unsqueeze(0).repeat(pad_len, 1)
@@ -469,11 +525,16 @@ class SmallDemoDataset_MasWindowDiffusionPolicy(Dataset):  # Load everything int
             act_seq = torch.cat([act_seq, pad_action.repeat(end - L, 1)], dim=0)
             # making the robot (arm and gripper) stay still
         
-        assert (obs_seq["state"].shape[0] == self.obs_horizon and act_seq.shape[0] == self.pred_horizon)
+        assert (
+            obs_seq["state"].shape[0] == self.obs_horizon
+            and act_seq.shape[0] == self.pred_horizon
+            and action_mask_seq.shape == act_seq.shape
+        )
         
         return {
             "observations": obs_seq,
             "actions": act_seq,
+            "action_mask": action_mask_seq,
         }
 
     def __len__(self):
@@ -508,12 +569,8 @@ class Agent(nn.Module):
         self.short_window_horizon = int(args.short_window_horizon)
         self.enable_long_window = int(args.mas_long_conv_output_dim) > 0
         self.enable_short_window = self.short_window_horizon > 0
-        self.blank_window_white_noise = bool(
-            getattr(args, "blank_window_white_noise", True)
-        )
-        self.blank_window_noise_std = float(
-            getattr(args, "blank_window_noise_std", 1.0)
-        )
+        self.loss_mode = args.loss_mode
+        self.loss_mask_area_weight = float(args.loss_mask_area_weight)
         self.mas_long_window_dim = self.long_window_horizon * MAS_STEP_DIM
         self.mas_short_window_dim = self.short_window_horizon * MAS_STEP_DIM
         self.mas_long_encode_mode = args.mas_long_encode_mode
@@ -598,23 +655,6 @@ class Agent(nn.Module):
         )
         self._printed_obs_cond_check = False
         self._printed_action_denorm_check = False
-        self._printed_blank_window_check = False
-
-    def _maybe_replace_window_with_white_noise(self, mas_window: torch.Tensor | None):
-        if (
-            not self.blank_window_white_noise
-            or mas_window is None
-            or mas_window.numel() == 0
-        ):
-            return mas_window
-        noisy_window = torch.randn_like(mas_window) * self.blank_window_noise_std
-        if not self._printed_blank_window_check:
-            print(
-                f"[blank_window] replacing MAS window values with white noise: "
-                f"std={self.blank_window_noise_std}, shape={tuple(mas_window.shape)}"
-            )
-            self._printed_blank_window_check = True
-        return noisy_window
 
     def _reshape_mas_window_value_and_mask(
         self,
@@ -779,11 +819,8 @@ class Agent(nn.Module):
 
         mas_long_window_feature = obs_seq.get("mas_long_window_feature", None)
         if mas_long_window_feature is None:
-            raw_mas_long_window = self._maybe_replace_window_with_white_noise(
-                obs_seq.get("mas_long_window", None)
-            )
             mas_long_window_feature = self.encode_mas_long_window(
-                raw_mas_long_window,
+                obs_seq.get("mas_long_window", None),
                 obs_seq.get("mas_long_window_mask", None),
                 obs_seq["state"],
             )
@@ -793,11 +830,8 @@ class Agent(nn.Module):
             )
         mas_short_window_feature = obs_seq.get("mas_short_window_feature", None)
         if mas_short_window_feature is None:
-            raw_mas_short_window = self._maybe_replace_window_with_white_noise(
-                obs_seq.get("mas_short_window", None)
-            )
             mas_short_window_feature = self.encode_mas_short_window(
-                raw_mas_short_window,
+                obs_seq.get("mas_short_window", None),
                 obs_seq.get("mas_short_window_mask", None),
                 obs_seq["state"],
             )
@@ -836,17 +870,26 @@ class Agent(nn.Module):
             self._printed_obs_cond_check = True
         return feature
 
-    def compute_loss(self, obs_seq, action_seq):
+    def forward(self, obs_seq, action_seq, action_mask=None):
+        return self.compute_loss(obs_seq, action_seq, action_mask)
+
+    def compute_loss(self, obs_seq, action_seq, action_mask=None):
         B = obs_seq["state"].shape[0]
+        model_device = obs_seq["state"].device
 
         # observation as FiLM conditioning
         obs_cond = self.obs_conditioning(obs_seq, eval_mode=False)  # (B, obs_horizon, obs_dim)
 
         # sample noise to add to actions
-        noise = torch.randn((B, self.pred_horizon, self.act_dim), device=device)
+        noise = torch.randn((B, self.pred_horizon, self.act_dim), device=model_device)
 
         # sample a diffusion iteration for each data point
-        timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (B,), device=device).long()
+        timesteps = torch.randint(
+            0,
+            self.noise_scheduler.config.num_train_timesteps,
+            (B,),
+            device=model_device,
+        ).long()
 
         # add noise to the clean images(actions) according to the noise magnitude at each diffusion iteration
         # (this is the forward diffusion process)
@@ -855,7 +898,13 @@ class Agent(nn.Module):
         # predict the noise residual
         noise_pred = self.noise_pred_net(noisy_action_seq, timesteps, obs_cond)
 
-        return F.mse_loss(noise_pred, noise)
+        return compute_mask_weighted_noise_mse(
+            noise_pred=noise_pred,
+            noise=noise,
+            action_mask=action_mask,
+            loss_mode=self.loss_mode,
+            mask_area_weight=self.loss_mask_area_weight,
+        )
 
     def get_action(self, obs_seq):
         # init scheduler
@@ -920,51 +969,229 @@ class Agent(nn.Module):
             self._printed_action_denorm_check = True
         return action_seq
 
-def save_ckpt(run_name, tag):
+def save_ckpt(run_name, tag, agent, ema, ema_agent, iteration, world_size):
     os.makedirs(f"runs/{run_name}/checkpoints", exist_ok=True)
     ema.copy_to(ema_agent.parameters())
     torch.save(
         {
             "agent": agent.state_dict(),
             "ema_agent": ema_agent.state_dict(),
+            "iter": iteration,
+            "world_size": world_size,
         },
         f"runs/{run_name}/checkpoints/{tag}.pt",
     )
 
 
-def build_eval_batch_indices(total_items: int, batch_size: int):
-    if total_items <= 0:
+def summarize_label_counts(labels):
+    counts = defaultdict(int)
+    for label in labels:
+        counts[str(label)] += 1
+    return dict(sorted(counts.items(), key=lambda item: item[0]))
+
+
+def _decode_meta_string(value):
+    value = np.asarray(value)
+    if value.shape == ():
+        value = value.item()
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def load_target_mask_composition_entries(data_path: str) -> list[tuple[str, float]] | None:
+    meta = load_dataset_meta(data_path)
+    mixed_enabled = _meta_flag(meta, "mixed_mask_enabled", False)
+    if not mixed_enabled:
+        return None
+    if "mask_slot_name_list_json" in meta and "mask_slot_ratio_list_json" in meta:
+        labels = json.loads(_decode_meta_string(meta["mask_slot_name_list_json"]))
+        ratios = json.loads(_decode_meta_string(meta["mask_slot_ratio_list_json"]))
+        if len(labels) != len(ratios):
+            raise ValueError(
+                f"mask_slot_name_list_json/mask_slot_ratio_list_json length mismatch in {data_path}"
+            )
+        return [(str(label), float(ratio)) for label, ratio in zip(labels, ratios)]
+    if "mask_type_list_json" in meta and "mask_composition_list_json" in meta:
+        labels = json.loads(_decode_meta_string(meta["mask_type_list_json"]))
+        ratios = json.loads(_decode_meta_string(meta["mask_composition_list_json"]))
+        if len(labels) != len(ratios):
+            raise ValueError(
+                f"mask_type_list_json/mask_composition_list_json length mismatch in {data_path}"
+            )
+        return [(str(label), float(ratio)) for label, ratio in zip(labels, ratios)]
+    return None
+
+
+def load_mask_assign_mode(data_path: str) -> str:
+    meta = load_dataset_meta(data_path)
+    if "mask_assign_mode" not in meta:
+        return "composition"
+    mode = _decode_meta_string(meta["mask_assign_mode"])
+    if mode not in {"composition", "one_demo_multi_mask"}:
+        raise ValueError(f"unsupported mask_assign_mode={mode!r} in {data_path}")
+    return mode
+
+
+def largest_remainder_counts(total_items: int, ratios: list[float]) -> list[int]:
+    if total_items < 0:
+        raise ValueError(f"total_items must be non-negative, got {total_items}")
+    if len(ratios) == 0:
+        raise ValueError("ratios must be non-empty")
+    if total_items == 0:
+        return [0 for _ in ratios]
+    raw = np.asarray(ratios, dtype=np.float64) * float(total_items)
+    counts = np.floor(raw).astype(np.int64)
+    remaining = int(total_items - int(counts.sum()))
+    if remaining > 0:
+        remainders = raw - counts.astype(np.float64)
+        order = sorted(range(len(ratios)), key=lambda idx: (-remainders[idx], idx))
+        for idx in order[:remaining]:
+            counts[idx] += 1
+    return [int(v) for v in counts.tolist()]
+
+
+def select_source_demo_indices(
+    source_episode_ids: list[int],
+    num_source_demos: int | None,
+    seed: int,
+) -> list[int]:
+    if len(source_episode_ids) == 0:
         return []
-    if batch_size <= 0:
-        raise ValueError(f"batch_size must be positive, got {batch_size}")
-    if total_items % batch_size != 0:
-        raise ValueError(
-            "mas-window eval requires the selected eval demo count to be divisible by "
-            f"num_eval_envs to avoid duplicate padded rollouts, got total_items={total_items}, "
-            f"batch_size={batch_size}"
+
+    source_to_indices = defaultdict(list)
+    ordered_source_ids = []
+    for local_idx, source_episode_id in enumerate(source_episode_ids):
+        source_episode_id = int(source_episode_id)
+        if source_episode_id not in source_to_indices:
+            ordered_source_ids.append(source_episode_id)
+        source_to_indices[source_episode_id].append(int(local_idx))
+
+    if num_source_demos is None or num_source_demos >= len(ordered_source_ids):
+        selected_source_ids = set(ordered_source_ids)
+    elif num_source_demos <= 0:
+        selected_source_ids = set()
+    else:
+        rng = np.random.default_rng(seed)
+        shuffled_source_ids = list(ordered_source_ids)
+        rng.shuffle(shuffled_source_ids)
+        selected_source_ids = set(shuffled_source_ids[:num_source_demos])
+
+    selected_indices = []
+    for source_episode_id in ordered_source_ids:
+        if source_episode_id in selected_source_ids:
+            selected_indices.extend(source_to_indices[source_episode_id])
+    return sorted(selected_indices)
+
+
+def select_demo_indices_by_mask_assign_mode(
+    labels: list[str],
+    source_episode_ids: list[int],
+    num_select: int | None,
+    seed: int,
+    target_composition_entries: list[tuple[str, float]] | None,
+    mask_assign_mode: str,
+) -> list[int]:
+    if mask_assign_mode == "composition":
+        return stratified_select_demo_indices(
+            labels=labels,
+            num_select=num_select,
+            seed=seed,
+            target_composition_entries=target_composition_entries,
         )
-    batches = []
-    for start in range(0, total_items, batch_size):
-        batch = list(range(start, start + batch_size))
-        batches.append(batch)
-    return batches
+    if mask_assign_mode == "one_demo_multi_mask":
+        return select_source_demo_indices(
+            source_episode_ids=source_episode_ids,
+            num_source_demos=num_select,
+            seed=seed,
+        )
+    raise ValueError(f"unsupported mask_assign_mode={mask_assign_mode!r}")
 
 
-if __name__ == "__main__":
+def stratified_select_demo_indices(
+    labels: list[str],
+    num_select: int | None,
+    seed: int,
+    target_composition_entries: list[tuple[str, float]] | None = None,
+) -> list[int]:
+    total_items = len(labels)
+    if num_select is None or num_select >= total_items:
+        return list(range(total_items))
+    if num_select <= 0:
+        return []
+
+    grouped_indices = defaultdict(list)
+    for idx, label in enumerate(labels):
+        grouped_indices[str(label)].append(int(idx))
+
+    if target_composition_entries is None:
+        ordered_labels = sorted(grouped_indices.keys())
+        target_items = [
+            (label, len(grouped_indices[label]) / float(total_items))
+            for label in ordered_labels
+        ]
+    else:
+        target_items = []
+        for label, composition in target_composition_entries:
+            label = str(label)
+            if label not in grouped_indices:
+                raise ValueError(
+                    f"label={label!r} from meta composition not found in dataset selection"
+                )
+            target_items.append((label, float(composition)))
+
+    target_counts = largest_remainder_counts(
+        num_select, [ratio for _, ratio in target_items]
+    )
+    rng = np.random.default_rng(seed)
+    shuffled_grouped_indices = {}
+    for label, candidates in grouped_indices.items():
+        shuffled_candidates = list(candidates)
+        rng.shuffle(shuffled_candidates)
+        shuffled_grouped_indices[label] = shuffled_candidates
+
+    selected = []
+    for (label, _), target_count in zip(target_items, target_counts):
+        candidates = shuffled_grouped_indices[label]
+        if target_count > len(candidates):
+            raise ValueError(
+                f"Cannot sample {target_count} demos for label={label!r}; "
+                f"only {len(candidates)} available"
+            )
+        selected.extend(candidates[:target_count])
+        del candidates[:target_count]
+
+    if len(selected) != num_select:
+        raise AssertionError(
+            f"stratified selection size mismatch: expected {num_select}, got {len(selected)}"
+        )
+    return sorted(selected)
+
+
+def main():
+    global args, device
+
     args = tyro.cli(Args)
+    distributed, world_size, rank, local_rank, is_main_process, device = setup_distributed(args)
 
-    # ------------------------------------------------------------------------ #
-    # 1. Run configuration and global random seeds
-    # ------------------------------------------------------------------------ #
     if args.exp_name is None:
-        args.exp_name = os.path.basename(__file__)[: -len(".py")]
-        run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+        base_name = os.path.basename(__file__)[: -len(".py")]
+        run_name = f"{args.env_id}__{base_name}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
+
+    if distributed:
+        shared_run_name = [run_name if is_main_process else None]
+        dist.broadcast_object_list(shared_run_name, src=0)
+        run_name = shared_run_name[0]
     video_dir = f"runs/{run_name}/videos"
 
     assert args.obs_horizon + args.act_horizon - 1 <= args.pred_horizon
     assert args.obs_horizon >= 1 and args.act_horizon >= 1 and args.pred_horizon >= 1
+    if not 0.0 <= float(args.loss_mask_area_weight) <= 1.0:
+        raise ValueError(
+            f"loss_mask_area_weight must be in [0, 1], got {args.loss_mask_area_weight}"
+        )
     if args.long_window_horizon is None:
         args.long_window_horizon = args.pred_horizon
     args.long_window_horizon = int(args.long_window_horizon)
@@ -977,19 +1204,25 @@ if __name__ == "__main__":
             "long_window_horizon must be positive when mas_long_conv_output_dim > 0"
         )
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    random.seed(args.seed + rank)
+    np.random.seed(args.seed + rank)
+    torch.manual_seed(args.seed + rank)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    if is_main_process:
+        print(
+            "[runtime] "
+            f"torch_device={device}, "
+            f"cuda_enabled={args.cuda}, "
+            f"cuda_available={torch.cuda.is_available()}, "
+            f"eval_sim_backend={args.sim_backend}, "
+            f"num_eval_envs={args.num_eval_envs}, "
+            f"world_size={world_size}"
+        )
 
-    # ------------------------------------------------------------------------ #
-    # 2. Evaluation demo alignment: demo path, reset seeds, traj ids, subsets
-    # ------------------------------------------------------------------------ #
     if args.test_demo_path is None:
         raise ValueError(
-            "train_mas_window.py requires --test-demo-path. "
+            "multitrain_mas_window_mixed.py requires --test-demo-path. "
             "Evaluation must use an explicit eval demo dataset and cannot reuse demo_path."
         )
     eval_demo_path = args.test_demo_path
@@ -998,32 +1231,56 @@ if __name__ == "__main__":
         num_traj=None,
         metadata_path=args.eval_demo_metadata_path,
     )
-    eval_traj_ids = infer_eval_traj_ids_from_demo(
-        eval_demo_path, num_traj=None
+    eval_traj_ids = infer_eval_traj_ids_from_demo(eval_demo_path, num_traj=None)
+    eval_mask_types_all = load_traj_mask_types(
+        eval_demo_path,
+        num_traj=None,
     )
+    eval_mask_type_slots_all = load_traj_mask_type_slots(
+        eval_demo_path,
+        num_traj=None,
+    )
+    eval_source_episode_ids_all = load_source_episode_ids(
+        eval_demo_path,
+        num_traj=None,
+    )
+    eval_mask_assign_mode = load_mask_assign_mode(eval_demo_path)
+    eval_target_composition_entries = load_target_mask_composition_entries(eval_demo_path)
     if len(eval_reset_seeds) == 0:
         raise ValueError(
             "Failed to infer evaluation reset seeds from eval demo metadata. "
             "mas-window evaluation requires demo-aligned reset seeds to keep MAS conditioning aligned."
         )
-    print(f"[seed-infer] auto inferred {len(eval_reset_seeds)} eval seeds")
+    if is_main_process:
+        print(f"[seed-infer] auto inferred {len(eval_reset_seeds)} eval seeds")
     total_eval_demos = len(eval_traj_ids) if len(eval_traj_ids) > 0 else len(eval_reset_seeds)
-    eval_demo_indices = select_eval_demo_indices(
-        total_demos=total_eval_demos,
-        num_eval_demos=args.num_eval_demos,
+    eval_selection_labels = (
+        eval_mask_type_slots_all
+        if len(eval_mask_type_slots_all) == len(eval_mask_types_all)
+        else eval_mask_types_all
+    )
+    eval_num_select = (
+        min(total_eval_demos, args.num_eval_demos)
+        if eval_mask_assign_mode == "composition"
+        else args.num_eval_demos
+    )
+    eval_demo_indices = select_demo_indices_by_mask_assign_mode(
+        labels=eval_selection_labels[:total_eval_demos],
+        source_episode_ids=eval_source_episode_ids_all[:total_eval_demos],
+        num_select=eval_num_select,
+        seed=args.seed,
+        target_composition_entries=(
+            eval_target_composition_entries
+            if eval_mask_assign_mode == "composition"
+            else None
+        ),
+        mask_assign_mode=eval_mask_assign_mode,
     )
     if len(eval_reset_seeds) > 0:
         eval_reset_seeds = [
             eval_reset_seeds[i] for i in eval_demo_indices if i < len(eval_reset_seeds)
         ]
         args.num_eval_episodes = len(eval_reset_seeds)
-        if len(eval_reset_seeds) % args.num_eval_envs != 0:
-            raise ValueError(
-                "Selected eval demos must be divisible by num_eval_envs for mas-window "
-                f"evaluation, got {len(eval_reset_seeds)} eval demos/seeds after filtering "
-                f"and num_eval_envs={args.num_eval_envs}. Please adjust --num-eval-demos "
-                "or --num-eval-envs."
-            )
     if len(eval_traj_ids) > 0:
         eval_traj_ids = [
             eval_traj_ids[i] for i in eval_demo_indices if i < len(eval_traj_ids)
@@ -1032,28 +1289,30 @@ if __name__ == "__main__":
         assert len(eval_traj_ids) == len(eval_reset_seeds), (
             "failed to align eval traj ids with eval seeds for video naming"
         )
-    print(
-        f"[mas-window] num_demos={args.num_demos}, demo_path={args.demo_path}, "
-        f"test_demo_path={args.test_demo_path}, eval_demo_path={eval_demo_path}, "
-        f"eval_demo_metadata_path={args.eval_demo_metadata_path}, "
-        f"eval_demo_indices={eval_demo_indices}, "
-        f"eval_reset_seeds={eval_reset_seeds if len(eval_reset_seeds) > 0 else None}, "
-        f"eval_traj_ids={eval_traj_ids if len(eval_traj_ids) > 0 else None}"
+    validate_eval_video_config(
+        num_eval_episodes=args.num_eval_episodes,
+        num_eval_envs=args.num_eval_envs,
+        capture_video_freq=args.capture_video_freq,
     )
+    if is_main_process:
+        print(
+            f"[mas-window] num_demos={args.num_demos}, demo_path={args.demo_path}, "
+            f"test_demo_path={args.test_demo_path}, eval_demo_path={eval_demo_path}, "
+            f"eval_demo_metadata_path={args.eval_demo_metadata_path}, "
+            f"eval_mask_assign_mode={eval_mask_assign_mode}, "
+            f"eval_demo_indices={eval_demo_indices}, "
+            f"eval_reset_seeds={eval_reset_seeds if len(eval_reset_seeds) > 0 else None}, "
+            f"eval_traj_ids={eval_traj_ids if len(eval_traj_ids) > 0 else None}"
+        )
 
-    # ------------------------------------------------------------------------ #
-    # 3. Evaluation-only runtime requirements: action denormalization and STPM
-    # ------------------------------------------------------------------------ #
     denorm_mins, denorm_maxs = load_action_denorm_stats(args.action_norm_path)
-    print("[denorm] eval actions will be denormalized before env.step().")
+    if is_main_process:
+        print("[denorm] eval actions will be denormalized before env.step().")
 
     stpm_encoder, stpm_n_obs_steps, stpm_frame_gap = build_eval_stpm_encoder(
         args.stpm_ckpt_path, args.stpm_config_path, device
     )
 
-    # ------------------------------------------------------------------------ #
-    # 4. Build evaluation environment and experiment logging
-    # ------------------------------------------------------------------------ #
     env_kwargs = dict(
         control_mode=args.control_mode,
         reward_mode="sparse",
@@ -1061,25 +1320,29 @@ if __name__ == "__main__":
         render_mode="rgb_array",
         human_render_camera_configs=dict(shader_pack="default")
     )
-    assert args.max_episode_steps != None, "max_episode_steps must be specified as imitation learning algorithms task solve speed is dependent on the data you train on"
+    assert args.max_episode_steps is not None, (
+        "max_episode_steps must be specified as imitation learning algorithms task solve speed "
+        "is dependent on the data you train on"
+    )
     env_kwargs["max_episode_steps"] = args.max_episode_steps
     other_kwargs = dict(obs_horizon=args.obs_horizon)
-    
+
     envs = make_eval_envs(
         args.env_id,
-        args.num_eval_envs,
+        args.num_eval_envs if is_main_process else 1,
         args.sim_backend,
         env_kwargs,
         other_kwargs,
-        video_dir=video_dir if args.capture_video else None,
+        video_dir=video_dir if args.capture_video and is_main_process else None,
         wrappers=[FlattenRGBDObservationWrapper],
     )
     validate_only_mas_eval_layout(envs, stpm_encoder)
 
-    if args.track:
+    if args.track and is_main_process:
         import wandb
 
         config = vars(args)
+        config["ddp_world_size"] = world_size
         config["eval_env_cfg"] = dict(
             **env_kwargs,
             num_envs=args.num_eval_envs,
@@ -1093,20 +1356,18 @@ if __name__ == "__main__":
             config=config,
             name=run_name,
             save_code=True,
-            group="DiffusionPolicy",
-            tags=["diffusion_policy"],
+            group="DiffusionPolicy_DDP",
+            tags=["diffusion_policy", "mixed_mask", "ddp"],
         )
 
-    writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s"
-        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
+    writer = SummaryWriter(f"runs/{run_name}") if is_main_process else None
+    if writer is not None:
+        writer.add_text(
+            "hyperparameters",
+            "|param|value|\n|-|-|\n%s"
+            % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        )
 
-    # ------------------------------------------------------------------------ #
-    # 5. Resolve observation preprocessing from a temporary single env
-    # ------------------------------------------------------------------------ #
     tmp_env_kwargs = dict(env_kwargs, obs_mode=args.obs_mode)
     tmp_env = gym.make(args.env_id, **tmp_env_kwargs)
     orignal_obs_space = tmp_env.observation_space
@@ -1114,57 +1375,145 @@ if __name__ == "__main__":
 
     obs_process_fn = partial(
         convert_obs,
-        concat_fn=partial(np.concatenate, axis=-1),  # merge camera outputs
-        transpose_fn=partial(np.transpose, axes=(0, 3, 1, 2)),  # (B, H, W, C) -> (B, C, H, W)
+        concat_fn=partial(np.concatenate, axis=-1),
+        transpose_fn=partial(np.transpose, axes=(0, 3, 1, 2)),
         state_obs_extractor=build_state_obs_extractor(args.env_id),
         depth=policy_uses_depth(args.obs_mode),
     )
 
-    # ------------------------------------------------------------------------ #
-    # 6. Load training dataset and dataloader
-    # ------------------------------------------------------------------------ #
+    train_mask_types_all = load_traj_mask_types(
+        data_path=args.demo_path,
+        num_traj=None,
+    )
+    train_mask_type_slots_all = load_traj_mask_type_slots(
+        data_path=args.demo_path,
+        num_traj=None,
+    )
+    train_source_episode_ids_all = load_source_episode_ids(
+        data_path=args.demo_path,
+        num_traj=None,
+    )
+    train_mask_assign_mode = load_mask_assign_mode(args.demo_path)
+    train_target_composition_entries = load_target_mask_composition_entries(args.demo_path)
+    train_selection_labels = (
+        train_mask_type_slots_all
+        if len(train_mask_type_slots_all) == len(train_mask_types_all)
+        else train_mask_types_all
+    )
+    train_demo_indices = select_demo_indices_by_mask_assign_mode(
+        labels=train_selection_labels,
+        source_episode_ids=train_source_episode_ids_all,
+        num_select=args.num_demos,
+        seed=args.seed,
+        target_composition_entries=(
+            train_target_composition_entries
+            if train_mask_assign_mode == "composition"
+            else None
+        ),
+        mask_assign_mode=train_mask_assign_mode,
+    )
+    selected_train_mask_types = [train_mask_types_all[i] for i in train_demo_indices]
+    selected_train_mask_type_slots = [train_mask_type_slots_all[i] for i in train_demo_indices]
     dataset = SmallDemoDataset_MasWindowDiffusionPolicy(
         data_path=args.demo_path,
         obs_process_fn=obs_process_fn,
         obs_space=orignal_obs_space,
         device=device,
-        num_traj=args.num_demos,
+        num_traj=None,
+        traj_indices=train_demo_indices,
     )
 
-    dataset.debug_print_sample(0)
+    if is_main_process:
+        dataset.debug_print_sample(0)
 
-    sampler = RandomSampler(dataset, replacement=False)
-    batch_sampler = BatchSampler(sampler, batch_size=args.batch_size, drop_last=True)
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+        drop_last=True,
+    )
+    local_batch_size = max(1, args.batch_size // world_size)
+    if args.batch_size % world_size != 0 and is_main_process:
+        print(
+            f"[warning] batch_size={args.batch_size} not divisible by world_size={world_size}. "
+            f"local_batch_size={local_batch_size}"
+        )
+    global_batch_effective = local_batch_size * world_size
+    total_num_workers = args.num_dataload_workers * world_size
+    if is_main_process:
+        print(
+            "[ddp] "
+            f"global_batch(requested)={args.batch_size}, "
+            f"global_batch(effective)={global_batch_effective}, "
+            f"per_gpu_batch={local_batch_size}, "
+            f"world_size={world_size}, "
+            f"num_workers(per_gpu)={args.num_dataload_workers}, "
+            f"num_workers(total)={total_num_workers}"
+        )
+        if args.num_dataload_workers == 0:
+            print("[hint] num_workers=0 最稳但吞吐可能较低；Linux 可尝试 4/8 提升数据加载速度。")
+        elif total_num_workers > os.cpu_count():
+            print(
+                f"[hint] total workers ({total_num_workers}) > CPU cores ({os.cpu_count()})，"
+                "可能导致上下文切换开销增加，可考虑降低 num_workers。"
+            )
+    batch_sampler = BatchSampler(sampler, batch_size=local_batch_size, drop_last=True)
     batch_sampler = IterationBasedBatchSampler(batch_sampler, args.total_iters)
     train_dataloader = DataLoader(
         dataset,
         batch_sampler=batch_sampler,
         num_workers=args.num_dataload_workers,
-        worker_init_fn=lambda worker_id: worker_init_fn(worker_id, base_seed=args.seed),
+        worker_init_fn=lambda worker_id: worker_init_fn(
+            worker_id, base_seed=args.seed + rank * 1000
+        ),
         persistent_workers=(args.num_dataload_workers > 0),
+        pin_memory=(device.type == "cuda"),
     )
 
-    # ------------------------------------------------------------------------ #
-    # 7. Load evaluation-only MAS conditioning data
-    # ------------------------------------------------------------------------ #
-    eval_mam_data = load_eval_mas_window_data(
+    eval_mam_data = load_ce_eval_data(
         data_path=eval_demo_path,
         device=device,
         num_traj=None,
     )
     if len(eval_demo_indices) > 0:
         eval_mam_data = subset_eval_data(eval_mam_data, eval_demo_indices)
+    eval_mask_type_counts = summarize_label_counts(eval_mam_data.get("mask_types", []))
+    eval_mask_slot_counts = summarize_label_counts(eval_mam_data.get("mask_type_slots", []))
+    train_mask_type_counts = summarize_label_counts(selected_train_mask_types)
+    train_mask_slot_counts = summarize_label_counts(selected_train_mask_type_slots)
+    train_total_mask_type_counts = summarize_label_counts(train_mask_types_all)
+    train_total_mask_slot_counts = summarize_label_counts(train_mask_type_slots_all)
+    if is_main_process:
+        print(f"[mixed-train] train mask type counts: {train_mask_type_counts}")
+        print(f"[mixed-train] train mask slot counts: {train_mask_slot_counts}")
+        print(f"[mixed-train] train total mask type counts: {train_total_mask_type_counts}")
+        print(f"[mixed-train] train total mask slot counts: {train_total_mask_slot_counts}")
+        print(f"[mixed-train] eval mask type counts: {eval_mask_type_counts}")
+        print(f"[mixed-train] eval mask slot counts: {eval_mask_slot_counts}")
+        print(
+            f"[mixed-train] mask_assign_mode: train={train_mask_assign_mode}, "
+            f"eval={eval_mask_assign_mode}, selected_train={len(train_demo_indices)}, "
+            f"selected_eval={len(eval_demo_indices)}"
+        )
 
-    # ------------------------------------------------------------------------ #
-    # 8. Build agent, EMA agent, optimizer, and LR scheduler
-    # ------------------------------------------------------------------------ #
     agent = Agent(envs, args).to(device)
     agent.set_action_denormalizer(denorm_mins, denorm_maxs, device)
     if dataset.state_min is not None and dataset.state_max is not None:
         agent.set_state_normalizer(dataset.state_min, dataset.state_max, device)
 
+    if distributed:
+        ddp_agent = DDP(
+            agent,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+            output_device=local_rank if device.type == "cuda" else None,
+            broadcast_buffers=False,
+        )
+    else:
+        ddp_agent = agent
+
     optimizer = optim.AdamW(
-        params=agent.parameters(), lr=args.lr, betas=(0.95, 0.999), weight_decay=1e-6
+        params=ddp_agent.parameters(), lr=args.lr, betas=(0.95, 0.999), weight_decay=1e-6
     )
 
     lr_scheduler = get_scheduler(
@@ -1180,180 +1529,174 @@ if __name__ == "__main__":
     if dataset.state_min is not None and dataset.state_max is not None:
         ema_agent.set_state_normalizer(dataset.state_min, dataset.state_max, device)
 
-    # ------------------------------------------------------------------------ #
-    # 9. Tracking buffers and helper functions for eval/logging/checkpointing
-    # ------------------------------------------------------------------------ #
     best_eval_metrics = defaultdict(float)
     timings = defaultdict(float)
+    ce_curve_iters = []
+    ce_curve_all = []
+    ce_curve_success = []
+    ce_curve_failed = []
+    capture_indices = (
+        build_capture_indices(args.num_eval_episodes, args.capture_video_freq)
+        if args.capture_video and is_main_process
+        else set()
+    )
 
     def evaluate_and_save_best(iteration):
-        if iteration % args.eval_freq == 0:
-            last_tick = time.time()
-            ema.copy_to(ema_agent.parameters())
-            if args.capture_video:
-                clear_iteration_artifacts(video_dir=video_dir, iteration=iteration)
-            if len(eval_reset_seeds) > 0:
-                eval_metrics = defaultdict(list)
-                eval_batch_indices = build_eval_batch_indices(
-                    total_items=len(eval_reset_seeds),
-                    batch_size=args.num_eval_envs,
-                )
-                for batch_indices in eval_batch_indices:
-                    valid_batch_size = sum(idx < len(eval_reset_seeds) for idx in batch_indices)
-                    video_snapshot = None
-                    if args.capture_video:
-                        video_snapshot = snapshot_video_files(video_dir)
-                    batch_reset_seeds = [eval_reset_seeds[idx] for idx in batch_indices]
-                    one_eval_data = subset_eval_data(eval_mam_data, batch_indices)
-                    one_eval_result = evaluate_mas_window(
-                        valid_batch_size,
-                        ema_agent,
-                        envs,
-                        device,
-                        args.sim_backend,
-                        eval_mas_window_data=one_eval_data,
-                        obs_horizon=args.obs_horizon,
-                        long_window_horizon=(
-                            args.long_window_horizon if args.mas_long_conv_output_dim > 0 else 0
-                        ),
-                        short_window_horizon=args.short_window_horizon,
-                        stpm_encoder=stpm_encoder,
-                        stpm_n_obs_steps=stpm_n_obs_steps,
-                        stpm_frame_gap=stpm_frame_gap,
-                        progress_bar=False,
-                        reset_seeds=batch_reset_seeds,
-                        return_progress_curves=args.capture_video,
-                    )
-                    if args.capture_video:
-                        one_metrics, progress_curve_records = one_eval_result
-                    else:
-                        one_metrics = one_eval_result
-                        progress_curve_records = None
-                    if args.capture_video:
-                        # On physx_cpu vector eval only env 0 records a video, so archive the
-                        # env-0 rollout and name it with the corresponding traj id.
-                        recorded_env_idx = 0
-                        local_idx = batch_indices[recorded_env_idx]
-                        success_at_end = bool(
-                            np.asarray(one_metrics["success_at_end"]).reshape(-1)[recorded_env_idx]
-                        )
-                        if success_at_end:
-                            archived_video_path = collect_success_video(
-                                video_dir=video_dir,
-                                previous_snapshot=video_snapshot,
-                                iteration=iteration,
-                                demo_idx=eval_traj_ids[local_idx],
-                            )
-                        else:
-                            archived_video_path = collect_failed_video(
-                                video_dir=video_dir,
-                                previous_snapshot=video_snapshot,
-                                iteration=iteration,
-                                demo_idx=eval_traj_ids[local_idx],
-                            )
-                        if (
-                            archived_video_path is not None
-                            and progress_curve_records is not None
-                            and recorded_env_idx < len(progress_curve_records)
-                        ):
-                            save_progress_curve_for_video(
-                                video_path=archived_video_path,
-                                video_dir=video_dir,
-                                timesteps=progress_curve_records[recorded_env_idx]["steps"],
-                                progress=progress_curve_records[recorded_env_idx]["progress"],
-                            )
-                    for k, v in one_metrics.items():
-                        metric_values = np.asarray(v).reshape(-1)[:valid_batch_size]
-                        eval_metrics[k].extend(metric_values.tolist())
-                for k in list(eval_metrics.keys()):
-                    eval_metrics[k] = np.asarray(eval_metrics[k])
-            else:
-                eval_metrics = evaluate_mas_window(
-                    args.num_eval_episodes,
-                    ema_agent,
-                    envs,
-                    device,
-                    args.sim_backend,
-                    eval_mas_window_data=eval_mam_data,
-                    obs_horizon=args.obs_horizon,
-                    long_window_horizon=(
-                        args.long_window_horizon if args.mas_long_conv_output_dim > 0 else 0
-                    ),
-                    short_window_horizon=args.short_window_horizon,
-                    stpm_encoder=stpm_encoder,
-                    stpm_n_obs_steps=stpm_n_obs_steps,
-                    stpm_frame_gap=stpm_frame_gap,
-                )
-            timings["eval"] += time.time() - last_tick
+        if (not is_main_process) or (iteration % args.eval_freq != 0):
+            return
 
-            for k, v in eval_metrics.items():
-                metric_value = float(np.mean(v)) if isinstance(v, np.ndarray) else float(v)
-                writer.add_scalar(f"eval/{k}", metric_value, iteration)
-                print(f"{k}: {metric_value:.6f}")
-            for k in ["success_once", "success_at_end"]:
-                if k in eval_metrics:
-                    metric_value = float(np.mean(eval_metrics[k]))
-                    if k not in best_eval_metrics or metric_value > best_eval_metrics[k]:
-                        best_eval_metrics[k] = metric_value
-                        save_ckpt(run_name, f"best_eval_{k}")
-                        print(f"New best {k}: {metric_value:.6f}. Saving checkpoint.")
+        last_tick = time.time()
+        ema.copy_to(ema_agent.parameters())
+        per_mask_type_summary = {}
+        per_mask_slot_summary = {}
+        if args.capture_video:
+            clear_iteration_artifacts(video_dir=video_dir, iteration=iteration)
+        mixed_eval_result = evaluate_mas_window_mixed(
+            args.num_eval_episodes,
+            ema_agent,
+            envs,
+            device,
+            args.sim_backend,
+            eval_mas_window_data=eval_mam_data,
+            obs_horizon=args.obs_horizon,
+            long_window_horizon=(
+                args.long_window_horizon if args.mas_long_conv_output_dim > 0 else 0
+            ),
+            short_window_horizon=args.short_window_horizon,
+            stpm_encoder=stpm_encoder,
+            stpm_n_obs_steps=stpm_n_obs_steps,
+            stpm_frame_gap=stpm_frame_gap,
+            progress_bar=False,
+            reset_seeds=eval_reset_seeds if len(eval_reset_seeds) > 0 else None,
+            return_progress_curves=args.capture_video,
+            return_rollout_records=True,
+            capture_indices=capture_indices if args.capture_video else None,
+            video_dir=video_dir if args.capture_video else None,
+            iteration=iteration,
+            eval_traj_ids=eval_traj_ids if len(eval_traj_ids) > 0 else None,
+        )
+        if args.capture_video:
+            (
+                eval_metrics,
+                per_mask_type_summary,
+                per_mask_slot_summary,
+                _progress_curve_records,
+                rollout_records,
+            ) = mixed_eval_result
+        else:
+            (
+                eval_metrics,
+                per_mask_type_summary,
+                per_mask_slot_summary,
+                rollout_records,
+            ) = mixed_eval_result
 
-    def log_metrics(iteration):
-        if iteration % args.log_freq == 0:
-            writer.add_scalar(
-                "charts/learning_rate", optimizer.param_groups[0]["lr"], iteration
+        ce_summary = aggregate_control_error(
+            compute_control_error_results_from_rollouts(
+                eval_data=eval_mam_data,
+                rollout_records=rollout_records,
+                action_min=denorm_mins,
+                action_max=denorm_maxs,
+                save_per_traj=False,
             )
-            writer.add_scalar("losses/total_loss", total_loss.item(), iteration)
-            for k, v in timings.items():
-                writer.add_scalar(f"time/{k}", v, iteration)
+        )
+        timings["eval"] += time.time() - last_tick
 
+        for k, v in eval_metrics.items():
+            metric_value = float(np.mean(v)) if isinstance(v, np.ndarray) else float(v)
+            writer.add_scalar(f"eval/{k}", metric_value, iteration)
+            print(f"{k}: {metric_value:.6f}")
+        for mask_type, one_summary in per_mask_type_summary.items():
+            for key, value in one_summary.items():
+                metric_value = float(value)
+                writer.add_scalar(f"eval_by_mask_type/{mask_type}/{key}", metric_value, iteration)
+                print(f"[{mask_type}] {key}: {metric_value:.6f}")
+        for mask_slot, one_summary in per_mask_slot_summary.items():
+            for key, value in one_summary.items():
+                metric_value = float(value)
+                writer.add_scalar(f"eval_by_mask_slot/{mask_slot}/{key}", metric_value, iteration)
+                print(f"[{mask_slot}] {key}: {metric_value:.6f}")
+        for k in ["ce_all", "ce_success", "ce_failed"]:
+            metric_value = float(ce_summary[k])
+            writer.add_scalar(f"eval/{k}", metric_value, iteration)
+            print(f"{k}: {metric_value:.6f}")
+        ce_curve_iters.append(int(iteration))
+        ce_curve_all.append(float(ce_summary["ce_all"]))
+        ce_curve_success.append(float(ce_summary["ce_success"]))
+        ce_curve_failed.append(float(ce_summary["ce_failed"]))
+        save_control_error_curve(
+            run_dir=writer.log_dir,
+            iterations=ce_curve_iters,
+            ce_all=ce_curve_all,
+            ce_success=ce_curve_success,
+            ce_failed=ce_curve_failed,
+        )
+        for k in ["success_once", "success_at_end"]:
+            if k in eval_metrics:
+                metric_value = float(np.mean(eval_metrics[k]))
+                if k not in best_eval_metrics or metric_value > best_eval_metrics[k]:
+                    best_eval_metrics[k] = metric_value
+                    save_ckpt(run_name, f"best_eval_{k}", agent, ema, ema_agent, iteration, world_size)
+                    print(f"New best {k}: {metric_value:.6f}. Saving checkpoint.")
 
-    # ---------------------------------------------------------------------------- #
-    # Training begins.
-    # ---------------------------------------------------------------------------- #
-    agent.train()
-    pbar = tqdm(total=args.total_iters)
+    def log_metrics(iteration, total_loss):
+        if (not is_main_process) or (iteration % args.log_freq != 0):
+            return
+
+        writer.add_scalar(
+            "charts/learning_rate", optimizer.param_groups[0]["lr"], iteration
+        )
+        writer.add_scalar("losses/total_loss", total_loss.item(), iteration)
+        for k, v in timings.items():
+            writer.add_scalar(f"time/{k}", v, iteration)
+
+    ddp_agent.train()
+    pbar = tqdm(total=args.total_iters, disable=not is_main_process)
     last_tick = time.time()
+    total_loss = None
     for iteration, data_batch in enumerate(train_dataloader):
         timings["data_loading"] += time.time() - last_tick
 
-        # move batch to target device
         data_batch = move_batch_to_device(data_batch, device)
 
-        # forward and compute loss
         last_tick = time.time()
-        total_loss = agent.compute_loss(
-            obs_seq=data_batch["observations"],  # obs_batch_dict['state'] is (B, L, obs_dim)
-            action_seq=data_batch["actions"],  # (B, L, act_dim)
+        total_loss = ddp_agent(
+            data_batch["observations"],
+            data_batch["actions"],
+            data_batch["action_mask"],
         )
         timings["forward"] += time.time() - last_tick
 
-        # backward
         last_tick = time.time()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
         optimizer.step()
-        lr_scheduler.step()  # step lr scheduler every batch, this is different from standard pytorch behavior
+        lr_scheduler.step()
         timings["backward"] += time.time() - last_tick
 
-        # ema step
         last_tick = time.time()
         ema.step(agent.parameters())
         timings["ema"] += time.time() - last_tick
 
-        # Evaluation
         evaluate_and_save_best(iteration)
-        log_metrics(iteration)
+        log_metrics(iteration, total_loss)
 
-        # Checkpoint
         if args.save_freq is not None and iteration % args.save_freq == 0:
-            save_ckpt(run_name, str(iteration))
-        pbar.update(1)
-        pbar.set_postfix({"loss": total_loss.item()})
+            save_ckpt(run_name, str(iteration), agent, ema, ema_agent, iteration, world_size)
+        if is_main_process:
+            pbar.update(1)
+            pbar.set_postfix({"loss": float(total_loss.item())})
         last_tick = time.time()
 
-    evaluate_and_save_best(args.total_iters)
-    log_metrics(args.total_iters)
+    if total_loss is not None:
+        evaluate_and_save_best(args.total_iters)
+        log_metrics(args.total_iters, total_loss)
 
     envs.close()
-    writer.close()
+    if writer is not None:
+        writer.close()
+    cleanup_distributed(distributed)
+
+
+if __name__ == "__main__":
+    main()

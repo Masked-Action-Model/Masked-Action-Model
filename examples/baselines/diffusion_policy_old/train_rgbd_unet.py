@@ -1,11 +1,14 @@
-ALGO_NAME = "BC_Diffusion_rgbd_UNet1D"
+ALGO_NAME = "BC_Diffusion_rgbd_UNet"
 
 import os
 import random
 import time
+import json
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import partial
+from pathlib import Path
 from typing import List, Optional
 
 import gymnasium as gym
@@ -27,6 +30,16 @@ from torch.utils.data.dataset import Dataset
 from torch.utils.data.sampler import BatchSampler, RandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
+# Allow running this file directly via `python .../train_rgbd.py`.
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from examples.baselines.diffusion_policy.data_preprocess_tools.normalize_utils import (
+    compute_global_min_max,
+    load_action_stats_from_path,
+    normalize_selected_dims,
+)
 from diffusion_policy.conditional_unet1d import ConditionalUnet1D
 from diffusion_policy.evaluate import evaluate
 from diffusion_policy.make_env import make_eval_envs
@@ -77,6 +90,10 @@ class Args:
         16  # 16->8 leads to worse performance, maybe it is like generate a half image; 16->32, improvement is very marginal
     )
     diffusion_step_embed_dim: int = 64  # not very important
+    unet_dims: List[int] = field(default_factory=lambda: [64, 128, 256])
+    """U-Net channel dimensions."""
+    n_groups: int = 8
+    """Number of groups for U-Net GroupNorm."""
 
 
     # Environment/experiment specific arguments
@@ -95,6 +112,8 @@ class Args:
     """the number of episodes to evaluate the agent on"""
     num_eval_envs: int = 10
     """the number of parallel environments to evaluate the agent on"""
+    action_norm_path: Optional[str] = None
+    """Optional path to action normalization json (must contain keys min/max). If omitted, rollout actions are sent to env.step() directly."""
     sim_backend: str = "physx_cpu"
     """the simulation backend to use for evaluation environments. can be "cpu" or "gpu"""
     num_dataload_workers: int = 0
@@ -116,10 +135,48 @@ def reorder_keys(d, ref_dict):
     return out
 
 
+def load_action_denorm_stats(action_norm_path: str):
+    if action_norm_path is None or len(action_norm_path.strip()) == 0:
+        raise ValueError(
+            "action_norm_path is required. Please pass --action-norm-path to provide min/max for denormalization."
+        )
+    mins, maxs = load_action_stats_from_path(action_norm_path)
+    print(f"[denorm] loaded action norm stats from {action_norm_path}, dims={mins.shape[0]}")
+    return mins, maxs
+
+
+def save_action_norm_stats(action_norm_path: str, mins: np.ndarray, maxs: np.ndarray):
+    os.makedirs(os.path.dirname(action_norm_path), exist_ok=True)
+    with open(action_norm_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "min": np.asarray(mins, dtype=np.float32).tolist(),
+                "max": np.asarray(maxs, dtype=np.float32).tolist(),
+            },
+            f,
+            indent=2,
+        )
+
+
 class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
-    def __init__(self, data_path, obs_process_fn, obs_space, include_rgb, include_depth,obs_horizon,pred_horizon, device, num_traj):
+    def __init__(
+        self,
+        data_path,
+        obs_process_fn,
+        obs_space,
+        include_rgb,
+        include_depth,
+        obs_horizon,
+        pred_horizon,
+        device,
+        num_traj,
+        action_norm_path=None,
+    ):
         self.include_rgb = include_rgb
         self.include_depth = include_depth
+        self.action_min = None
+        self.action_max = None
+        self.action_norm_path = None
 
         from diffusion_policy.utils import load_demo_dataset
         trajectories = load_demo_dataset(data_path, num_traj=num_traj, concat=False)
@@ -140,9 +197,31 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             obs_traj_dict_list.append(_obs_traj_dict)
         trajectories["observations"] = obs_traj_dict_list
         self.obs_keys = list(_obs_traj_dict.keys())
-        # Pre-process the actions
-        for i in range(len(trajectories["actions"])):
-            trajectories["actions"][i] = torch.Tensor(trajectories["actions"][i]).to(device=device)
+        raw_actions = [np.asarray(action, dtype=np.float32) for action in trajectories["actions"]]
+        if action_norm_path is not None and len(action_norm_path.strip()) > 0:
+            action_min, action_max = load_action_denorm_stats(action_norm_path)
+            self.action_norm_path = action_norm_path
+            print(f"[action_norm] using provided stats: {action_norm_path}")
+        else:
+            action_min, action_max = compute_global_min_max(raw_actions)
+            self.action_norm_path = os.path.splitext(data_path)[0] + ".action_norm.json"
+            save_action_norm_stats(self.action_norm_path, action_min, action_max)
+            print(
+                f"[action_norm] computed stats from dataset and saved to {self.action_norm_path}"
+            )
+        self.action_min = np.asarray(action_min, dtype=np.float32)
+        self.action_max = np.asarray(action_max, dtype=np.float32)
+        print(f"[action_norm] min={self.action_min}")
+        print(f"[action_norm] max={self.action_max}")
+
+        # Pre-process the actions into normalized space for training.
+        for i, action in enumerate(raw_actions):
+            normalized_action = normalize_selected_dims(
+                action,
+                mins=self.action_min,
+                maxs=self.action_max,
+            )
+            trajectories["actions"][i] = torch.from_numpy(normalized_action).to(device=device)
         print("Obs/action pre-processing is done, start to pre-compute the slice indices...")
 
          # Fixed to pd_ee_pose: pad with final action to keep target unchanged.
@@ -273,11 +352,12 @@ class Agent(nn.Module):
         self.visual_encoder = PlainConv(
             in_channels=total_visual_channels, out_dim=visual_feature_dim, pool_feature_map=True
         )
-        per_step_obs_dim = visual_feature_dim + obs_state_dim
         self.noise_pred_net = ConditionalUnet1D(
             input_dim=self.act_dim,
-            global_cond_dim=self.obs_horizon * per_step_obs_dim,
+            global_cond_dim=self.obs_horizon * (visual_feature_dim + obs_state_dim),
             diffusion_step_embed_dim=args.diffusion_step_embed_dim,
+            down_dims=args.unet_dims,
+            n_groups=args.n_groups,
         )
         self.num_diffusion_iters = 100
         self.noise_scheduler = DDPMScheduler(
@@ -286,6 +366,16 @@ class Agent(nn.Module):
             clip_sample=True,  # clip output to [-1,1] to improve stability
             prediction_type="epsilon",  # predict noise (instead of denoised action)
         )
+        self.register_buffer(
+            "action_denorm_min", torch.empty(0, dtype=torch.float32), persistent=True
+        )
+        self.register_buffer(
+            "action_denorm_max", torch.empty(0, dtype=torch.float32), persistent=True
+        )
+
+    def set_action_denormalizer(self, mins: np.ndarray, maxs: np.ndarray, device):
+        self.action_denorm_min = torch.as_tensor(mins, device=device, dtype=torch.float32)
+        self.action_denorm_max = torch.as_tensor(maxs, device=device, dtype=torch.float32)
 
     def encode_obs(self, obs_seq, eval_mode):
         if self.include_rgb:
@@ -309,9 +399,7 @@ class Agent(nn.Module):
         B = obs_seq["state"].shape[0]
 
         # observation as FiLM conditioning
-        obs_cond = self.encode_obs(
-            obs_seq, eval_mode=False
-        )  # (B, obs_horizon, obs_dim)
+        obs_cond = self.encode_obs(obs_seq, eval_mode=False)
         obs_cond = obs_cond.flatten(start_dim=1)  # (B, obs_horizon * obs_dim)
 
         # sample noise to add to actions
@@ -325,7 +413,7 @@ class Agent(nn.Module):
         noisy_action_seq = self.noise_scheduler.add_noise(action_seq, noise, timesteps)
 
         # predict the noise residual
-        noise_pred = self.noise_pred_net(noisy_action_seq, timesteps, global_cond=obs_cond)
+        noise_pred = self.noise_pred_net(noisy_action_seq, timesteps, obs_cond)
 
         return F.mse_loss(noise_pred, noise)
 
@@ -344,9 +432,7 @@ class Agent(nn.Module):
             if self.include_depth:
                 obs_seq["depth"] = obs_seq["depth"].permute(0, 1, 4, 2, 3)
 
-            obs_cond = self.encode_obs(
-                obs_seq, eval_mode=True
-            )  # (B, obs_horizon, obs_dim)
+            obs_cond = self.encode_obs(obs_seq, eval_mode=True)
             obs_cond = obs_cond.flatten(start_dim=1)  # (B, obs_horizon * obs_dim)
 
             # initialize action from Guassian noise
@@ -359,7 +445,7 @@ class Agent(nn.Module):
                 timesteps = torch.full(
                     (B,), k, dtype=torch.long, device=noisy_action_seq.device
                 )
-                noise_pred = self.noise_pred_net(noisy_action_seq, timesteps, global_cond=obs_cond)
+                noise_pred = self.noise_pred_net(noisy_action_seq, timesteps, obs_cond)
 
                 # inverse diffusion step (remove noise)
                 noisy_action_seq = self.noise_scheduler.step(
@@ -371,7 +457,14 @@ class Agent(nn.Module):
         # only take act_horizon number of actions
         start = self.obs_horizon - 1
         end = start + self.act_horizon
-        return noisy_action_seq[:, start:end]  # (B, act_horizon, act_dim)
+        action_seq = noisy_action_seq[:, start:end]  # (B, act_horizon, act_dim)
+        if self.action_denorm_min.numel() > 0 and self.action_denorm_max.numel() > 0:
+            d = min(int(self.action_denorm_min.shape[0]), action_seq.shape[-1])
+            mins = self.action_denorm_min[:d]
+            maxs = self.action_denorm_max[:d]
+            action_seq = action_seq.clone()
+            action_seq[..., :d] = mins + 0.5 * (action_seq[..., :d] + 1.0) * (maxs - mins)
+        return action_seq
 
 
 def save_ckpt(run_name, tag):
@@ -402,7 +495,6 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
-
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # create evaluation environment
@@ -411,6 +503,7 @@ if __name__ == "__main__":
         reward_mode="sparse",
         obs_mode=args.obs_mode,
         render_mode="rgb_array",
+        sensor_configs=dict(shader_pack="default"),
         human_render_camera_configs=dict(shader_pack="default")
     )
     assert args.max_episode_steps != None, "max_episode_steps must be specified as imitation learning algorithms task solve speed is dependent on the data you train on"
@@ -472,7 +565,13 @@ if __name__ == "__main__":
         obs_horizon=args.obs_horizon,
         pred_horizon=args.pred_horizon,
         device=device,
-        num_traj=args.num_demos
+        num_traj=args.num_demos,
+        action_norm_path=args.action_norm_path,
+    )
+    denorm_mins = dataset.action_min
+    denorm_maxs = dataset.action_max
+    print(
+        f"[denorm] training uses normalized pd_ee_pose actions; rollout will denormalize with {dataset.action_norm_path}"
     )
     debug_sample_idx = 0
     print("Debug printing a sample from the dataset...")
@@ -508,6 +607,8 @@ if __name__ == "__main__":
     # holds a copy of the model weights
     ema = EMAModel(parameters=agent.parameters(), power=0.75)
     ema_agent = Agent(envs, args).to(device)
+    agent.set_action_denormalizer(denorm_mins, denorm_maxs, device)
+    ema_agent.set_action_denormalizer(denorm_mins, denorm_maxs, device)
 
     best_eval_metrics = defaultdict(float)
     timings = defaultdict(float)
@@ -586,6 +687,7 @@ if __name__ == "__main__":
 
     evaluate_and_save_best(args.total_iters)
     log_metrics(args.total_iters)
+    save_ckpt(run_name, "final")
 
     envs.close()
     writer.close()

@@ -4,22 +4,19 @@ set -euo pipefail
 # Train script for examples/baselines/diffusion_policy_old/train_rgbd.py
 # Override any value by exporting the variable before running this script.
 
-EXP_NAME="${EXP_NAME:-dit_old}"
+EXP_NAME="${EXP_NAME:-benchmark-pose-dit-origin-rgb}"
 SEED="${SEED:-1}"
 TORCH_DETERMINISTIC="${TORCH_DETERMINISTIC:-true}"
 CUDA="${CUDA:-true}"
 TRACK="${TRACK:-false}"
 WANDB_PROJECT_NAME="${WANDB_PROJECT_NAME:-ManiSkill}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
-CAPTURE_VIDEO="${CAPTURE_VIDEO:-true}"
+CAPTURE_VIDEO="${CAPTURE_VIDEO:-false}"
 
 ENV_ID="${ENV_ID:-PickCube-v1}"
-DEMO_PATH="${DEMO_PATH:-demos/data_1/data_1_normed.h5}"
-SOURCE_DEMO_METADATA_PATH="${SOURCE_DEMO_METADATA_PATH:-demos/data_1/data_1.json}"
-TRAIN_SEED_REFERENCE_METADATA_PATH="${TRAIN_SEED_REFERENCE_METADATA_PATH:-demos/data_1_preprocessed/3D_points_0.1/data_1_3D_points_0.1_train.json}"
-EVAL_DEMO_METADATA_PATH="${EVAL_DEMO_METADATA_PATH:-demos/data_1_preprocessed/3D_points_0.1/data_1_3D_points_0.1_eval.json}"
-NUM_DEMOS="${NUM_DEMOS:-100}"
-TOTAL_ITERS="${TOTAL_ITERS:-500000}"
+DEMO_PATH="${DEMO_PATH:-demos/exp_4/PickCube-v1/motionplanning/experiment_4.rgb.pd_ee_pose.physx_cpu.h5}"
+NUM_DEMOS="${NUM_DEMOS:-50}"
+TOTAL_ITERS="${TOTAL_ITERS:-100000}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 
 LR="${LR:-1e-4}"
@@ -28,16 +25,14 @@ ACT_HORIZON="${ACT_HORIZON:-8}"
 PRED_HORIZON="${PRED_HORIZON:-16}"
 DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-64}"
 
-
-OBS_MODE="${OBS_MODE:-rgb+depth}"
+OBS_MODE="${OBS_MODE:-rgb}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-100}"
 LOG_FREQ="${LOG_FREQ:-1000}"
-
 EVAL_FREQ="${EVAL_FREQ:-5000}"
-SAVE_FREQ="${SAVE_FREQ:-}"
+SAVE_FREQ="${SAVE_FREQ:-50000}"
 NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-100}"
-NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-1}"
-ACTION_NORM_PATH="${ACTION_NORM_PATH:-demos/data_1/data_1_norm.json}"
+NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-10}"
+ACTION_NORM_PATH="${ACTION_NORM_PATH:-}"
 SIM_BACKEND="${SIM_BACKEND:-physx_cpu}"
 NUM_DATALOAD_WORKERS="${NUM_DATALOAD_WORKERS:-0}"
 CONTROL_MODE="${CONTROL_MODE:-pd_ee_pose}"
@@ -93,15 +88,6 @@ else
 fi
 if [[ -n "$NUM_DEMOS" ]]; then
   ARGS+=(--num-demos "$NUM_DEMOS")
-fi
-if [[ -n "$SOURCE_DEMO_METADATA_PATH" ]]; then
-  ARGS+=(--source-demo-metadata-path "$SOURCE_DEMO_METADATA_PATH")
-fi
-if [[ -n "$TRAIN_SEED_REFERENCE_METADATA_PATH" ]]; then
-  ARGS+=(--train-seed-reference-metadata-path "$TRAIN_SEED_REFERENCE_METADATA_PATH")
-fi
-if [[ -n "$EVAL_DEMO_METADATA_PATH" ]]; then
-  ARGS+=(--eval-demo-metadata-path "$EVAL_DEMO_METADATA_PATH")
 fi
 if [[ -n "$ACTION_NORM_PATH" ]]; then
   ARGS+=(--action-norm-path "$ACTION_NORM_PATH")

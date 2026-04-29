@@ -38,6 +38,9 @@ class STPMEncoder(nn.Module):
         self.cfg = OmegaConf.load(self._resolve_path(config_path))
         self.device = torch.device(device or self.cfg.general.device)
         self.task_name = str(self.cfg.general.task_name)
+        self.task_description = str(
+            getattr(self.cfg.general, "task_description", self.task_name)
+        )
         self.state_dim = int(self.cfg.model.state_dim)
 
         camera_names = list(self.cfg.general.camera_names)
@@ -100,7 +103,7 @@ class STPMEncoder(nn.Module):
 
     def _normalize_tasks(self, tasks: Union[str, Sequence[str], None], batch_size: int) -> list[str]:
         if tasks is None:
-            return [self.task_name] * batch_size
+            return [self.task_description] * batch_size
         if isinstance(tasks, str):
             return [tasks] * batch_size
         tasks = list(tasks)

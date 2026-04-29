@@ -1,10 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-# Train script for examples/baselines/diffusion_policy_old/train_rgbd_unet.py
+# Train script for examples/baselines/diffusion_policy_old/train_rgbd_depth_norm.py
 # Override any value by exporting the variable before running this script.
 
-EXP_NAME="${EXP_NAME:-benchmark-pose-unet-rgb}"
+EXP_NAME="${EXP_NAME:-benchmark-pose-dit-rgbd-depth-norm}"
 SEED="${SEED:-1}"
 TORCH_DETERMINISTIC="${TORCH_DETERMINISTIC:-true}"
 CUDA="${CUDA:-true}"
@@ -14,8 +14,8 @@ WANDB_ENTITY="${WANDB_ENTITY:-}"
 CAPTURE_VIDEO="${CAPTURE_VIDEO:-false}"
 
 ENV_ID="${ENV_ID:-PickCube-v1}"
-DEMO_PATH="${DEMO_PATH:-demos/exp_4/PickCube-v1/motionplanning/experiment_4.rgb.pd_ee_pose.physx_cpu.h5}"
-NUM_DEMOS="${NUM_DEMOS:-100}"
+DEMO_PATH="${DEMO_PATH:-demos/exp_4/PickCube-v1/motionplanning/experiment_4.rgbd.pd_ee_pose.physx_cpu.h5}"
+NUM_DEMOS="${NUM_DEMOS:-50}"
 TOTAL_ITERS="${TOTAL_ITERS:-100000}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 
@@ -24,10 +24,8 @@ OBS_HORIZON="${OBS_HORIZON:-2}"
 ACT_HORIZON="${ACT_HORIZON:-8}"
 PRED_HORIZON="${PRED_HORIZON:-16}"
 DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-64}"
-UNET_DIMS="${UNET_DIMS:-64 128 256}"
-N_GROUPS="${N_GROUPS:-8}"
 
-OBS_MODE="${OBS_MODE:-rgb}"
+OBS_MODE="${OBS_MODE:-rgb+depth}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-100}"
 LOG_FREQ="${LOG_FREQ:-1000}"
 EVAL_FREQ="${EVAL_FREQ:-5000}"
@@ -52,8 +50,6 @@ ARGS=(
   --act-horizon "$ACT_HORIZON"
   --pred-horizon "$PRED_HORIZON"
   --diffusion-step-embed-dim "$DIFFUSION_STEP_EMBED_DIM"
-  --unet-dims $UNET_DIMS
-  --n-groups "$N_GROUPS"
   --obs-mode "$OBS_MODE"
   --log-freq "$LOG_FREQ"
   --eval-freq "$EVAL_FREQ"
@@ -106,4 +102,4 @@ if [[ -n "$DEMO_TYPE" ]]; then
   ARGS+=(--demo-type "$DEMO_TYPE")
 fi
 
-python examples/baselines/diffusion_policy_old/train_rgbd_unet.py "${ARGS[@]}"
+python examples/baselines/diffusion_policy_old/train_rgbd_depth_norm.py "${ARGS[@]}"
