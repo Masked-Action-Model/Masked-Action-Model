@@ -138,7 +138,7 @@ if [[ $DO_PUSH -eq 1 ]]; then
     echo "Cannot detect current branch for push." >&2
     exit 1
   fi
-  git -C "${TARGET_REPO}" push origin "${CURRENT_BRANCH}"
+  git -C "${TARGET_REPO}" -c http.version=HTTP/1.1 push origin "${CURRENT_BRANCH}"
 fi
 
 echo
