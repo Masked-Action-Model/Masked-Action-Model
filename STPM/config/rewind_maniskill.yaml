@@ -3,7 +3,8 @@ general:
   task_name: "pick up the cube and place it at the goal"  # language prompt
   repo_id: demos/data_1/data_1_train.h5                   # dataset .h5 path
   state_norm_path: STPM/pickcube_state_norm_train.json  
-  camera_names: ["base_camera"] 
+  camera_names: "auto"
+  state_paths: ["obs/agent/qpos", "obs/agent/qvel", "obs/extra/is_grasped", "obs/extra/tcp_pose", "obs/extra/goal_pos"]
   seed: 42
   device: "cuda"  
 
@@ -31,7 +32,7 @@ model:
   dropout: 0.1  # dropout used inside the reward model
   n_obs_steps: 6  # number of historical observations; dataset sequence length is n_obs_steps + 1
   frame_gap: 2  # gap in raw observation indices between consecutive sampled frames
-  state_dim: 29  # state feature dimension: qpos + qvel + goal_pos + tcp_pose + is_grasped
+  state_dim: 29  # state feature dimension: qpos + qvel + is_grasped + tcp_pose + goal_pos
   no_state: False  # if True, replace state input with zeros during training/eval
   resume_training: False  # whether to load model weights from model_path before training
   model_path: ""  # checkpoint path used when resume_training=True

@@ -12,7 +12,12 @@ from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 from tqdm import tqdm
 import wandb
 
-from maniskill_dataset import FrameManiskillDataset
+from maniskill_dataset import (
+    FrameManiskillDataset,
+    infer_state_dim_from_h5,
+    resolve_camera_names,
+    resolve_state_paths,
+)
 from utils.data_utils import get_valid_episodes, split_train_eval_episodes, adapt_maniskill_batch_rewind
 from utils.train_utils import set_seed, save_ckpt, get_normalizer_from_calculated
 from models.rewind_reward_model import RewardTransformer
@@ -34,7 +39,26 @@ class ReWiNDWorkspace:
         self.device = torch.device(cfg.general.device if torch.cuda.is_available() else "cpu")
         print(f"[Init] Using device: {self.device}")
         set_seed(cfg.general.seed)
-        self.camera_names = cfg.general.camera_names
+        configured_camera_names = getattr(cfg.general, "camera_names", "auto")
+        self.camera_names = resolve_camera_names(cfg.general.repo_id, configured_camera_names)
+        cfg.general.camera_names = self.camera_names
+        cfg.general.state_paths = resolve_state_paths(
+            list(getattr(cfg.general, "state_paths", [])) or None
+        )
+        inferred_state_dim = infer_state_dim_from_h5(
+            cfg.general.repo_id,
+            state_paths=cfg.general.state_paths,
+        )
+        configured_state_dim = int(getattr(cfg.model, "state_dim", inferred_state_dim))
+        if configured_state_dim != inferred_state_dim:
+            print(
+                f"[Init] Override STPM state_dim from config {configured_state_dim} "
+                f"to H5-inferred {inferred_state_dim}."
+            )
+        cfg.model.state_dim = inferred_state_dim
+        print(f"[Init] STPM cameras: {self.camera_names}")
+        print(f"[Init] STPM state_paths: {list(cfg.general.state_paths)}")
+        print(f"[Init] STPM state_dim: {cfg.model.state_dim}")
         self.task_description = str(
             getattr(cfg.general, "task_description", cfg.general.task_name)
         )
@@ -66,9 +90,9 @@ class ReWiNDWorkspace:
             episodes=train_eps,
             n_obs_steps=cfg.model.n_obs_steps,
             frame_gap=cfg.model.frame_gap,
-            image_names=cfg.general.camera_names,
+            image_names=self.camera_names,
             task_description=self.task_description,
-            state_paths=list(getattr(cfg.general, "state_paths", [])) or None,
+            state_paths=cfg.general.state_paths,
         )
 
         dataset_val = FrameManiskillDataset(
@@ -76,9 +100,9 @@ class ReWiNDWorkspace:
             episodes=val_eps,
             n_obs_steps=cfg.model.n_obs_steps,
             frame_gap=cfg.model.frame_gap,
-            image_names=cfg.general.camera_names,
+            image_names=self.camera_names,
             task_description=self.task_description,
-            state_paths=list(getattr(cfg.general, "state_paths", [])) or None,
+            state_paths=cfg.general.state_paths,
         )
 
         dataloader_train = torch.utils.data.DataLoader(dataset_train, **cfg.dataloader)
@@ -146,7 +170,7 @@ class ReWiNDWorkspace:
             reward_model.train()
             with tqdm(dataloader_train, desc=f"Epoch {epoch}") as pbar:
                 for batch in pbar:
-                    batch = adapt_maniskill_batch_rewind(batch, camera_names=cfg.general.camera_names)
+                    batch = adapt_maniskill_batch_rewind(batch, camera_names=self.camera_names)
 
                     B, T = batch["image_frames"][self.camera_names[0]].shape[:2]
                     img_list = []
@@ -200,7 +224,7 @@ class ReWiNDWorkspace:
                 print("running validation...")
                 with torch.no_grad():
                     for batch in dataloader_val:
-                        batch = adapt_maniskill_batch_rewind(batch, camera_names=cfg.general.camera_names)
+                        batch = adapt_maniskill_batch_rewind(batch, camera_names=self.camera_names)
                         B, T = batch["image_frames"][self.camera_names[0]].shape[:2]
                         img_list = []
                         for key in self.camera_names:

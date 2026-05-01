@@ -36,6 +36,20 @@ PICKCUBE_ROLLOUT_STATE_DIM = (
     + PICKCUBE_TCP_POSE_DIM
     + PICKCUBE_GOAL_POS_DIM
 )
+ROLLOUT_DEFAULT_STATE_PATHS = [
+    "obs/agent/qpos",
+    "obs/agent/qvel",
+    "obs/extra/is_grasped",
+    "obs/extra/tcp_pose",
+    "obs/extra/goal_pos",
+]
+LEGACY_PICKCUBE_STPM_STATE_PATHS = [
+    "obs/agent/qpos",
+    "obs/agent/qvel",
+    "obs/extra/goal_pos",
+    "obs/extra/tcp_pose",
+    "obs/extra/is_grasped",
+]
 
 
 def validate_stpm_eval_setup(stpm_encoder, stpm_n_obs_steps: int, stpm_frame_gap: int):
@@ -44,15 +58,17 @@ def validate_stpm_eval_setup(stpm_encoder, stpm_n_obs_steps: int, stpm_frame_gap
             "stpm_encoder is required for only-mas evaluation. "
             "Pass a valid STPM checkpoint from the training entrypoint."
         )
-    if getattr(stpm_encoder, "camera_name", None) != "base_camera":
-        raise ValueError(
-            "Only STPM configs with a single 'base_camera' are supported for "
-            f"only-mas evaluation, got camera_name={getattr(stpm_encoder, 'camera_name', None)!r}."
+    camera_names = list(
+        getattr(
+            stpm_encoder,
+            "camera_names",
+            [getattr(stpm_encoder, "camera_name", "base_camera")],
         )
-    if int(getattr(stpm_encoder, "state_dim", -1)) != PICKCUBE_ROLLOUT_STATE_DIM:
+    )
+    if not camera_names or camera_names[0] != "base_camera":
         raise ValueError(
-            "Only PickCube-compatible STPM checkpoints are supported right now. "
-            f"Expected state_dim={PICKCUBE_ROLLOUT_STATE_DIM}, got {getattr(stpm_encoder, 'state_dim', None)}."
+            "STPM-driven only-mas evaluation expects base_camera as the first camera, "
+            f"got camera_names={camera_names!r}."
         )
     if int(stpm_n_obs_steps) <= 0:
         raise ValueError(f"stpm_n_obs_steps must be positive, got {stpm_n_obs_steps}")
@@ -60,9 +76,8 @@ def validate_stpm_eval_setup(stpm_encoder, stpm_n_obs_steps: int, stpm_frame_gap
         raise ValueError(f"stpm_frame_gap must be positive, got {stpm_frame_gap}")
     _debug_print_once(
         "check5_validate",
-        f"[check5] STPM eval setup validated: camera=base_camera, "
-        f"checkpoint_state_dim={int(getattr(stpm_encoder, 'state_dim', -1))}, "
-        f"expected_rollout_state_dim={PICKCUBE_ROLLOUT_STATE_DIM}",
+        f"[check5] STPM eval setup validated: cameras={camera_names}, "
+        f"checkpoint_state_dim={int(getattr(stpm_encoder, 'state_dim', -1))}",
     )
 
 
@@ -123,22 +138,30 @@ def append_latest_rollout_frame(histories, stacked_obs: dict):
             history[key].append(frame[key])
 
 
-def _reorder_pickcube_rollout_state_for_stpm(
-    rollout_state: torch.Tensor, expected_state_dim: int
-):
+def _prepare_rollout_state_for_stpm(rollout_state: torch.Tensor, stpm_encoder):
     if rollout_state.ndim != 1:
         raise ValueError(
             f"Expected single rollout state frame to be 1D, got shape {tuple(rollout_state.shape)}"
         )
-    if rollout_state.numel() != PICKCUBE_ROLLOUT_STATE_DIM:
+    expected_state_dim = int(stpm_encoder.state_dim)
+    if rollout_state.numel() != expected_state_dim:
         raise ValueError(
-            "Current only-mas evaluator only supports PickCube-compatible rollout "
-            f"states with dim={PICKCUBE_ROLLOUT_STATE_DIM}, got {rollout_state.numel()}."
+            "Rollout state dim does not match STPM checkpoint state_dim: "
+            f"rollout={rollout_state.numel()}, checkpoint={expected_state_dim}."
         )
-    if expected_state_dim != PICKCUBE_ROLLOUT_STATE_DIM:
+    state_paths = list(getattr(stpm_encoder, "state_paths", []))
+    if state_paths in ([], ROLLOUT_DEFAULT_STATE_PATHS):
+        _debug_print_once(
+            "check5_state_identity",
+            f"[check5] STPM state uses rollout order directly: dim={rollout_state.numel()}",
+        )
+        return rollout_state
+
+    if state_paths != LEGACY_PICKCUBE_STPM_STATE_PATHS or rollout_state.numel() != PICKCUBE_ROLLOUT_STATE_DIM:
         raise ValueError(
-            "Current only-mas evaluator only supports PickCube-compatible STPM "
-            f"state_dim={PICKCUBE_ROLLOUT_STATE_DIM}, got {expected_state_dim}."
+            "STPM checkpoint state_paths do not match the rollout flattened state order. "
+            "Retrain STPM with state_paths matching rollout order, or add an explicit "
+            f"state reorder mapping. state_paths={state_paths!r}"
         )
 
     qpos_end = PICKCUBE_QPOS_DIM
@@ -155,35 +178,41 @@ def _reorder_pickcube_rollout_state_for_stpm(
 
     reordered = torch.cat((qpos, qvel, goal_pos, tcp_pose, is_grasped), dim=0)
     _debug_print_once(
-        "check5_reorder",
-        f"[check5] STPM state reorder validated: input_dim={rollout_state.numel()}, "
+        "check5_legacy_reorder",
+        f"[check5] legacy PickCube STPM state reorder validated: input_dim={rollout_state.numel()}, "
         f"reordered_dim={reordered.numel()}, order=(qpos,qvel,goal_pos,tcp_pose,is_grasped)",
     )
     return reordered
 
 
-def _build_stpm_rgb_frame(rgb_frame: torch.Tensor):
+def _build_stpm_rgb_frame(rgb_frame: torch.Tensor, num_cameras: int):
     if rgb_frame.ndim != 3:
         raise ValueError(
             f"Expected rgb frame to be 3D, got rgb={tuple(rgb_frame.shape)}"
         )
 
-    if rgb_frame.shape[-1] == 3:
+    if num_cameras <= 0:
+        raise ValueError(f"num_cameras must be positive, got {num_cameras}")
+
+    if rgb_frame.shape[-1] == 3 * num_cameras:
         rgb_chw = rgb_frame.permute(2, 0, 1)
-    elif rgb_frame.shape[0] == 3:
+    elif rgb_frame.shape[0] == 3 * num_cameras:
         rgb_chw = rgb_frame
     else:
         raise ValueError(
-            "Only single-camera 'base_camera' rollout observations are supported. "
-            f"Expected rgb channel dim 3, got shape {tuple(rgb_frame.shape)}."
+            f"Expected rgb channel dim {3 * num_cameras} for {num_cameras} camera(s), "
+            f"got shape {tuple(rgb_frame.shape)}."
         )
 
-    if rgb_chw.shape[0] != 3:
+    if rgb_chw.shape[0] != 3 * num_cameras:
         raise ValueError(
-            f"Expected base_camera rgb channel count 3, got {rgb_chw.shape[0]}."
+            f"Expected rgb channel count {3 * num_cameras}, got {rgb_chw.shape[0]}."
         )
 
-    return rgb_chw.to(dtype=torch.float32)
+    rgb_chw = rgb_chw.to(dtype=torch.float32)
+    if num_cameras == 1:
+        return rgb_chw
+    return rgb_chw.reshape(num_cameras, 3, rgb_chw.shape[-2], rgb_chw.shape[-1])
 
 
 def _sample_stpm_history_indices(
@@ -214,6 +243,9 @@ def predict_progress_from_histories(
 ):
     rgb_windows = []
     state_windows = []
+    num_cameras = len(
+        getattr(stpm_encoder, "camera_names", [getattr(stpm_encoder, "camera_name", "base_camera")])
+    )
 
     for env_idx, history in enumerate(histories):
         expected_history_len = obs_horizon + int(step_ptr[env_idx].item())
@@ -242,12 +274,11 @@ def predict_progress_from_histories(
             rgb_seq = []
             state_seq = []
             for hist_idx in sampled_indices:
-                rgb_seq.append(_build_stpm_rgb_frame(history["rgb"][hist_idx]))
+                rgb_seq.append(
+                    _build_stpm_rgb_frame(history["rgb"][hist_idx], num_cameras)
+                )
                 state_seq.append(
-                    _reorder_pickcube_rollout_state_for_stpm(
-                        history["state"][hist_idx],
-                        expected_state_dim=stpm_encoder.state_dim,
-                    )
+                    _prepare_rollout_state_for_stpm(history["state"][hist_idx], stpm_encoder)
                 )
 
             rgb_windows.append(torch.stack(rgb_seq, dim=0))
@@ -273,6 +304,9 @@ def predict_current_progress_from_histories(
 ):
     rgb_windows = []
     state_windows = []
+    num_cameras = len(
+        getattr(stpm_encoder, "camera_names", [getattr(stpm_encoder, "camera_name", "base_camera")])
+    )
 
     for env_idx, history in enumerate(histories):
         expected_history_len = obs_horizon + int(step_ptr[env_idx].item())
@@ -300,12 +334,11 @@ def predict_current_progress_from_histories(
         rgb_seq = []
         state_seq = []
         for hist_idx in sampled_indices:
-            rgb_seq.append(_build_stpm_rgb_frame(history["rgb"][hist_idx]))
+            rgb_seq.append(
+                _build_stpm_rgb_frame(history["rgb"][hist_idx], num_cameras)
+            )
             state_seq.append(
-                _reorder_pickcube_rollout_state_for_stpm(
-                    history["state"][hist_idx],
-                    expected_state_dim=stpm_encoder.state_dim,
-                )
+                _prepare_rollout_state_for_stpm(history["state"][hist_idx], stpm_encoder)
             )
 
         rgb_windows.append(torch.stack(rgb_seq, dim=0))

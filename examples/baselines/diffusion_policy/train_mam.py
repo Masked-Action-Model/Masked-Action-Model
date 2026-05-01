@@ -261,16 +261,24 @@ def build_eval_stpm_encoder(
 def validate_only_mas_eval_layout(envs: VectorEnv, stpm_encoder):
     rgb_shape = envs.single_observation_space["rgb"].shape
     state_shape = envs.single_observation_space["state"].shape
-
-    if getattr(stpm_encoder, "camera_name", None) != "base_camera":
-        raise ValueError(
-            "Only STPM configs with a single 'base_camera' are supported, "
-            f"got camera_name={getattr(stpm_encoder, 'camera_name', None)!r}."
+    camera_names = list(
+        getattr(
+            stpm_encoder,
+            "camera_names",
+            [getattr(stpm_encoder, "camera_name", "base_camera")],
         )
-    if rgb_shape[-1] != 3:
+    )
+    expected_rgb_channels = 3 * len(camera_names)
+
+    if not camera_names or camera_names[0] != "base_camera":
         raise ValueError(
-            "Only single-camera rollout observations are supported for STPM-driven "
-            f"mas-window evaluation, got rgb shape {rgb_shape}."
+            "STPM-driven eval expects base_camera as the first camera, "
+            f"got camera_names={camera_names!r}."
+        )
+    if rgb_shape[-1] != expected_rgb_channels:
+        raise ValueError(
+            "Rollout RGB channels do not match the STPM checkpoint camera count, "
+            f"got rgb shape {rgb_shape}, camera_names={camera_names!r}."
         )
     if state_shape[-1] != int(stpm_encoder.state_dim):
         raise ValueError(

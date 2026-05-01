@@ -12,10 +12,90 @@ import torch
 DEFAULT_STATE_PATHS = [
     "obs/agent/qpos",
     "obs/agent/qvel",
-    "obs/extra/goal_pos",
-    "obs/extra/tcp_pose",
     "obs/extra/is_grasped",
+    "obs/extra/tcp_pose",
+    "obs/extra/goal_pos",
 ]
+
+
+def infer_camera_names_from_h5(repo_id: str | Path) -> list[str]:
+    path = Path(repo_id)
+    if not path.exists():
+        raise FileNotFoundError(f"ManiSkill dataset not found: {path}")
+    if path.suffix != ".h5":
+        raise ValueError(f"Expected an .h5 dataset path, got: {path}")
+
+    traj_pattern = re.compile(r"traj_(\d+)")
+    with h5py.File(path, "r") as dataset:
+        traj_keys = sorted(
+            key for key in dataset.keys() if traj_pattern.fullmatch(key)
+        )
+        if not traj_keys:
+            raise ValueError(f"No traj_* groups found in ManiSkill dataset: {path}")
+        sensor_data_path = f"{traj_keys[0]}/obs/sensor_data"
+        if sensor_data_path not in dataset:
+            raise ValueError(
+                f"No obs/sensor_data found in {path}. "
+                "STPM visual training requires an rgb/rgbd H5 dataset."
+            )
+        sensor_data = dataset[sensor_data_path]
+        camera_names = [
+            camera_name
+            for camera_name in sensor_data.keys()
+            if "rgb" in sensor_data[camera_name]
+        ]
+
+    if not camera_names:
+        raise ValueError(f"No RGB camera datasets found under {sensor_data_path} in {path}")
+    return camera_names
+
+
+def resolve_camera_names(repo_id: str | Path, image_names: list[str] | str | None) -> list[str]:
+    if image_names is None:
+        return infer_camera_names_from_h5(repo_id)
+    if isinstance(image_names, str):
+        if image_names.lower() == "auto":
+            return infer_camera_names_from_h5(repo_id)
+        return [image_names]
+    image_names = list(image_names)
+    if len(image_names) == 0 or any(str(name).lower() == "auto" for name in image_names):
+        return infer_camera_names_from_h5(repo_id)
+    return image_names
+
+
+def resolve_state_paths(state_paths: list[str] | None) -> list[str]:
+    return list(state_paths or DEFAULT_STATE_PATHS)
+
+
+def infer_state_dim_from_h5(repo_id: str | Path, state_paths: list[str] | None = None) -> int:
+    path = Path(repo_id)
+    if not path.exists():
+        raise FileNotFoundError(f"ManiSkill dataset not found: {path}")
+    if path.suffix != ".h5":
+        raise ValueError(f"Expected an .h5 dataset path, got: {path}")
+
+    resolved_state_paths = resolve_state_paths(state_paths)
+    traj_pattern = re.compile(r"traj_(\d+)")
+    with h5py.File(path, "r") as dataset:
+        traj_keys = sorted(
+            key for key in dataset.keys() if traj_pattern.fullmatch(key)
+        )
+        if not traj_keys:
+            raise ValueError(f"No traj_* groups found in ManiSkill dataset: {path}")
+        traj_group = dataset[traj_keys[0]]
+        state_dim = 0
+        for state_path in resolved_state_paths:
+            try:
+                value = traj_group[state_path]
+            except KeyError:
+                raise KeyError(
+                    f"Configured STPM state path {state_path!r} is missing from {path}. "
+                    f"state_paths={resolved_state_paths!r}"
+                ) from None
+            frame_shape = value.shape[1:]
+            path_dim = int(np.prod(frame_shape)) if len(frame_shape) > 0 else 1
+            state_dim += path_dim
+    return state_dim
 
 
 class FrameManiskillDataset(torch.utils.data.Dataset):
@@ -25,7 +105,7 @@ class FrameManiskillDataset(torch.utils.data.Dataset):
         episodes: list[int] | None = None,
         n_obs_steps: int = 1,
         frame_gap: int = 1,
-        image_names: list[str] | None = None,
+        image_names: list[str] | str | None = None,
         task_name: str = "",
         task_description: str | None = None,
         state_paths: list[str] | None = None,
@@ -39,7 +119,7 @@ class FrameManiskillDataset(torch.utils.data.Dataset):
 
         self.n_obs_steps = int(n_obs_steps)
         self.frame_gap = int(frame_gap)
-        self.image_names = image_names or ["base_camera"]
+        self.image_names = resolve_camera_names(self.path, image_names)
         self.task_description = task_description if task_description is not None else task_name
         self.sequence_length = self.n_obs_steps + 1
         self.frame_relative_indices = np.arange(
@@ -49,13 +129,7 @@ class FrameManiskillDataset(torch.utils.data.Dataset):
             dtype=np.int64,
         )
 
-        unsupported = [name for name in self.image_names if name != "base_camera"]
-        if unsupported:
-            raise ValueError(
-                f"Only 'base_camera' is supported by FrameManiskillDataset for now. "
-                f"Got unsupported image_names={unsupported}"
-            )
-        self.state_paths = list(state_paths or DEFAULT_STATE_PATHS)
+        self.state_paths = resolve_state_paths(state_paths)
 
         self._h5_file: h5py.File | None = None
         self.episode_lengths: dict[int, int] = {}
@@ -110,8 +184,24 @@ class FrameManiskillDataset(torch.utils.data.Dataset):
     def _take_rows(dataset: h5py.Dataset, sampled_indices: np.ndarray) -> np.ndarray:
         return np.stack([dataset[int(i)] for i in sampled_indices], axis=0)
 
-    def _load_camera_tensor(self, traj_group: h5py.Group, sampled_indices: np.ndarray) -> torch.Tensor:
-        camera_group = traj_group["obs"]["sensor_data"]["base_camera"]
+    def _load_camera_tensor(
+        self,
+        traj_group: h5py.Group,
+        sampled_indices: np.ndarray,
+        camera_name: str,
+    ) -> torch.Tensor:
+        try:
+            camera_group = traj_group["obs"]["sensor_data"][camera_name]
+        except KeyError:
+            available = []
+            if "sensor_data" in traj_group["obs"]:
+                available = list(traj_group["obs"]["sensor_data"].keys())
+            raise KeyError(
+                f"Camera {camera_name!r} is missing from trajectory. "
+                f"Available cameras: {available}"
+            ) from None
+        if "rgb" not in camera_group:
+            raise KeyError(f"Camera {camera_name!r} has no rgb dataset.")
         rgb = self._take_rows(camera_group["rgb"], sampled_indices).astype(np.float32)
         rgb = np.transpose(rgb, (0, 3, 1, 2))
         return torch.from_numpy(rgb)
@@ -155,7 +245,6 @@ class FrameManiskillDataset(torch.utils.data.Dataset):
         targets = sampled_indices.astype(np.float32) / float(denominator)
 
         item = {
-            "base_camera": self._load_camera_tensor(traj_group, sampled_indices),
             "state": self._load_state_tensor(traj_group, sampled_indices),
             "targets": torch.from_numpy(targets),
             "lengths": torch.tensor([self.sequence_length], dtype=torch.long),
@@ -164,4 +253,8 @@ class FrameManiskillDataset(torch.utils.data.Dataset):
             "episode_index": episode_index,
             "anchor_index": anchor_index,
         }
+        for camera_name in self.image_names:
+            item[camera_name] = self._load_camera_tensor(
+                traj_group, sampled_indices, camera_name
+            )
         return item

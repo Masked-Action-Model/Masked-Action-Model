@@ -20,7 +20,8 @@ class STPMEncoder(nn.Module):
     Frozen STPM inference wrapper.
 
     Input:
-    - rgbd: [T, 3/4, H, W] or [B, T, 3/4, H, W]
+    - rgbd: [T, 3/4, H, W], [B, T, 3/4, H, W],
+      [T, N, 3/4, H, W], or [B, T, N, 3/4, H, W]
     - state: [T, state_dim] or [B, T, state_dim]
 
     Output:
@@ -42,11 +43,18 @@ class STPMEncoder(nn.Module):
             getattr(self.cfg.general, "task_description", self.task_name)
         )
         self.state_dim = int(self.cfg.model.state_dim)
+        self.state_paths = list(getattr(self.cfg.general, "state_paths", []))
 
-        camera_names = list(self.cfg.general.camera_names)
-        if len(camera_names) != 1:
-            raise ValueError(f"STPMEncoder only supports single-camera inference, got cameras={camera_names}")
-        self.camera_name = camera_names[0]
+        configured_camera_names = self.cfg.general.camera_names
+        if isinstance(configured_camera_names, str) and configured_camera_names.lower() == "auto":
+            raise ValueError(
+                "STPMEncoder cannot use camera_names='auto'. "
+                "Use the config.yaml saved by STPM training, which records concrete camera names."
+            )
+        self.camera_names = list(configured_camera_names)
+        if len(self.camera_names) <= 0:
+            raise ValueError("STPMEncoder requires at least one camera name in config.")
+        self.camera_name = self.camera_names[0]
 
         self.clip_encoder = FrozenCLIPEncoder(self.cfg.encoders.vision_ckpt, self.device)
         self.reward_model = RewardTransformer(
@@ -57,7 +65,7 @@ class STPMEncoder(nn.Module):
             n_layers=self.cfg.model.n_layers,
             n_heads=self.cfg.model.n_heads,
             dropout=self.cfg.model.dropout,
-            num_cameras=1,
+            num_cameras=len(self.camera_names),
         ).to(self.device)
         self.state_normalizer = get_normalizer_from_calculated(
             self.cfg.general.state_norm_path,
@@ -95,11 +103,70 @@ class STPMEncoder(nn.Module):
             raise ValueError(f"Expected {name} to have {expected_ndim - 1} or {expected_ndim} dims, got shape {tuple(x.shape)}")
         return x, False
 
-    @staticmethod
-    def _select_rgb(rgbd: torch.Tensor) -> torch.Tensor:
-        if rgbd.shape[2] not in (3, 4):
-            raise ValueError(f"Expected RGB/RGBD tensor with 3 or 4 channels, got shape {tuple(rgbd.shape)}")
-        return rgbd[:, :, :3, :, :]
+    def _prepare_rgb(self, rgbd: torch.Tensor) -> tuple[torch.Tensor, bool]:
+        num_cameras = len(self.camera_names)
+        if rgbd.ndim == 4:
+            rgbd = rgbd.unsqueeze(0)
+            squeezed = True
+        elif rgbd.ndim in (5, 6):
+            squeezed = False
+        else:
+            raise ValueError(
+                "Expected rgbd to have 4, 5, or 6 dims, "
+                f"got shape {tuple(rgbd.shape)}"
+            )
+
+        if (
+            rgbd.ndim == 5
+            and num_cameras > 1
+            and rgbd.shape[1] == num_cameras
+            and rgbd.shape[2] in (3, 4)
+        ):
+            rgb = rgbd.unsqueeze(0)[:, :, :, :3, :, :]
+            squeezed = True
+        elif rgbd.ndim == 5:
+            channels = rgbd.shape[2]
+            if channels in (3, 4):
+                if num_cameras != 1:
+                    raise ValueError(
+                        f"STPM checkpoint expects {num_cameras} cameras {self.camera_names}, "
+                        f"but got a single-camera tensor with shape {tuple(rgbd.shape)}"
+                    )
+                rgb = rgbd[:, :, :3, :, :].unsqueeze(2)
+            elif channels == 3 * num_cameras:
+                rgb = rgbd.reshape(
+                    rgbd.shape[0],
+                    rgbd.shape[1],
+                    num_cameras,
+                    3,
+                    rgbd.shape[3],
+                    rgbd.shape[4],
+                )
+            elif channels == 4 * num_cameras:
+                rgb = rgbd.reshape(
+                    rgbd.shape[0],
+                    rgbd.shape[1],
+                    num_cameras,
+                    4,
+                    rgbd.shape[3],
+                    rgbd.shape[4],
+                )[:, :, :, :3, :, :]
+            else:
+                raise ValueError(
+                    f"Expected channel dim 3/4 or 3/4*num_cameras={num_cameras}, "
+                    f"got shape {tuple(rgbd.shape)}"
+                )
+        else:
+            if rgbd.shape[2] != num_cameras:
+                raise ValueError(
+                    f"Expected camera dim {num_cameras}, got shape {tuple(rgbd.shape)}"
+                )
+            if rgbd.shape[3] not in (3, 4):
+                raise ValueError(
+                    f"Expected RGB/RGBD channel dim 3 or 4, got shape {tuple(rgbd.shape)}"
+                )
+            rgb = rgbd[:, :, :, :3, :, :]
+        return rgb, squeezed
 
     def _normalize_tasks(self, tasks: Union[str, Sequence[str], None], batch_size: int) -> list[str]:
         if tasks is None:
@@ -118,32 +185,35 @@ class STPMEncoder(nn.Module):
         state: torch.Tensor,
         tasks: Union[str, Sequence[str], None] = None,
     ) -> torch.Tensor:
-        rgbd, squeezed_rgbd = self._ensure_batch_dim(rgbd, expected_ndim=5, name="rgbd")
+        rgb, squeezed_rgbd = self._prepare_rgb(rgbd)
         state, squeezed_state = self._ensure_batch_dim(state, expected_ndim=3, name="state")
 
         if squeezed_rgbd != squeezed_state:
             raise ValueError("rgbd and state must either both have batch dim or both be single trajectories.")
-        if rgbd.shape[:2] != state.shape[:2]:
+        if rgb.shape[:2] != state.shape[:2]:
             raise ValueError(
-                f"Mismatched rgbd/state leading dims: rgbd {tuple(rgbd.shape[:2])}, state {tuple(state.shape[:2])}"
+                f"Mismatched rgbd/state leading dims: rgbd {tuple(rgb.shape[:2])}, state {tuple(state.shape[:2])}"
             )
-        if rgbd.shape[2] not in (3, 4):
-            raise ValueError(f"Expected rgb/rgbd channel dim to be 3 or 4, got shape {tuple(rgbd.shape)}")
         if state.shape[-1] != self.state_dim:
             raise ValueError(f"Expected state dim {self.state_dim}, got shape {tuple(state.shape)}")
 
-        batch_size, horizon = rgbd.shape[:2]
+        batch_size, horizon, num_cameras = rgb.shape[:3]
         lengths = torch.full((batch_size,), horizon, dtype=torch.long, device=self.device)
         task_list = self._normalize_tasks(tasks, batch_size)
 
-        rgbd = rgbd.to(self.device)
+        rgb = rgb.to(self.device)
         state = self.state_normalizer.normalize(state.to(self.device))
         if self.cfg.model.no_state:
             state = torch.zeros_like(state)
 
-        rgb = self._select_rgb(rgbd).flatten(0, 1)
+        rgb = rgb.permute(2, 0, 1, 3, 4, 5).reshape(
+            num_cameras * batch_size * horizon,
+            3,
+            rgb.shape[-2],
+            rgb.shape[-1],
+        )
         img_emb = self.clip_encoder.encode_image(rgb)
-        img_emb = img_emb.view(batch_size, horizon, -1).unsqueeze(1)
+        img_emb = img_emb.view(num_cameras, batch_size, horizon, -1).permute(1, 0, 2, 3)
         lang_emb = self.clip_encoder.encode_text(task_list)
         progress_seq = self.reward_model(img_emb, lang_emb, state, lengths)
         last_progress = progress_seq[:, -1]
