@@ -21,40 +21,105 @@ TRACK="${TRACK:-false}"
 CAPTURE_VIDEO="${CAPTURE_VIDEO:-false}"
 
 # -----------------------------------------------------------------------------
-# 2. Raw paths and single-mask preprocess params
+# 2. Raw paths and mask preprocess params
 # -----------------------------------------------------------------------------
 
 RAW_DEMO_H5="${RAW_DEMO_H5:-demos/data_1/data_1.h5}"
 RAW_DEMO_JSON="${RAW_DEMO_JSON:-demos/data_1/data_1.json}"
 PREPROCESSED_ROOT_DIR="${PREPROCESSED_ROOT_DIR:-demos/data_1_preprocessed}"
 PREPROCESSED_DATA_PREFIX="${PREPROCESSED_DATA_PREFIX:-data_1}"
-PREPROCESS_MASK_TYPE="${PREPROCESS_MASK_TYPE:-3D_points}"
-PREPROCESS_RETAIN_RATIO="${PREPROCESS_RETAIN_RATIO:-0.5}"
-PREPROCESS_MASK_SEQ_LEN="${PREPROCESS_MASK_SEQ_LEN:-20}"
+PREPROCESSED_DATA_DIR="${PREPROCESSED_DATA_DIR:-}"
 PREPROCESS_MASK_VALUE="${PREPROCESS_MASK_VALUE:-0}"
 PREPROCESS_NUM_TRAJ="${PREPROCESS_NUM_TRAJ:-}"
-NUM_MASK_TYPE="${NUM_MASK_TYPE:-1}"
 
-if [[ "$NUM_MASK_TYPE" != "1" ]]; then
-  echo "ERROR: subgoal condition only supports single mask type; set NUM_MASK_TYPE=1." >&2
-  exit 1
-fi
+# Subgoal condition only supports one mask. Keep the same list interface as MAM:
+#   MASK_TYPE_LIST='["3D_points"]'
+#   MASK_RATIO_LIST='[0.5]'      # retain_ratio, or seq_len for seq masks
+MASK_TYPE_LIST="${MASK_TYPE_LIST:-[\"3D_points\"]}"
+MASK_RATIO_LIST="${MASK_RATIO_LIST:-[0.5]}"
 
-case "$PREPROCESS_MASK_TYPE" in
-  pose_AnyGrasp|pose_motion_planning|points|3D_points|random_mask)
-    PREPROCESS_DIR_SUFFIX="${PREPROCESS_MASK_TYPE}_${PREPROCESS_RETAIN_RATIO}"
-    ;;
+MASK_ASSIGNMENTS="$(
+MASK_TYPE_LIST="$MASK_TYPE_LIST" \
+MASK_RATIO_LIST="$MASK_RATIO_LIST" \
+python - <<'PY'
+import ast
+import os
+import shlex
+
+def parse_list(value):
+    try:
+        parsed = ast.literal_eval(value)
+    except Exception:
+        parsed = [value]
+    if isinstance(parsed, (str, bytes)):
+        parsed = [parsed]
+    return list(parsed)
+
+def parse_mask_param(value):
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+        return None
+    return float(value)
+
+mask_types = [str(v) for v in parse_list(os.environ["MASK_TYPE_LIST"])]
+mask_params = [parse_mask_param(v) for v in parse_list(os.environ["MASK_RATIO_LIST"])]
+if len(mask_types) != 1:
+    raise ValueError(
+        "run_subgoal_condition.sh only supports one mask. "
+        f"Got MASK_TYPE_LIST={mask_types!r}"
+    )
+if len(mask_params) == 0:
+    mask_params = [0.2]
+if len(mask_params) > 1:
+    raise ValueError(
+        "run_subgoal_condition.sh expects exactly one MASK_RATIO_LIST value. "
+        f"Got MASK_RATIO_LIST={mask_params!r}"
+    )
+
+mask_param = mask_params[0]
+assignments = {
+    "MASK_TYPE_LIST": f"[{mask_types[0]!r}]",
+    "MASK_RATIO_LIST": f"[{0 if mask_param is None else mask_param}]",
+    "SINGLE_MASK_TYPE": mask_types[0],
+    "SINGLE_MASK_PARAM": "0" if mask_param is None else format(float(mask_param), "g"),
+}
+for key, value in assignments.items():
+    print(f"{key}={shlex.quote(value)}")
+PY
+)"
+eval "$MASK_ASSIGNMENTS"
+
+export \
+  MASK_TYPE_LIST MASK_RATIO_LIST PREPROCESSED_DATA_PREFIX
+
+SINGLE_MASK_RETAIN_RATIO="1.0"
+SINGLE_MASK_SEQ_LEN="1"
+case "$SINGLE_MASK_TYPE" in
   2D_partial_trajectory|local_planner)
-    PREPROCESS_DIR_SUFFIX="${PREPROCESS_MASK_TYPE}_seq${PREPROCESS_MASK_SEQ_LEN}"
-    ;;
-  2D_video_trajectory|2D_image_trajectory)
-    PREPROCESS_DIR_SUFFIX="${PREPROCESS_MASK_TYPE}"
+    SINGLE_MASK_SEQ_LEN="${SINGLE_MASK_PARAM}"
     ;;
   *)
-    PREPROCESS_DIR_SUFFIX="${PREPROCESS_MASK_TYPE}"
+    SINGLE_MASK_RETAIN_RATIO="${SINGLE_MASK_PARAM}"
     ;;
 esac
+echo "[subgoal-mask] type=${SINGLE_MASK_TYPE}"
+echo "[subgoal-mask] ratio=${SINGLE_MASK_PARAM}"
 
+case "$SINGLE_MASK_TYPE" in
+  pose_AnyGrasp|pose_motion_planning|points|3D_points|random_mask)
+    PREPROCESS_DIR_SUFFIX="${SINGLE_MASK_TYPE}_${SINGLE_MASK_RETAIN_RATIO}"
+    ;;
+  2D_partial_trajectory|local_planner)
+    PREPROCESS_DIR_SUFFIX="${SINGLE_MASK_TYPE}_seq${SINGLE_MASK_SEQ_LEN}"
+    ;;
+  2D_video_trajectory|2D_image_trajectory)
+    PREPROCESS_DIR_SUFFIX="${SINGLE_MASK_TYPE}"
+    ;;
+  *)
+    PREPROCESS_DIR_SUFFIX="${SINGLE_MASK_TYPE}"
+    ;;
+esac
 PREPROCESSED_DATA_DIR="${PREPROCESSED_DATA_DIR:-${PREPROCESSED_ROOT_DIR}/${PREPROCESS_DIR_SUFFIX}}"
 PREPROCESSED_FILE_STEM="${PREPROCESSED_FILE_STEM:-${PREPROCESSED_DATA_PREFIX}_${PREPROCESS_DIR_SUFFIX}}"
 DEMO_PATH="${DEMO_PATH:-${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_train.h5}"
@@ -125,9 +190,9 @@ ensure_preprocessed_dataset() {
     --output-dir "$PREPROCESSED_DATA_DIR"
     --output-prefix "$PREPROCESSED_DATA_PREFIX"
     --env-id "$ENV_ID"
-    --mask-type "$PREPROCESS_MASK_TYPE"
-    --retain-ratio "$PREPROCESS_RETAIN_RATIO"
-    --mask-seq-len "$PREPROCESS_MASK_SEQ_LEN"
+    --mask-type "$SINGLE_MASK_TYPE"
+    --retain-ratio "$SINGLE_MASK_RETAIN_RATIO"
+    --mask-seq-len "$SINGLE_MASK_SEQ_LEN"
     --mask-value "$PREPROCESS_MASK_VALUE"
   )
   if [[ -n "$PREPROCESS_NUM_TRAJ" ]]; then

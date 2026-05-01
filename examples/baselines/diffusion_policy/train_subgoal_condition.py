@@ -4,6 +4,7 @@ import os
 import random
 import time
 import sys
+import json
 from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import partial
@@ -42,7 +43,12 @@ from evaluate.evaluate_subgoal_condition import evaluate
 from models.conditional_unet1d import ConditionalUnet1D
 from models.modeling_ditdp import DiTNoiseNet
 from models.plain_conv import PlainConv
-from utils.load_train_data_utils import load_demo_dataset
+from utils.control_error_utils import load_source_episode_ids
+from utils.load_eval_data_utils import (
+    load_traj_mask_type_slots,
+    load_traj_mask_types,
+)
+from utils.load_train_data_utils import load_dataset_meta, load_demo_dataset
 from utils.make_env import make_eval_envs
 from utils.split_eval_utils import (
     ensure_raw_train_eval_split,
@@ -174,6 +180,171 @@ def read_mas_max_length(data_path: str) -> int:
         return max(int(f[key]["mas"].shape[0]) for key in traj_keys)
 
 
+def summarize_label_counts(labels):
+    counts = defaultdict(int)
+    for label in labels:
+        counts[str(label)] += 1
+    return dict(sorted(counts.items(), key=lambda item: item[0]))
+
+
+def _decode_meta_string(value):
+    value = np.asarray(value)
+    if value.shape == ():
+        value = value.item()
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def load_target_mask_composition_entries(data_path: str) -> list[tuple[str, float]] | None:
+    meta = load_dataset_meta(data_path)
+    mixed_enabled = bool(np.asarray(meta.get("mixed_mask_enabled", False)).reshape(-1)[0])
+    if not mixed_enabled:
+        return None
+    if "mask_slot_name_list_json" in meta and "mask_slot_ratio_list_json" in meta:
+        labels = json.loads(_decode_meta_string(meta["mask_slot_name_list_json"]))
+        ratios = json.loads(_decode_meta_string(meta["mask_slot_ratio_list_json"]))
+        return [(str(label), float(ratio)) for label, ratio in zip(labels, ratios)]
+    if "mask_type_list_json" in meta and "mask_composition_list_json" in meta:
+        labels = json.loads(_decode_meta_string(meta["mask_type_list_json"]))
+        ratios = json.loads(_decode_meta_string(meta["mask_composition_list_json"]))
+        return [(str(label), float(ratio)) for label, ratio in zip(labels, ratios)]
+    return None
+
+
+def load_mask_assign_mode(data_path: str) -> str:
+    meta = load_dataset_meta(data_path)
+    if "mask_assign_mode" not in meta:
+        return "composition"
+    mode = _decode_meta_string(meta["mask_assign_mode"])
+    if mode not in {"composition", "one_demo_multi_mask"}:
+        raise ValueError(f"unsupported mask_assign_mode={mode!r} in {data_path}")
+    return mode
+
+
+def largest_remainder_counts(total_items: int, ratios: list[float]) -> list[int]:
+    if total_items == 0:
+        return [0 for _ in ratios]
+    raw = np.asarray(ratios, dtype=np.float64) * float(total_items)
+    counts = np.floor(raw).astype(np.int64)
+    remaining = int(total_items - int(counts.sum()))
+    if remaining > 0:
+        remainders = raw - counts.astype(np.float64)
+        order = sorted(range(len(ratios)), key=lambda idx: (-remainders[idx], idx))
+        for idx in order[:remaining]:
+            counts[idx] += 1
+    return [int(v) for v in counts.tolist()]
+
+
+def stratified_select_demo_indices(
+    labels: list[str],
+    num_select: int | None,
+    seed: int,
+    target_composition_entries: list[tuple[str, float]] | None = None,
+) -> list[int]:
+    total_items = len(labels)
+    if num_select is None or num_select >= total_items:
+        return list(range(total_items))
+    if num_select <= 0:
+        return []
+    grouped_indices = defaultdict(list)
+    for idx, label in enumerate(labels):
+        grouped_indices[str(label)].append(int(idx))
+    if target_composition_entries is None:
+        target_items = [
+            (label, len(indices) / float(total_items))
+            for label, indices in sorted(grouped_indices.items())
+        ]
+    else:
+        target_items = target_composition_entries
+    target_counts = largest_remainder_counts(
+        int(num_select), [ratio for _, ratio in target_items]
+    )
+    rng = np.random.default_rng(seed)
+    shuffled = {}
+    for label, indices in grouped_indices.items():
+        candidates = list(indices)
+        rng.shuffle(candidates)
+        shuffled[label] = candidates
+    selected = []
+    for (label, _), count in zip(target_items, target_counts):
+        candidates = shuffled[str(label)]
+        if count > len(candidates):
+            raise ValueError(
+                f"Cannot sample {count} demos for label={label!r}; only {len(candidates)} available"
+            )
+        selected.extend(candidates[:count])
+    return sorted(selected)
+
+
+def select_source_demo_indices(
+    source_episode_ids: list[int],
+    num_source_demos: int | None,
+    seed: int,
+) -> list[int]:
+    source_to_indices = defaultdict(list)
+    ordered_source_ids = []
+    for local_idx, source_episode_id in enumerate(source_episode_ids):
+        source_episode_id = int(source_episode_id)
+        if source_episode_id not in source_to_indices:
+            ordered_source_ids.append(source_episode_id)
+        source_to_indices[source_episode_id].append(int(local_idx))
+    if num_source_demos is None or num_source_demos >= len(ordered_source_ids):
+        selected_source_ids = set(ordered_source_ids)
+    elif num_source_demos <= 0:
+        selected_source_ids = set()
+    else:
+        rng = np.random.default_rng(seed)
+        shuffled_source_ids = list(ordered_source_ids)
+        rng.shuffle(shuffled_source_ids)
+        selected_source_ids = set(shuffled_source_ids[:num_source_demos])
+    selected_indices = []
+    for source_episode_id in ordered_source_ids:
+        if source_episode_id in selected_source_ids:
+            selected_indices.extend(source_to_indices[source_episode_id])
+    return sorted(selected_indices)
+
+
+def has_single_mask_label(mask_types: list[str], mask_type_slots: list[str]) -> bool:
+    labels = (
+        mask_type_slots
+        if len(mask_type_slots) == len(mask_types) and len(mask_type_slots) > 0
+        else mask_types
+    )
+    return len({str(label) for label in labels}) <= 1
+
+
+def select_subgoal_demo_indices(
+    labels: list[str],
+    mask_types: list[str],
+    mask_type_slots: list[str],
+    source_episode_ids: list[int],
+    num_select: int | None,
+    seed: int,
+    target_composition_entries: list[tuple[str, float]] | None,
+    mask_assign_mode: str,
+) -> list[int]:
+    if has_single_mask_label(mask_types, mask_type_slots):
+        total_items = len(labels)
+        if num_select is None or int(num_select) >= total_items:
+            return list(range(total_items))
+        return list(range(max(0, int(num_select))))
+    if mask_assign_mode == "composition":
+        return stratified_select_demo_indices(
+            labels=labels,
+            num_select=num_select,
+            seed=seed,
+            target_composition_entries=target_composition_entries,
+        )
+    if mask_assign_mode == "one_demo_multi_mask":
+        return select_source_demo_indices(
+            source_episode_ids=source_episode_ids,
+            num_source_demos=num_select,
+            seed=seed,
+        )
+    raise ValueError(f"unsupported mask_assign_mode={mask_assign_mode!r}")
+
+
 def build_subgoal_flat(mas, target_len: int, device=None) -> torch.Tensor:
     mas_np = np.asarray(mas, dtype=np.float32)
     if mas_np.ndim != 2 or mas_np.shape[1] < 7:
@@ -193,12 +364,14 @@ def load_eval_subgoal_data(
     device,
     mas_max_length: int,
     num_traj: Optional[int] = None,
+    traj_indices: Optional[list[int]] = None,
 ) -> dict:
     trajectories = load_demo_dataset(
         data_path,
         keys=["mas"],
         num_traj=num_traj,
         concat=False,
+        traj_indices=traj_indices,
     )
     return {
         "subgoal_flat": [
@@ -221,6 +394,7 @@ class SmallDemoDataset_SubgoalCondition(Dataset):  # Load everything into memory
         device,
         num_traj,
         mas_max_length,
+        traj_indices=None,
     ):
         self.include_rgb = include_rgb
         self.include_depth = include_depth
@@ -232,6 +406,7 @@ class SmallDemoDataset_SubgoalCondition(Dataset):  # Load everything into memory
             keys=["observations", "actions", "mas"],
             num_traj=num_traj,
             concat=False,
+            traj_indices=traj_indices,
         )
         # trajectories['observations'] is a list of dict, each dict is a traj, with keys in obs_space, values with length L+1
         # trajectories['actions'] is a list of np.ndarray (L, act_dim)
@@ -565,11 +740,41 @@ if __name__ == "__main__":
             "eval_demo_path is required for split train/eval. "
             "Pass --eval-demo-path to select eval reset seeds from an eval h5/json."
         )
-    eval_reset_kwargs_list = load_eval_reset_kwargs_list(
+    eval_mask_types_all = load_traj_mask_types(args.eval_demo_path, num_traj=None)
+    eval_mask_type_slots_all = load_traj_mask_type_slots(args.eval_demo_path, num_traj=None)
+    eval_source_episode_ids_all = load_source_episode_ids(args.eval_demo_path, num_traj=None)
+    eval_mask_assign_mode = load_mask_assign_mode(args.eval_demo_path)
+    eval_target_composition_entries = load_target_mask_composition_entries(args.eval_demo_path)
+    eval_selection_labels = (
+        eval_mask_type_slots_all
+        if len(eval_mask_type_slots_all) == len(eval_mask_types_all)
+        else eval_mask_types_all
+    )
+    eval_num_select = (
+        min(len(eval_selection_labels), args.num_eval_demos)
+        if eval_mask_assign_mode == "composition" and args.num_eval_demos is not None
+        else args.num_eval_demos
+    )
+    eval_demo_indices = select_subgoal_demo_indices(
+        labels=eval_selection_labels,
+        mask_types=eval_mask_types_all,
+        mask_type_slots=eval_mask_type_slots_all,
+        source_episode_ids=eval_source_episode_ids_all,
+        num_select=eval_num_select,
+        seed=args.seed,
+        target_composition_entries=(
+            eval_target_composition_entries
+            if eval_mask_assign_mode == "composition"
+            else None
+        ),
+        mask_assign_mode=eval_mask_assign_mode,
+    )
+    eval_reset_kwargs_all = load_eval_reset_kwargs_list(
         eval_demo_path=args.eval_demo_path,
         eval_demo_metadata_path=args.eval_demo_metadata_path,
-        num_traj=args.num_eval_demos,
+        num_traj=None,
     )
+    eval_reset_kwargs_list = [eval_reset_kwargs_all[i] for i in eval_demo_indices]
     if args.num_eval_episodes != len(eval_reset_kwargs_list):
         print(
             f"[eval-split] overriding num_eval_episodes={args.num_eval_episodes} "
@@ -588,7 +793,14 @@ if __name__ == "__main__":
         data_path=args.eval_demo_path,
         device=device,
         mas_max_length=mas_max_length,
-        num_traj=args.num_eval_demos,
+        num_traj=None,
+        traj_indices=eval_demo_indices,
+    )
+    print(
+        f"[subgoal-eval] mask_assign_mode={eval_mask_assign_mode}, "
+        f"selected_eval={len(eval_demo_indices)}, "
+        f"mask_type_counts={summarize_label_counts([eval_mask_types_all[i] for i in eval_demo_indices])}, "
+        f"mask_slot_counts={summarize_label_counts([eval_mask_type_slots_all[i] for i in eval_demo_indices])}"
     )
     print(
         f"[subgoal] mas_max_length={mas_max_length}, subgoal_dim={args.subgoal_dim}, "
@@ -654,6 +866,39 @@ if __name__ == "__main__":
     depth = include_depth
     )
 
+    train_mask_types_all = load_traj_mask_types(args.demo_path, num_traj=None)
+    train_mask_type_slots_all = load_traj_mask_type_slots(args.demo_path, num_traj=None)
+    train_source_episode_ids_all = load_source_episode_ids(args.demo_path, num_traj=None)
+    train_mask_assign_mode = load_mask_assign_mode(args.demo_path)
+    train_target_composition_entries = load_target_mask_composition_entries(args.demo_path)
+    train_selection_labels = (
+        train_mask_type_slots_all
+        if len(train_mask_type_slots_all) == len(train_mask_types_all)
+        else train_mask_types_all
+    )
+    train_demo_indices = select_subgoal_demo_indices(
+        labels=train_selection_labels,
+        mask_types=train_mask_types_all,
+        mask_type_slots=train_mask_type_slots_all,
+        source_episode_ids=train_source_episode_ids_all,
+        num_select=args.num_demos,
+        seed=args.seed,
+        target_composition_entries=(
+            train_target_composition_entries
+            if train_mask_assign_mode == "composition"
+            else None
+        ),
+        mask_assign_mode=train_mask_assign_mode,
+    )
+    selected_train_mask_types = [train_mask_types_all[i] for i in train_demo_indices]
+    selected_train_mask_type_slots = [train_mask_type_slots_all[i] for i in train_demo_indices]
+    print(
+        f"[subgoal-train] mask_assign_mode={train_mask_assign_mode}, "
+        f"selected_train={len(train_demo_indices)}, "
+        f"mask_type_counts={summarize_label_counts(selected_train_mask_types)}, "
+        f"mask_slot_counts={summarize_label_counts(selected_train_mask_type_slots)}"
+    )
+
     dataset = SmallDemoDataset_SubgoalCondition(
         data_path=args.demo_path,
         obs_process_fn=obs_process_fn,
@@ -663,8 +908,9 @@ if __name__ == "__main__":
         obs_horizon=args.obs_horizon,
         pred_horizon=args.pred_horizon,
         device=device,
-        num_traj=args.num_demos,
+        num_traj=None,
         mas_max_length=mas_max_length,
+        traj_indices=train_demo_indices,
     )
     print(
         "[denorm] training uses preprocessed normalized pd_ee_pose actions; "
