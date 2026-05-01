@@ -44,7 +44,7 @@ except ModuleNotFoundError:
         _summarize_eval_metrics,
     )
 
-from train_mas_window import (
+from train_mam import (
     build_eval_batch_indices,
     build_eval_stpm_encoder,
     validate_only_mas_eval_layout,

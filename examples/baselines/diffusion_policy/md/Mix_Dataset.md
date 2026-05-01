@@ -49,7 +49,7 @@ mask 类型说明：
   - `data_preprocess/utils/obs_utils.py`
   - `data_preprocess/utils/progress_utils.py`
   - 然后再进入 `train_mas_window.py`
-  - 训练加载时才会用到 `utils/load_train_data_utils.py`、`utils/build_progress_window_utils.py`
+  - 训练加载时才会用到 `utils/load_train_data_utils.py`、`utils/progress_utils.py`
 
 - shell 脚本阶段做的事情：
   - 先根据 `PREPROCESS_MASK_TYPE`、`PREPROCESS_RETAIN_RATIO`、`PREPROCESS_MASK_SEQ_LEN` 拼出输出目录和文件名后缀。

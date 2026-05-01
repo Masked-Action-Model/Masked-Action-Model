@@ -17,3 +17,4 @@ __pycache__/
 
 #本地文件
 dp/*
+.codex

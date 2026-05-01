@@ -1,10 +1,11 @@
-ALGO_NAME = "BC_Diffusion_rgbd_DiT_MASWindow"
+ALGO_NAME = "BC_Diffusion_rgbd_DiT_MAM"
 MAS_STEP_DIM = 8
 
 import os
 import random
 import time
 import sys
+import json
 from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import partial
@@ -31,16 +32,14 @@ from torch.utils.data.dataset import Dataset
 from torch.utils.data.sampler import BatchSampler, RandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
-from evaluate.evaluate_mas_window import evaluate_mas_window
+from evaluate.evaluate_mam import evaluate_mam
 from models.mas_conv1d import MasConv1D
 from models.mas_conv2d import MasConv
 from models.modeling_ditdp import DiTNoiseNet
 from models.plain_conv import PlainConv
-from utils.add_progress_to_mas_utils import (
+from utils.progress_utils import (
     augment_mask_with_progress,
     augment_mas_with_progress,
-)
-from utils.build_progress_window_utils import (
     build_dual_mas_window_obs_horizon,
 )
 from utils.denormalize_utils import (compute_state_min_max,
@@ -49,19 +48,19 @@ from utils.control_error_utils import (
     aggregate_control_error,
     compute_control_error_results_from_rollouts,
     load_ce_eval_data,
+    load_source_episode_ids,
 )
 from utils.draw_p_t_curve_utils import (
     save_control_error_curve,
-    save_progress_curve_for_video,
 )
 from utils.eval_video_sampling_utils import (
     build_capture_indices,
-    build_eval_batches,
     validate_eval_video_config,
 )
 from utils.load_eval_data_utils import (infer_eval_reset_seeds_from_demo,
                                   infer_eval_traj_ids_from_demo,
-                                  select_eval_demo_indices,
+                                  load_traj_mask_type_slots,
+                                  load_traj_mask_types,
                                   subset_eval_data)
 from utils.load_train_data_utils import load_dataset_meta, load_demo_dataset
 from utils.loss_utils import (
@@ -73,10 +72,6 @@ from utils.utils import (IterationBasedBatchSampler, build_state_obs_extractor,
                          convert_obs, worker_init_fn)
 from utils.video_utils import (
     clear_iteration_artifacts,
-    collect_failed_video,
-    collect_success_video,
-    delete_new_video_files,
-    snapshot_video_files,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -194,6 +189,24 @@ def policy_uses_depth(obs_mode: str) -> bool:
     raise ValueError(f"Unsupported obs_mode={obs_mode!r}; expected 'rgb' or 'rgb+depth'.")
 
 
+def build_eval_batch_indices(total_items: int, batch_size: int) -> list[list[int]]:
+    total_items = int(total_items)
+    batch_size = int(batch_size)
+    if total_items <= 0:
+        return []
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if total_items % batch_size != 0:
+        raise ValueError(
+            "total_items must be divisible by batch_size for fixed-size eval batches, "
+            f"got total_items={total_items}, batch_size={batch_size}"
+        )
+    return [
+        list(range(start, start + batch_size))
+        for start in range(0, total_items, batch_size)
+    ]
+
+
 def stpm_eval_env_obs_mode(policy_obs_mode: str) -> str:
     if policy_obs_mode not in ("rgb", "rgb+depth"):
         raise ValueError(
@@ -297,11 +310,17 @@ def _load_state_norm_stats_from_meta(meta: dict):
     )
 
 class SmallDemoDataset_MasWindowDiffusionPolicy(Dataset):  # Load everything into memory
-    def __init__(self, data_path, obs_process_fn, obs_space, device, num_traj):
+    def __init__(self, data_path, obs_process_fn, obs_space, device, num_traj, traj_indices=None):
         self.include_depth = policy_uses_depth(args.obs_mode)
 
         load_keys = ["observations", "actions", "mas", "mask", "env_states", "success", "terminated", "truncated"]
-        trajectories = load_demo_dataset(data_path, keys=load_keys, num_traj=num_traj, concat=False)
+        trajectories = load_demo_dataset(
+            data_path,
+            keys=load_keys,
+            num_traj=num_traj if traj_indices is None else None,
+            concat=False,
+            traj_indices=traj_indices,
+        )
         dataset_meta = load_dataset_meta(data_path)
         self.state_is_normalized = _meta_flag(dataset_meta, "states_normalized", False)
         print(
@@ -956,6 +975,230 @@ def save_ckpt(run_name, tag):
     )
 
 
+def summarize_label_counts(labels):
+    counts = defaultdict(int)
+    for label in labels:
+        counts[str(label)] += 1
+    return dict(sorted(counts.items(), key=lambda item: item[0]))
+
+
+def _decode_meta_string(value):
+    value = np.asarray(value)
+    if value.shape == ():
+        value = value.item()
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def load_target_mask_composition_entries(data_path: str) -> list[tuple[str, float]] | None:
+    meta = load_dataset_meta(data_path)
+    mixed_enabled = _meta_flag(meta, "mixed_mask_enabled", False)
+    if not mixed_enabled:
+        return None
+    if "mask_slot_name_list_json" in meta and "mask_slot_ratio_list_json" in meta:
+        labels = json.loads(_decode_meta_string(meta["mask_slot_name_list_json"]))
+        ratios = json.loads(_decode_meta_string(meta["mask_slot_ratio_list_json"]))
+        if len(labels) != len(ratios):
+            raise ValueError(
+                f"mask_slot_name_list_json/mask_slot_ratio_list_json length mismatch in {data_path}"
+            )
+        return [(str(label), float(ratio)) for label, ratio in zip(labels, ratios)]
+    if "mask_type_list_json" in meta and "mask_composition_list_json" in meta:
+        labels = json.loads(_decode_meta_string(meta["mask_type_list_json"]))
+        ratios = json.loads(_decode_meta_string(meta["mask_composition_list_json"]))
+        if len(labels) != len(ratios):
+            raise ValueError(
+                f"mask_type_list_json/mask_composition_list_json length mismatch in {data_path}"
+            )
+        return [(str(label), float(ratio)) for label, ratio in zip(labels, ratios)]
+    return None
+
+
+def load_mask_assign_mode(data_path: str) -> str:
+    meta = load_dataset_meta(data_path)
+    if "mask_assign_mode" not in meta:
+        return "composition"
+    mode = _decode_meta_string(meta["mask_assign_mode"])
+    if mode not in {"composition", "one_demo_multi_mask"}:
+        raise ValueError(f"unsupported mask_assign_mode={mode!r} in {data_path}")
+    return mode
+
+
+def largest_remainder_counts(total_items: int, ratios: list[float]) -> list[int]:
+    if total_items < 0:
+        raise ValueError(f"total_items must be non-negative, got {total_items}")
+    if len(ratios) == 0:
+        raise ValueError("ratios must be non-empty")
+    if total_items == 0:
+        return [0 for _ in ratios]
+    raw = np.asarray(ratios, dtype=np.float64) * float(total_items)
+    counts = np.floor(raw).astype(np.int64)
+    remaining = int(total_items - int(counts.sum()))
+    if remaining > 0:
+        remainders = raw - counts.astype(np.float64)
+        order = sorted(range(len(ratios)), key=lambda idx: (-remainders[idx], idx))
+        for idx in order[:remaining]:
+            counts[idx] += 1
+    return [int(v) for v in counts.tolist()]
+
+
+def select_source_demo_indices(
+    source_episode_ids: list[int],
+    num_source_demos: int | None,
+    seed: int,
+) -> list[int]:
+    if len(source_episode_ids) == 0:
+        return []
+
+    source_to_indices = defaultdict(list)
+    ordered_source_ids = []
+    for local_idx, source_episode_id in enumerate(source_episode_ids):
+        source_episode_id = int(source_episode_id)
+        if source_episode_id not in source_to_indices:
+            ordered_source_ids.append(source_episode_id)
+        source_to_indices[source_episode_id].append(int(local_idx))
+
+    if num_source_demos is None or num_source_demos >= len(ordered_source_ids):
+        selected_source_ids = set(ordered_source_ids)
+    elif num_source_demos <= 0:
+        selected_source_ids = set()
+    else:
+        rng = np.random.default_rng(seed)
+        shuffled_source_ids = list(ordered_source_ids)
+        rng.shuffle(shuffled_source_ids)
+        selected_source_ids = set(shuffled_source_ids[:num_source_demos])
+
+    selected_indices = []
+    for source_episode_id in ordered_source_ids:
+        if source_episode_id in selected_source_ids:
+            selected_indices.extend(source_to_indices[source_episode_id])
+    return sorted(selected_indices)
+
+
+def select_demo_indices_by_mask_assign_mode(
+    labels: list[str],
+    source_episode_ids: list[int],
+    num_select: int | None,
+    seed: int,
+    target_composition_entries: list[tuple[str, float]] | None,
+    mask_assign_mode: str,
+) -> list[int]:
+    if mask_assign_mode == "composition":
+        return stratified_select_demo_indices(
+            labels=labels,
+            num_select=num_select,
+            seed=seed,
+            target_composition_entries=target_composition_entries,
+        )
+    if mask_assign_mode == "one_demo_multi_mask":
+        return select_source_demo_indices(
+            source_episode_ids=source_episode_ids,
+            num_source_demos=num_select,
+            seed=seed,
+        )
+    raise ValueError(f"unsupported mask_assign_mode={mask_assign_mode!r}")
+
+
+def has_single_mask_label(mask_types: list[str], mask_type_slots: list[str]) -> bool:
+    labels = (
+        mask_type_slots
+        if len(mask_type_slots) == len(mask_types) and len(mask_type_slots) > 0
+        else mask_types
+    )
+    return len({str(label) for label in labels}) <= 1
+
+
+def select_first_demo_indices(total_items: int, num_select: int | None) -> list[int]:
+    if num_select is None or int(num_select) >= int(total_items):
+        return list(range(int(total_items)))
+    if int(num_select) <= 0:
+        return []
+    return list(range(int(num_select)))
+
+
+def select_mam_demo_indices(
+    labels: list[str],
+    mask_types: list[str],
+    mask_type_slots: list[str],
+    source_episode_ids: list[int],
+    num_select: int | None,
+    seed: int,
+    target_composition_entries: list[tuple[str, float]] | None,
+    mask_assign_mode: str,
+) -> list[int]:
+    if has_single_mask_label(mask_types, mask_type_slots):
+        return select_first_demo_indices(total_items=len(labels), num_select=num_select)
+    return select_demo_indices_by_mask_assign_mode(
+        labels=labels,
+        source_episode_ids=source_episode_ids,
+        num_select=num_select,
+        seed=seed,
+        target_composition_entries=target_composition_entries,
+        mask_assign_mode=mask_assign_mode,
+    )
+
+
+def stratified_select_demo_indices(
+    labels: list[str],
+    num_select: int | None,
+    seed: int,
+    target_composition_entries: list[tuple[str, float]] | None = None,
+) -> list[int]:
+    total_items = len(labels)
+    if num_select is None or num_select >= total_items:
+        return list(range(total_items))
+    if num_select <= 0:
+        return []
+
+    grouped_indices = defaultdict(list)
+    for idx, label in enumerate(labels):
+        grouped_indices[str(label)].append(int(idx))
+
+    if target_composition_entries is None:
+        ordered_labels = sorted(grouped_indices.keys())
+        target_items = [
+            (label, len(grouped_indices[label]) / float(total_items))
+            for label in ordered_labels
+        ]
+    else:
+        target_items = []
+        for label, composition in target_composition_entries:
+            label = str(label)
+            if label not in grouped_indices:
+                raise ValueError(
+                    f"label={label!r} from meta composition not found in dataset selection"
+                )
+            target_items.append((label, float(composition)))
+
+    target_counts = largest_remainder_counts(
+        num_select, [ratio for _, ratio in target_items]
+    )
+    rng = np.random.default_rng(seed)
+    shuffled_grouped_indices = {}
+    for label, candidates in grouped_indices.items():
+        shuffled_candidates = list(candidates)
+        rng.shuffle(shuffled_candidates)
+        shuffled_grouped_indices[label] = shuffled_candidates
+
+    selected = []
+    for (label, _), target_count in zip(target_items, target_counts):
+        candidates = shuffled_grouped_indices[label]
+        if target_count > len(candidates):
+            raise ValueError(
+                f"Cannot sample {target_count} demos for label={label!r}; "
+                f"only {len(candidates)} available"
+            )
+        selected.extend(candidates[:target_count])
+        del candidates[:target_count]
+
+    if len(selected) != num_select:
+        raise AssertionError(
+            f"stratified selection size mismatch: expected {num_select}, got {len(selected)}"
+        )
+    return sorted(selected)
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
 
@@ -1010,13 +1253,21 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    print(
+        "[runtime] "
+        f"torch_device={device}, "
+        f"cuda_enabled={args.cuda}, "
+        f"cuda_available={torch.cuda.is_available()}, "
+        f"eval_sim_backend={args.sim_backend}, "
+        f"num_eval_envs={args.num_eval_envs}"
+    )
 
     # ------------------------------------------------------------------------ #
     # 2. Evaluation demo alignment: demo path, reset seeds, traj ids, subsets
     # ------------------------------------------------------------------------ #
     if args.test_demo_path is None:
         raise ValueError(
-            "train_mas_window.py requires --test-demo-path. "
+            "train_mam.py requires --test-demo-path. "
             "Evaluation must use an explicit eval demo dataset and cannot reuse demo_path."
         )
     eval_demo_path = args.test_demo_path
@@ -1028,6 +1279,20 @@ if __name__ == "__main__":
     eval_traj_ids = infer_eval_traj_ids_from_demo(
         eval_demo_path, num_traj=None
     )
+    eval_mask_types_all = load_traj_mask_types(
+        eval_demo_path,
+        num_traj=None,
+    )
+    eval_mask_type_slots_all = load_traj_mask_type_slots(
+        eval_demo_path,
+        num_traj=None,
+    )
+    eval_source_episode_ids_all = load_source_episode_ids(
+        eval_demo_path,
+        num_traj=None,
+    )
+    eval_mask_assign_mode = load_mask_assign_mode(eval_demo_path)
+    eval_target_composition_entries = load_target_mask_composition_entries(eval_demo_path)
     if len(eval_reset_seeds) == 0:
         raise ValueError(
             "Failed to infer evaluation reset seeds from eval demo metadata. "
@@ -1035,9 +1300,29 @@ if __name__ == "__main__":
         )
     print(f"[seed-infer] auto inferred {len(eval_reset_seeds)} eval seeds")
     total_eval_demos = len(eval_traj_ids) if len(eval_traj_ids) > 0 else len(eval_reset_seeds)
-    eval_demo_indices = select_eval_demo_indices(
-        total_demos=total_eval_demos,
-        num_eval_demos=args.num_eval_demos,
+    eval_selection_labels = (
+        eval_mask_type_slots_all
+        if len(eval_mask_type_slots_all) == len(eval_mask_types_all)
+        else eval_mask_types_all
+    )
+    eval_num_select = (
+        min(total_eval_demos, args.num_eval_demos)
+        if eval_mask_assign_mode == "composition"
+        else args.num_eval_demos
+    )
+    eval_demo_indices = select_mam_demo_indices(
+        labels=eval_selection_labels[:total_eval_demos],
+        mask_types=eval_mask_types_all[:total_eval_demos],
+        mask_type_slots=eval_mask_type_slots_all[:total_eval_demos],
+        source_episode_ids=eval_source_episode_ids_all[:total_eval_demos],
+        num_select=eval_num_select,
+        seed=args.seed,
+        target_composition_entries=(
+            eval_target_composition_entries
+            if eval_mask_assign_mode == "composition"
+            else None
+        ),
+        mask_assign_mode=eval_mask_assign_mode,
     )
     if len(eval_reset_seeds) > 0:
         eval_reset_seeds = [
@@ -1058,9 +1343,10 @@ if __name__ == "__main__":
         capture_video_freq=args.capture_video_freq,
     )
     print(
-        f"[mas-window] num_demos={args.num_demos}, demo_path={args.demo_path}, "
+        f"[mam] num_demos={args.num_demos}, demo_path={args.demo_path}, "
         f"test_demo_path={args.test_demo_path}, eval_demo_path={eval_demo_path}, "
         f"eval_demo_metadata_path={args.eval_demo_metadata_path}, "
+        f"eval_mask_assign_mode={eval_mask_assign_mode}, "
         f"eval_demo_indices={eval_demo_indices}, "
         f"eval_reset_seeds={eval_reset_seeds if len(eval_reset_seeds) > 0 else None}, "
         f"eval_traj_ids={eval_traj_ids if len(eval_traj_ids) > 0 else None}, "
@@ -1149,12 +1435,48 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------------ #
     # 6. Load training dataset and dataloader
     # ------------------------------------------------------------------------ #
+    train_mask_types_all = load_traj_mask_types(
+        data_path=args.demo_path,
+        num_traj=None,
+    )
+    train_mask_type_slots_all = load_traj_mask_type_slots(
+        data_path=args.demo_path,
+        num_traj=None,
+    )
+    train_source_episode_ids_all = load_source_episode_ids(
+        data_path=args.demo_path,
+        num_traj=None,
+    )
+    train_mask_assign_mode = load_mask_assign_mode(args.demo_path)
+    train_target_composition_entries = load_target_mask_composition_entries(args.demo_path)
+    train_selection_labels = (
+        train_mask_type_slots_all
+        if len(train_mask_type_slots_all) == len(train_mask_types_all)
+        else train_mask_types_all
+    )
+    train_demo_indices = select_mam_demo_indices(
+        labels=train_selection_labels,
+        mask_types=train_mask_types_all,
+        mask_type_slots=train_mask_type_slots_all,
+        source_episode_ids=train_source_episode_ids_all,
+        num_select=args.num_demos,
+        seed=args.seed,
+        target_composition_entries=(
+            train_target_composition_entries
+            if train_mask_assign_mode == "composition"
+            else None
+        ),
+        mask_assign_mode=train_mask_assign_mode,
+    )
+    selected_train_mask_types = [train_mask_types_all[i] for i in train_demo_indices]
+    selected_train_mask_type_slots = [train_mask_type_slots_all[i] for i in train_demo_indices]
     dataset = SmallDemoDataset_MasWindowDiffusionPolicy(
         data_path=args.demo_path,
         obs_process_fn=obs_process_fn,
         obs_space=orignal_obs_space,
         device=device,
-        num_traj=args.num_demos,
+        num_traj=None,
+        traj_indices=train_demo_indices,
     )
 
     dataset.debug_print_sample(0)
@@ -1180,6 +1502,23 @@ if __name__ == "__main__":
     )
     if len(eval_demo_indices) > 0:
         eval_mam_data = subset_eval_data(eval_mam_data, eval_demo_indices)
+    eval_mask_type_counts = summarize_label_counts(eval_mam_data.get("mask_types", []))
+    eval_mask_slot_counts = summarize_label_counts(eval_mam_data.get("mask_type_slots", []))
+    train_mask_type_counts = summarize_label_counts(selected_train_mask_types)
+    train_mask_slot_counts = summarize_label_counts(selected_train_mask_type_slots)
+    train_total_mask_type_counts = summarize_label_counts(train_mask_types_all)
+    train_total_mask_slot_counts = summarize_label_counts(train_mask_type_slots_all)
+    print(f"[mam-train] train mask type counts: {train_mask_type_counts}")
+    print(f"[mam-train] train mask slot counts: {train_mask_slot_counts}")
+    print(f"[mam-train] train total mask type counts: {train_total_mask_type_counts}")
+    print(f"[mam-train] train total mask slot counts: {train_total_mask_slot_counts}")
+    print(f"[mam-train] eval mask type counts: {eval_mask_type_counts}")
+    print(f"[mam-train] eval mask slot counts: {eval_mask_slot_counts}")
+    print(
+        f"[mam-train] mask_assign_mode: train={train_mask_assign_mode}, "
+        f"eval={eval_mask_assign_mode}, selected_train={len(train_demo_indices)}, "
+        f"selected_eval={len(eval_demo_indices)}"
+    )
 
     # ------------------------------------------------------------------------ #
     # 8. Build agent, EMA agent, optimizer, and LR scheduler
@@ -1226,152 +1565,82 @@ if __name__ == "__main__":
             last_tick = time.time()
             ema.copy_to(ema_agent.parameters())
             ce_summary = None
+            per_mask_type_summary = {}
+            per_mask_slot_summary = {}
             if args.capture_video:
                 clear_iteration_artifacts(video_dir=video_dir, iteration=iteration)
-            if len(eval_reset_seeds) > 0:
-                eval_metrics = defaultdict(list)
-                per_traj_ce_results = []
-                eval_batches = build_eval_batches(
-                    len(eval_reset_seeds),
-                    args.num_eval_envs,
-                    capture_indices=capture_indices if args.capture_video else None,
-                )
-                for eval_batch in eval_batches:
-                    batch_indices = eval_batch.indices
-                    valid_batch_size = eval_batch.valid_count
-                    should_save_eval_artifacts = (
-                        args.capture_video and eval_batch.capture_index is not None
-                    )
-                    video_snapshot = None
-                    if args.capture_video:
-                        video_snapshot = snapshot_video_files(video_dir)
-                    batch_reset_seeds = [eval_reset_seeds[idx] for idx in batch_indices]
-                    one_eval_data = subset_eval_data(eval_mam_data, batch_indices)
-                    one_eval_result = evaluate_mas_window(
-                        valid_batch_size,
-                        ema_agent,
-                        envs,
-                        device,
-                        args.sim_backend,
-                        eval_mas_window_data=one_eval_data,
-                        obs_horizon=args.obs_horizon,
-                        long_window_horizon=(
-                            args.long_window_horizon if args.mas_long_conv_output_dim > 0 else 0
-                        ),
-                        long_window_backward_length=(
-                            args.long_window_backward_length if args.mas_long_conv_output_dim > 0 else 0
-                        ),
-                        long_window_forward_length=(
-                            args.long_window_forward_length if args.mas_long_conv_output_dim > 0 else 0
-                        ),
-                        short_window_horizon=args.short_window_horizon,
-                        stpm_encoder=stpm_encoder,
-                        stpm_n_obs_steps=stpm_n_obs_steps,
-                        stpm_frame_gap=stpm_frame_gap,
-                        progress_bar=args.eval_progress_bar,
-                        reset_seeds=batch_reset_seeds,
-                        return_progress_curves=should_save_eval_artifacts,
-                        return_rollout_records=True,
-                        inpainting=args.inpainting,
-                    )
-                    if should_save_eval_artifacts:
-                        one_metrics, progress_curve_records, batch_rollout_records = one_eval_result
-                    else:
-                        one_metrics, batch_rollout_records = one_eval_result
-                        progress_curve_records = None
-                    valid_batch_indices = batch_indices[:valid_batch_size]
-                    valid_eval_data = subset_eval_data(eval_mam_data, valid_batch_indices)
-                    valid_rollout_records = batch_rollout_records[:valid_batch_size]
-                    per_traj_ce_results.extend(
-                        compute_control_error_results_from_rollouts(
-                            eval_data=valid_eval_data,
-                            rollout_records=valid_rollout_records,
-                            action_min=denorm_mins,
-                            action_max=denorm_maxs,
-                            save_per_traj=False,
-                        )
-                    )
-                    if args.capture_video:
-                        if should_save_eval_artifacts:
-                            recorded_env_idx = 0
-                            local_idx = int(eval_batch.capture_index)
-                            success_at_end = bool(
-                                np.asarray(one_metrics["success_at_end"]).reshape(-1)[recorded_env_idx]
-                            )
-                            if success_at_end:
-                                archived_video_path = collect_success_video(
-                                    video_dir=video_dir,
-                                    previous_snapshot=video_snapshot,
-                                    iteration=iteration,
-                                    demo_idx=eval_traj_ids[local_idx],
-                                )
-                            else:
-                                archived_video_path = collect_failed_video(
-                                    video_dir=video_dir,
-                                    previous_snapshot=video_snapshot,
-                                    iteration=iteration,
-                                    demo_idx=eval_traj_ids[local_idx],
-                                )
-                            if (
-                                archived_video_path is not None
-                                and progress_curve_records is not None
-                                and recorded_env_idx < len(progress_curve_records)
-                            ):
-                                save_progress_curve_for_video(
-                                    video_path=archived_video_path,
-                                    video_dir=video_dir,
-                                    timesteps=progress_curve_records[recorded_env_idx]["steps"],
-                                    progress=progress_curve_records[recorded_env_idx]["progress"],
-                                )
-                        else:
-                            delete_new_video_files(video_dir, video_snapshot)
-                    for k, v in one_metrics.items():
-                        metric_values = np.asarray(v).reshape(-1)[:valid_batch_size]
-                        eval_metrics[k].extend(metric_values.tolist())
-                for k in list(eval_metrics.keys()):
-                    eval_metrics[k] = np.asarray(eval_metrics[k])
-                ce_summary = aggregate_control_error(per_traj_ce_results)
+            mam_eval_result = evaluate_mam(
+                args.num_eval_episodes,
+                ema_agent,
+                envs,
+                device,
+                args.sim_backend,
+                eval_mas_window_data=eval_mam_data,
+                obs_horizon=args.obs_horizon,
+                long_window_horizon=(
+                    args.long_window_horizon if args.mas_long_conv_output_dim > 0 else 0
+                ),
+                long_window_backward_length=(
+                    args.long_window_backward_length if args.mas_long_conv_output_dim > 0 else 0
+                ),
+                long_window_forward_length=(
+                    args.long_window_forward_length if args.mas_long_conv_output_dim > 0 else 0
+                ),
+                short_window_horizon=args.short_window_horizon,
+                stpm_encoder=stpm_encoder,
+                stpm_n_obs_steps=stpm_n_obs_steps,
+                stpm_frame_gap=stpm_frame_gap,
+                progress_bar=args.eval_progress_bar,
+                reset_seeds=eval_reset_seeds if len(eval_reset_seeds) > 0 else None,
+                return_progress_curves=args.capture_video,
+                return_rollout_records=True,
+                capture_indices=capture_indices if args.capture_video else None,
+                video_dir=video_dir if args.capture_video else None,
+                iteration=iteration,
+                eval_traj_ids=eval_traj_ids if len(eval_traj_ids) > 0 else None,
+                inpainting=args.inpainting,
+            )
+            if args.capture_video:
+                (
+                    eval_metrics,
+                    per_mask_type_summary,
+                    per_mask_slot_summary,
+                    progress_curve_records,
+                    rollout_records,
+                ) = mam_eval_result
             else:
-                eval_metrics, rollout_records = evaluate_mas_window(
-                    args.num_eval_episodes,
-                    ema_agent,
-                    envs,
-                    device,
-                    args.sim_backend,
-                    eval_mas_window_data=eval_mam_data,
-                    obs_horizon=args.obs_horizon,
-                    long_window_horizon=(
-                        args.long_window_horizon if args.mas_long_conv_output_dim > 0 else 0
-                    ),
-                    long_window_backward_length=(
-                        args.long_window_backward_length if args.mas_long_conv_output_dim > 0 else 0
-                    ),
-                    long_window_forward_length=(
-                        args.long_window_forward_length if args.mas_long_conv_output_dim > 0 else 0
-                    ),
-                    short_window_horizon=args.short_window_horizon,
-                    stpm_encoder=stpm_encoder,
-                    stpm_n_obs_steps=stpm_n_obs_steps,
-                    stpm_frame_gap=stpm_frame_gap,
-                    progress_bar=args.eval_progress_bar,
-                    return_rollout_records=True,
-                    inpainting=args.inpainting,
+                (
+                    eval_metrics,
+                    per_mask_type_summary,
+                    per_mask_slot_summary,
+                    rollout_records,
+                ) = mam_eval_result
+                progress_curve_records = None
+            ce_summary = aggregate_control_error(
+                compute_control_error_results_from_rollouts(
+                    eval_data=eval_mam_data,
+                    rollout_records=rollout_records,
+                    action_min=denorm_mins,
+                    action_max=denorm_maxs,
+                    save_per_traj=False,
                 )
-                ce_summary = aggregate_control_error(
-                    compute_control_error_results_from_rollouts(
-                        eval_data=eval_mam_data,
-                        rollout_records=rollout_records,
-                        action_min=denorm_mins,
-                        action_max=denorm_maxs,
-                        save_per_traj=False,
-                    )
-                )
+            )
             timings["eval"] += time.time() - last_tick
 
             for k, v in eval_metrics.items():
                 metric_value = float(np.mean(v)) if isinstance(v, np.ndarray) else float(v)
                 writer.add_scalar(f"eval/{k}", metric_value, iteration)
                 print(f"{k}: {metric_value:.6f}")
+            for mask_type, one_summary in per_mask_type_summary.items():
+                for key, value in one_summary.items():
+                    metric_value = float(value)
+                    writer.add_scalar(f"eval_by_mask_type/{mask_type}/{key}", metric_value, iteration)
+                    print(f"[{mask_type}] {key}: {metric_value:.6f}")
+            for mask_slot, one_summary in per_mask_slot_summary.items():
+                for key, value in one_summary.items():
+                    metric_value = float(value)
+                    writer.add_scalar(f"eval_by_mask_slot/{mask_slot}/{key}", metric_value, iteration)
+                    print(f"[{mask_slot}] {key}: {metric_value:.6f}")
             if ce_summary is not None:
                 for k in ["ce_all", "ce_success", "ce_failed"]:
                     metric_value = float(ce_summary[k])

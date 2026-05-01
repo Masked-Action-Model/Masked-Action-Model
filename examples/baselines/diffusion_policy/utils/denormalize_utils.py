@@ -1,26 +1,13 @@
 from typing import List
 
-import numpy as np
 import torch
 
 try:
-    from data_preprocess.utils.normalize_utils import load_action_stats_from_path
+    from utils.split_eval_utils import load_action_denorm_stats
 except ModuleNotFoundError:
-    from examples.baselines.diffusion_policy.data_preprocess.utils.normalize_utils import (
-        load_action_stats_from_path,
+    from examples.baselines.diffusion_policy.utils.split_eval_utils import (
+        load_action_denorm_stats,
     )
-
-
-def load_action_denorm_stats(action_norm_path: str):
-    if action_norm_path is None or len(action_norm_path.strip()) == 0:
-        raise ValueError(
-            "action_norm_path is required. Please pass --action-norm-path to provide min/max for denormalization."
-        )
-    mins, maxs = load_action_stats_from_path(action_norm_path)
-    print(
-        f"[denorm] loaded action norm stats from {action_norm_path}, dims={mins.shape[0]}"
-    )
-    return mins, maxs
 
 
 def compute_state_min_max(state_traj_list: List[torch.Tensor]):

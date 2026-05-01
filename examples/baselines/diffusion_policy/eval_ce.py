@@ -12,7 +12,7 @@ import torch
 import tyro
 from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
 
-from train_mas_window import (
+from train_mam import (
     MAS_STEP_DIM,
     Agent,
     _load_state_norm_stats_from_meta,

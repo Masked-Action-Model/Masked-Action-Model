@@ -98,7 +98,7 @@ python examples/baselines/diffusion_policy/train_only_mas.py ...
 - `build_progress_column(traj_len, mas_len, device) -> (mas_len, 1)`
 - `augment_mas_with_progress(mas_t, traj_len) -> (T, 8)`
 这两个函数现在单独位于：
-- `examples/baselines/diffusion_policy/utils/add_progress_to_mas_utils.py`
+- `examples/baselines/diffusion_policy/utils/progress_utils.py`
 逻辑：
 1. 用 `traj_len=L` 在 `[0, 1]` 之间线性生成 progress
 2. 如果 `traj_len < T`，剩余 padding 部分全部补成 `1.0`

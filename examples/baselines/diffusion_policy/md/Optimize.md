@@ -619,7 +619,7 @@ inferencetime：
    - 未显式传 `long_window_forward_length` 时，默认使用 `pred_horizon`，因此默认仍等价于原 forward-only 逻辑。
 
 2. 修改范围：
-   - `utils/build_progress_window_utils.py`
+   - `utils/progress_utils.py`
      - 新增 `build_mas_window_around_step(...)`。
      - `build_mas_long_window_from_future(...)` 支持 backward/forward 参数。
      - `build_dual_mas_window_obs_horizon(...)` 支持双向 long window。

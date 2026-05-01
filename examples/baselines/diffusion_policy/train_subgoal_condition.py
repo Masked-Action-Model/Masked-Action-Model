@@ -1,4 +1,4 @@
-ALGO_NAME = "BC_Diffusion_rgbd_Baseline"
+ALGO_NAME = "BC_Diffusion_rgbd_SubgoalCondition"
 
 import os
 import random
@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Literal, Optional
 
 import gymnasium as gym
+import h5py
 from gymnasium.vector.vector_env import VectorEnv
 import numpy as np
 import torch
@@ -37,11 +38,7 @@ BASELINE_ROOT = Path(__file__).resolve().parent
 if str(BASELINE_ROOT) not in sys.path:
     sys.path.insert(0, str(BASELINE_ROOT))
 
-from data_preprocess.utils.normalize_utils import (
-    compute_global_min_max,
-    normalize_selected_dims,
-)
-from evaluate.evaluate_baseline import evaluate
+from evaluate.evaluate_subgoal_condition import evaluate
 from models.conditional_unet1d import ConditionalUnet1D
 from models.modeling_ditdp import DiTNoiseNet
 from models.plain_conv import PlainConv
@@ -51,7 +48,6 @@ from utils.split_eval_utils import (
     ensure_raw_train_eval_split,
     load_action_denorm_stats,
     load_eval_reset_kwargs_list,
-    save_action_norm_stats,
 )
 from utils.utils import (IterationBasedBatchSampler, build_state_obs_extractor,
                          convert_obs, worker_init_fn)
@@ -118,8 +114,10 @@ class Args:
         16  # 16->8 leads to worse performance, maybe it is like generate a half image; 16->32, improvement is very marginal
     )
     diffusion_step_embed_dim: int = 64  # not very important
-    noise_model: Literal["Transformer", "Unet"] = "Transformer"
-    """denoiser backbone. Transformer uses DiTNoiseNet; Unet uses ConditionalUnet1D."""
+    noise_model: Literal["Transformer"] = "Transformer"
+    """denoiser backbone. Subgoal condition only supports DiTNoiseNet."""
+    subgoal_dim: int = 0
+    """flattened padded MAS condition dim, resolved from train/eval datasets at runtime."""
     unet_dims: List[int] = field(default_factory=lambda: [64, 128, 256])
     """UNet channel dimensions, used only when noise_model=Unet."""
     n_groups: int = 8
@@ -165,7 +163,52 @@ def reorder_keys(d, ref_dict):
     return out
 
 
-class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
+def read_mas_max_length(data_path: str) -> int:
+    with h5py.File(data_path, "r") as f:
+        traj_keys = sorted(
+            [key for key in f.keys() if key.startswith("traj_")],
+            key=lambda x: int(x.split("_")[-1]),
+        )
+        if len(traj_keys) == 0:
+            raise ValueError(f"no traj_* found in dataset: {data_path}")
+        return max(int(f[key]["mas"].shape[0]) for key in traj_keys)
+
+
+def build_subgoal_flat(mas, target_len: int, device=None) -> torch.Tensor:
+    mas_np = np.asarray(mas, dtype=np.float32)
+    if mas_np.ndim != 2 or mas_np.shape[1] < 7:
+        raise ValueError(f"expected mas shape (T, >=7), got {mas_np.shape}")
+    if mas_np.shape[0] > target_len:
+        raise ValueError(f"mas length {mas_np.shape[0]} exceeds target_len={target_len}")
+    padded = np.zeros((target_len, 7), dtype=np.float32)
+    padded[: mas_np.shape[0], :] = mas_np[:, :7]
+    tensor = torch.from_numpy(padded.reshape(-1))
+    if device is not None:
+        tensor = tensor.to(device=device)
+    return tensor
+
+
+def load_eval_subgoal_data(
+    data_path: str,
+    device,
+    mas_max_length: int,
+    num_traj: Optional[int] = None,
+) -> dict:
+    trajectories = load_demo_dataset(
+        data_path,
+        keys=["mas"],
+        num_traj=num_traj,
+        concat=False,
+    )
+    return {
+        "subgoal_flat": [
+            build_subgoal_flat(mas, target_len=mas_max_length, device=device)
+            for mas in trajectories["mas"]
+        ]
+    }
+
+
+class SmallDemoDataset_SubgoalCondition(Dataset):  # Load everything into memory
     def __init__(
         self,
         data_path,
@@ -177,15 +220,19 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         pred_horizon,
         device,
         num_traj,
-        action_norm_path=None,
+        mas_max_length,
     ):
         self.include_rgb = include_rgb
         self.include_depth = include_depth
-        self.action_min = None
-        self.action_max = None
-        self.action_norm_path = None
+        self.mas_max_length = int(mas_max_length)
+        self.subgoal_dim = self.mas_max_length * 7
 
-        trajectories = load_demo_dataset(data_path, num_traj=num_traj, concat=False)
+        trajectories = load_demo_dataset(
+            data_path,
+            keys=["observations", "actions", "mas"],
+            num_traj=num_traj,
+            concat=False,
+        )
         # trajectories['observations'] is a list of dict, each dict is a traj, with keys in obs_space, values with length L+1
         # trajectories['actions'] is a list of np.ndarray (L, act_dim)
         print("Raw trajectory loaded, beginning observation pre-processing...")
@@ -203,32 +250,18 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             obs_traj_dict_list.append(_obs_traj_dict)
         trajectories["observations"] = obs_traj_dict_list
         self.obs_keys = list(_obs_traj_dict.keys())
-        raw_actions = [np.asarray(action, dtype=np.float32) for action in trajectories["actions"]]
-        if action_norm_path is not None and len(action_norm_path.strip()) > 0:
-            action_min, action_max = load_action_denorm_stats(action_norm_path)
-            self.action_norm_path = action_norm_path
-            print(f"[action_norm] using provided stats: {action_norm_path}")
-        else:
-            action_min, action_max = compute_global_min_max(raw_actions)
-            self.action_norm_path = os.path.splitext(data_path)[0] + ".action_norm.json"
-            save_action_norm_stats(self.action_norm_path, action_min, action_max)
-            print(
-                f"[action_norm] computed stats from dataset and saved to {self.action_norm_path}"
-            )
-        self.action_min = np.asarray(action_min, dtype=np.float32)
-        self.action_max = np.asarray(action_max, dtype=np.float32)
-        print(f"[action_norm] min={self.action_min}")
-        print(f"[action_norm] max={self.action_max}")
-
-        # Pre-process the actions into normalized space for training.
-        for i, action in enumerate(raw_actions):
-            normalized_action = normalize_selected_dims(
-                action,
-                mins=self.action_min,
-                maxs=self.action_max,
-            )
-            trajectories["actions"][i] = torch.from_numpy(normalized_action).to(device=device)
-        print("Obs/action pre-processing is done, start to pre-compute the slice indices...")
+        for i, action in enumerate(trajectories["actions"]):
+            trajectories["actions"][i] = torch.from_numpy(
+                np.asarray(action, dtype=np.float32)
+            ).to(device=device)
+        trajectories["subgoal_flat"] = [
+            build_subgoal_flat(mas, target_len=self.mas_max_length, device=device)
+            for mas in trajectories["mas"]
+        ]
+        print(
+            "Obs/action/subgoal pre-processing is done, "
+            "start to pre-compute the slice indices..."
+        )
 
          # Fixed to pd_ee_pose: pad with final action to keep target unchanged.
         print("Using fixed control mode pd_ee_pose, padding with final action.")
@@ -286,6 +319,9 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
                     # repeat the first frame for visual obs to avoid uint8 underflow/overflow
                     pad_obs_seq = torch.stack([obs_seq[k][0]] * pad_len, dim=0)
                     obs_seq[k] = torch.cat((pad_obs_seq, obs_seq[k]), dim=0)
+        obs_seq["subgoal"] = self.trajectories["subgoal_flat"][traj_idx].unsqueeze(0).repeat(
+            self.obs_horizon, 1
+        )
 
         # Slice action window directly from full trajectory length.
         act_seq = self.trajectories["actions"][traj_idx][max(0, start) : end]
@@ -343,9 +379,14 @@ class Agent(nn.Module):
         self.noise_model = args.noise_model
         assert (len(env.single_observation_space["state"].shape) == 2)  # (obs_horizon, obs_dim)
         assert len(env.single_action_space.shape) == 1  # (act_dim, )
+        if args.noise_model != "Transformer":
+            raise ValueError("Subgoal condition only supports noise_model='Transformer'")
 
         self.act_dim = env.single_action_space.shape[0]
         obs_state_dim = env.single_observation_space["state"].shape[1]
+        subgoal_dim = int(args.subgoal_dim)
+        if subgoal_dim <= 0:
+            raise ValueError("args.subgoal_dim must be resolved before building Agent")
         total_visual_channels = 0
         self.include_rgb = "rgb" in env.single_observation_space.keys()
         self.include_depth = "depth" in env.single_observation_space.keys()
@@ -359,24 +400,13 @@ class Agent(nn.Module):
         self.visual_encoder = PlainConv(
             in_channels=total_visual_channels, out_dim=visual_feature_dim, pool_feature_map=True
         )
-        if args.noise_model == "Transformer":
-            self.noise_pred_net = DiTNoiseNet(
-                ac_dim=self.act_dim,
-                ac_chunk=self.pred_horizon,
-                obs_dim=visual_feature_dim + obs_state_dim,
-                time_dim=args.diffusion_step_embed_dim,
-                use_mask=False,
-            )
-        elif args.noise_model == "Unet":
-            self.noise_pred_net = ConditionalUnet1D(
-                input_dim=self.act_dim,
-                global_cond_dim=self.obs_horizon * (visual_feature_dim + obs_state_dim),
-                diffusion_step_embed_dim=args.diffusion_step_embed_dim,
-                down_dims=args.unet_dims,
-                n_groups=args.n_groups,
-            )
-        else:
-            raise ValueError(f"unsupported noise_model={args.noise_model!r}")
+        self.noise_pred_net = DiTNoiseNet(
+            ac_dim=self.act_dim,
+            ac_chunk=self.pred_horizon,
+            obs_dim=visual_feature_dim + obs_state_dim + subgoal_dim,
+            time_dim=args.diffusion_step_embed_dim,
+            use_mask=False,
+        )
         self.num_diffusion_iters = 100
         self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=self.num_diffusion_iters,
@@ -410,7 +440,10 @@ class Agent(nn.Module):
             img_seq = self.aug(img_seq)  # (B*obs_horizon, C, H, W)
         visual_feature = self.visual_encoder(img_seq)  # (B*obs_horizon, D)
         visual_feature = visual_feature.reshape(batch_size, self.obs_horizon, visual_feature.shape[1])  # (B, obs_horizon, D)
-        feature = torch.cat((visual_feature, obs_seq["state"]), dim=-1)  # (B, obs_horizon, D+obs_state_dim)
+        feature = torch.cat(
+            (visual_feature, obs_seq["state"], obs_seq["subgoal"]),
+            dim=-1,
+        )
         return feature  # (B, obs_horizon, D+obs_state_dim)
 
     def prepare_noise_condition(self, obs_cond):
@@ -508,7 +541,11 @@ def save_ckpt(run_name, tag):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    ensure_raw_train_eval_split(args)
+    if args.raw_demo_h5 is not None and len(args.raw_demo_h5.strip()) > 0:
+        raise ValueError(
+            "Subgoal condition expects preprocessed single-mask datasets. "
+            "Use run_subgoal_condition.sh to generate demo/eval h5 files."
+        )
 
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
@@ -540,6 +577,23 @@ if __name__ == "__main__":
         )
         args.num_eval_episodes = len(eval_reset_kwargs_list)
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    mas_max_length = max(
+        read_mas_max_length(args.demo_path),
+        read_mas_max_length(args.eval_demo_path),
+    )
+    args.subgoal_dim = mas_max_length * 7
+    action_norm_path = args.action_norm_path or args.demo_path
+    denorm_mins, denorm_maxs = load_action_denorm_stats(action_norm_path)
+    eval_subgoal_data = load_eval_subgoal_data(
+        data_path=args.eval_demo_path,
+        device=device,
+        mas_max_length=mas_max_length,
+        num_traj=args.num_eval_demos,
+    )
+    print(
+        f"[subgoal] mas_max_length={mas_max_length}, subgoal_dim={args.subgoal_dim}, "
+        f"action_norm_path={action_norm_path}"
+    )
 
     # create evaluation environment
     env_kwargs = dict(
@@ -600,7 +654,7 @@ if __name__ == "__main__":
     depth = include_depth
     )
 
-    dataset = SmallDemoDataset_DiffusionPolicy(
+    dataset = SmallDemoDataset_SubgoalCondition(
         data_path=args.demo_path,
         obs_process_fn=obs_process_fn,
         obs_space=orignal_obs_space,
@@ -610,12 +664,11 @@ if __name__ == "__main__":
         pred_horizon=args.pred_horizon,
         device=device,
         num_traj=args.num_demos,
-        action_norm_path=args.action_norm_path,
+        mas_max_length=mas_max_length,
     )
-    denorm_mins = dataset.action_min
-    denorm_maxs = dataset.action_max
     print(
-        f"[denorm] training uses normalized pd_ee_pose actions; rollout will denormalize with {dataset.action_norm_path}"
+        "[denorm] training uses preprocessed normalized pd_ee_pose actions; "
+        f"rollout will denormalize with {action_norm_path}"
     )
     debug_sample_idx = 0
     print("Debug printing a sample from the dataset...")
@@ -669,6 +722,7 @@ if __name__ == "__main__":
                 device,
                 args.sim_backend,
                 reset_kwargs_list=eval_reset_kwargs_list,
+                eval_subgoal_data=eval_subgoal_data,
             )
             timings["eval"] += time.time() - last_tick
 

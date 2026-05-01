@@ -7,7 +7,7 @@ import torch
 from h5py import File
 
 try:
-    from utils.add_progress_to_mas_utils import (
+    from utils.progress_utils import (
         augment_mask_with_progress,
         augment_mas_with_progress,
         pad_mas_to_length,
@@ -15,7 +15,7 @@ try:
     )
     from utils.load_train_data_utils import load_demo_dataset
 except ModuleNotFoundError:
-    from examples.baselines.diffusion_policy.utils.add_progress_to_mas_utils import (
+    from examples.baselines.diffusion_policy.utils.progress_utils import (
         augment_mask_with_progress,
         augment_mas_with_progress,
         pad_mas_to_length,

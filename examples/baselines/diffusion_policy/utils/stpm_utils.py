@@ -1,7 +1,7 @@
 import torch
 
 from mani_skill.utils import common
-from utils.build_progress_window_utils import (
+from utils.progress_utils import (
     build_mas_long_window_from_future,
     build_mas_short_window_from_future,
 )

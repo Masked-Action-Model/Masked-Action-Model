@@ -28,7 +28,7 @@
 另外顺手补了两个兼容点：
 
 - `utils/denormalize_utils.py` 现在支持直接从预处理后的 `h5/meta` 读取 `action_min/max`
-- `utils/add_progress_to_mas_utils.py` 现在对已经是 `(T, 8)` 的 `mas` 幂等，不会重复加 progress
+- `utils/progress_utils.py` 现在对已经是 `(T, 8)` 的 `mas` 幂等，不会重复加 progress
 
 ## 更新（2026-04-17）
 
