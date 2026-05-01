@@ -81,10 +81,12 @@ RSYNC_EXCLUDES=(
 )
 
 rsync -a "${RSYNC_EXCLUDES[@]}" \
+  --delete \
   "${SOURCE_REPO}/STPM" \
   "${TARGET_REPO}/"
 
 rsync -a "${RSYNC_EXCLUDES[@]}" \
+  --delete \
   "${SOURCE_REPO}/examples/baselines/diffusion_policy" \
   "${TARGET_REPO}/examples/baselines/"
 
