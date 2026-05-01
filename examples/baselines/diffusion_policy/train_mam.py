@@ -212,7 +212,7 @@ def stpm_eval_env_obs_mode(policy_obs_mode: str) -> str:
         raise ValueError(
             f"Unsupported obs_mode={policy_obs_mode!r}; expected 'rgb' or 'rgb+depth'."
         )
-    return "rgb+depth"
+    return policy_obs_mode
 
 
 def reorder_keys(d, ref_dict):
@@ -260,7 +260,6 @@ def build_eval_stpm_encoder(
 
 def validate_only_mas_eval_layout(envs: VectorEnv, stpm_encoder):
     rgb_shape = envs.single_observation_space["rgb"].shape
-    depth_shape = envs.single_observation_space["depth"].shape
     state_shape = envs.single_observation_space["state"].shape
 
     if getattr(stpm_encoder, "camera_name", None) != "base_camera":
@@ -268,10 +267,10 @@ def validate_only_mas_eval_layout(envs: VectorEnv, stpm_encoder):
             "Only STPM configs with a single 'base_camera' are supported, "
             f"got camera_name={getattr(stpm_encoder, 'camera_name', None)!r}."
         )
-    if rgb_shape[-1] != 3 or depth_shape[-1] != 1:
+    if rgb_shape[-1] != 3:
         raise ValueError(
             "Only single-camera rollout observations are supported for STPM-driven "
-            f"mas-window evaluation, got rgb shape {rgb_shape} and depth shape {depth_shape}."
+            f"mas-window evaluation, got rgb shape {rgb_shape}."
         )
     if state_shape[-1] != int(stpm_encoder.state_dim):
         raise ValueError(

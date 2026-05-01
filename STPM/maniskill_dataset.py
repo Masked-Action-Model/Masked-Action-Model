@@ -113,11 +113,8 @@ class FrameManiskillDataset(torch.utils.data.Dataset):
     def _load_camera_tensor(self, traj_group: h5py.Group, sampled_indices: np.ndarray) -> torch.Tensor:
         camera_group = traj_group["obs"]["sensor_data"]["base_camera"]
         rgb = self._take_rows(camera_group["rgb"], sampled_indices).astype(np.float32)
-        depth = self._take_rows(camera_group["depth"], sampled_indices).astype(np.float32)
         rgb = np.transpose(rgb, (0, 3, 1, 2))
-        depth = np.transpose(depth, (0, 3, 1, 2))
-        camera = np.concatenate([rgb, depth], axis=1)
-        return torch.from_numpy(camera)
+        return torch.from_numpy(rgb)
 
     def _load_state_path(
         self, traj_group: h5py.Group, path: str, sampled_indices: np.ndarray

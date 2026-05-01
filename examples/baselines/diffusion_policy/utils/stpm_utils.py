@@ -69,33 +69,28 @@ def validate_stpm_eval_setup(stpm_encoder, stpm_n_obs_steps: int, stpm_frame_gap
 def prepare_batched_rollout_obs(obs, device, obs_horizon: int):
     obs = common.to_tensor(obs, device)
 
-    if "rgb" not in obs or "depth" not in obs or "state" not in obs:
+    if "rgb" not in obs or "state" not in obs:
         raise ValueError(
-            f"Expected rollout obs to contain keys rgb/depth/state, got {sorted(obs.keys())}"
+            f"Expected rollout obs to contain keys rgb/state, got {sorted(obs.keys())}"
         )
 
     if obs["rgb"].ndim == 4:
         obs["rgb"] = obs["rgb"].unsqueeze(0)
-    if obs["depth"].ndim == 4:
-        obs["depth"] = obs["depth"].unsqueeze(0)
     if obs["state"].ndim == 2:
         obs["state"] = obs["state"].unsqueeze(0)
 
-    if obs["rgb"].ndim != 5 or obs["depth"].ndim != 5 or obs["state"].ndim != 3:
+    if obs["rgb"].ndim != 5 or obs["state"].ndim != 3:
         raise ValueError(
             "Unexpected rollout obs shapes after batching: "
-            f"rgb={tuple(obs['rgb'].shape)}, depth={tuple(obs['depth'].shape)}, "
-            f"state={tuple(obs['state'].shape)}"
+            f"rgb={tuple(obs['rgb'].shape)}, state={tuple(obs['state'].shape)}"
         )
     if (
         obs["rgb"].shape[1] != obs_horizon
-        or obs["depth"].shape[1] != obs_horizon
         or obs["state"].shape[1] != obs_horizon
     ):
         raise ValueError(
             f"Expected obs_horizon={obs_horizon} in rollout obs, got "
-            f"rgb={tuple(obs['rgb'].shape)}, depth={tuple(obs['depth'].shape)}, "
-            f"state={tuple(obs['state'].shape)}"
+            f"rgb={tuple(obs['rgb'].shape)}, state={tuple(obs['state'].shape)}"
         )
 
     return obs
@@ -104,7 +99,6 @@ def prepare_batched_rollout_obs(obs, device, obs_horizon: int):
 def _extract_single_frame(stacked_obs: dict, env_idx: int, frame_idx: int):
     return {
         "rgb": stacked_obs["rgb"][env_idx, frame_idx].clone(),
-        "depth": stacked_obs["depth"][env_idx, frame_idx].clone(),
         "state": stacked_obs["state"][env_idx, frame_idx].clone(),
     }
 
@@ -113,7 +107,7 @@ def init_env_histories_from_reset_obs(stacked_obs: dict, obs_horizon: int):
     histories = []
     num_envs = stacked_obs["state"].shape[0]
     for env_idx in range(num_envs):
-        history = dict(rgb=[], depth=[], state=[])
+        history = dict(rgb=[], state=[])
         for frame_idx in range(obs_horizon):
             frame = _extract_single_frame(stacked_obs, env_idx, frame_idx)
             for key in history.keys():
@@ -168,10 +162,10 @@ def _reorder_pickcube_rollout_state_for_stpm(
     return reordered
 
 
-def _build_stpm_rgbd_frame(rgb_frame: torch.Tensor, depth_frame: torch.Tensor):
-    if rgb_frame.ndim != 3 or depth_frame.ndim != 3:
+def _build_stpm_rgb_frame(rgb_frame: torch.Tensor):
+    if rgb_frame.ndim != 3:
         raise ValueError(
-            f"Expected rgb/depth frames to be 3D, got rgb={tuple(rgb_frame.shape)}, depth={tuple(depth_frame.shape)}"
+            f"Expected rgb frame to be 3D, got rgb={tuple(rgb_frame.shape)}"
         )
 
     if rgb_frame.shape[-1] == 3:
@@ -184,28 +178,12 @@ def _build_stpm_rgbd_frame(rgb_frame: torch.Tensor, depth_frame: torch.Tensor):
             f"Expected rgb channel dim 3, got shape {tuple(rgb_frame.shape)}."
         )
 
-    if depth_frame.shape[-1] == 1:
-        depth_chw = depth_frame.permute(2, 0, 1)
-    elif depth_frame.shape[0] == 1:
-        depth_chw = depth_frame
-    else:
+    if rgb_chw.shape[0] != 3:
         raise ValueError(
-            "Only single-camera 'base_camera' rollout observations are supported. "
-            f"Expected depth channel dim 1, got shape {tuple(depth_frame.shape)}."
+            f"Expected base_camera rgb channel count 3, got {rgb_chw.shape[0]}."
         )
 
-    if rgb_chw.shape[0] != 3 or depth_chw.shape[0] != 1:
-        raise ValueError(
-            f"Expected base_camera rgb/depth channel counts (3, 1), got {rgb_chw.shape[0]} and {depth_chw.shape[0]}."
-        )
-
-    return torch.cat(
-        (
-            rgb_chw.to(dtype=torch.float32),
-            depth_chw.to(dtype=torch.float32),
-        ),
-        dim=0,
-    )
+    return rgb_chw.to(dtype=torch.float32)
 
 
 def _sample_stpm_history_indices(
@@ -234,7 +212,7 @@ def predict_progress_from_histories(
     target_device,
     target_dtype,
 ):
-    rgbd_windows = []
+    rgb_windows = []
     state_windows = []
 
     for env_idx, history in enumerate(histories):
@@ -261,15 +239,10 @@ def predict_progress_from_histories(
                 frame_gap=stpm_frame_gap,
             )
 
-            rgbd_seq = []
+            rgb_seq = []
             state_seq = []
             for hist_idx in sampled_indices:
-                rgbd_seq.append(
-                    _build_stpm_rgbd_frame(
-                        history["rgb"][hist_idx],
-                        history["depth"][hist_idx],
-                    )
-                )
+                rgb_seq.append(_build_stpm_rgb_frame(history["rgb"][hist_idx]))
                 state_seq.append(
                     _reorder_pickcube_rollout_state_for_stpm(
                         history["state"][hist_idx],
@@ -277,12 +250,12 @@ def predict_progress_from_histories(
                     )
                 )
 
-            rgbd_windows.append(torch.stack(rgbd_seq, dim=0))
+            rgb_windows.append(torch.stack(rgb_seq, dim=0))
             state_windows.append(torch.stack(state_seq, dim=0))
 
-    rgbd_batch = torch.stack(rgbd_windows, dim=0)
+    rgb_batch = torch.stack(rgb_windows, dim=0)
     state_batch = torch.stack(state_windows, dim=0)
-    progress = stpm_encoder.predict_progress(rgbd=rgbd_batch, state=state_batch)
+    progress = stpm_encoder.predict_progress(rgbd=rgb_batch, state=state_batch)
     return progress.to(device=target_device, dtype=target_dtype).reshape(
         len(histories), obs_horizon, 1
     )
@@ -298,7 +271,7 @@ def predict_current_progress_from_histories(
     target_device,
     target_dtype,
 ):
-    rgbd_windows = []
+    rgb_windows = []
     state_windows = []
 
     for env_idx, history in enumerate(histories):
@@ -324,15 +297,10 @@ def predict_current_progress_from_histories(
             frame_gap=stpm_frame_gap,
         )
 
-        rgbd_seq = []
+        rgb_seq = []
         state_seq = []
         for hist_idx in sampled_indices:
-            rgbd_seq.append(
-                _build_stpm_rgbd_frame(
-                    history["rgb"][hist_idx],
-                    history["depth"][hist_idx],
-                )
-            )
+            rgb_seq.append(_build_stpm_rgb_frame(history["rgb"][hist_idx]))
             state_seq.append(
                 _reorder_pickcube_rollout_state_for_stpm(
                     history["state"][hist_idx],
@@ -340,12 +308,12 @@ def predict_current_progress_from_histories(
                 )
             )
 
-        rgbd_windows.append(torch.stack(rgbd_seq, dim=0))
+        rgb_windows.append(torch.stack(rgb_seq, dim=0))
         state_windows.append(torch.stack(state_seq, dim=0))
 
-    rgbd_batch = torch.stack(rgbd_windows, dim=0)
+    rgb_batch = torch.stack(rgb_windows, dim=0)
     state_batch = torch.stack(state_windows, dim=0)
-    progress = stpm_encoder.predict_progress(rgbd=rgbd_batch, state=state_batch)
+    progress = stpm_encoder.predict_progress(rgbd=rgb_batch, state=state_batch)
     return progress.to(device=target_device, dtype=target_dtype).reshape(
         len(histories), 1
     )

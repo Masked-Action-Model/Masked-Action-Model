@@ -20,7 +20,7 @@ class STPMEncoder(nn.Module):
     Frozen STPM inference wrapper.
 
     Input:
-    - rgbd: [T, 4, H, W] or [B, T, 4, H, W]
+    - rgbd: [T, 3/4, H, W] or [B, T, 3/4, H, W]
     - state: [T, state_dim] or [B, T, state_dim]
 
     Output:
@@ -97,8 +97,8 @@ class STPMEncoder(nn.Module):
 
     @staticmethod
     def _select_rgb(rgbd: torch.Tensor) -> torch.Tensor:
-        if rgbd.shape[2] < 3:
-            raise ValueError(f"Expected RGBD tensor with at least 3 channels, got shape {tuple(rgbd.shape)}")
+        if rgbd.shape[2] not in (3, 4):
+            raise ValueError(f"Expected RGB/RGBD tensor with 3 or 4 channels, got shape {tuple(rgbd.shape)}")
         return rgbd[:, :, :3, :, :]
 
     def _normalize_tasks(self, tasks: Union[str, Sequence[str], None], batch_size: int) -> list[str]:
@@ -127,8 +127,8 @@ class STPMEncoder(nn.Module):
             raise ValueError(
                 f"Mismatched rgbd/state leading dims: rgbd {tuple(rgbd.shape[:2])}, state {tuple(state.shape[:2])}"
             )
-        if rgbd.shape[2] != 4:
-            raise ValueError(f"Expected rgbd channel dim to be 4, got shape {tuple(rgbd.shape)}")
+        if rgbd.shape[2] not in (3, 4):
+            raise ValueError(f"Expected rgb/rgbd channel dim to be 3 or 4, got shape {tuple(rgbd.shape)}")
         if state.shape[-1] != self.state_dim:
             raise ValueError(f"Expected state dim {self.state_dim}, got shape {tuple(state.shape)}")
 
