@@ -82,12 +82,10 @@ RSYNC_EXCLUDES=(
 
 rsync -a "${RSYNC_EXCLUDES[@]}" \
   "${SOURCE_REPO}/STPM" \
-  "${SOURCE_REPO}/STPM_PickCube" \
   "${TARGET_REPO}/"
 
 rsync -a "${RSYNC_EXCLUDES[@]}" \
   "${SOURCE_REPO}/examples/baselines/diffusion_policy" \
-  "${SOURCE_REPO}/examples/baselines/diffusion_policy_old" \
   "${TARGET_REPO}/examples/baselines/"
 
 git -C "${TARGET_REPO}" status --short --branch
@@ -101,9 +99,7 @@ fi
 git -C "${TARGET_REPO}" add \
   .gitignore \
   STPM \
-  STPM_PickCube \
   examples/baselines/diffusion_policy \
-  examples/baselines/diffusion_policy_old \
   scripts/sync_from_maniskill.sh
 
 if git -C "${TARGET_REPO}" diff --cached --quiet; then

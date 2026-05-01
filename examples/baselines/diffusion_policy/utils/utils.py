@@ -4,12 +4,12 @@ from gymnasium import spaces
 from torch.utils.data.sampler import Sampler
 
 try:
-    from data_preprocess_tools.obs_utils import (
+    from data_preprocess.utils.obs_utils import (
         build_default_state_obs_extractor,
         flatten_state_from_obs,
     )
 except ModuleNotFoundError:
-    from examples.baselines.diffusion_policy.data_preprocess_tools.obs_utils import (
+    from examples.baselines.diffusion_policy.data_preprocess.utils.obs_utils import (
         build_default_state_obs_extractor,
         flatten_state_from_obs,
     )

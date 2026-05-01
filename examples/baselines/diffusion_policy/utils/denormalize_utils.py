@@ -4,9 +4,9 @@ import numpy as np
 import torch
 
 try:
-    from data_preprocess_tools.normalize_utils import load_action_stats_from_path
+    from data_preprocess.utils.normalize_utils import load_action_stats_from_path
 except ModuleNotFoundError:
-    from examples.baselines.diffusion_policy.data_preprocess_tools.normalize_utils import (
+    from examples.baselines.diffusion_policy.data_preprocess.utils.normalize_utils import (
         load_action_stats_from_path,
     )
 

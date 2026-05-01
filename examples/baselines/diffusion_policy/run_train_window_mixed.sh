@@ -210,7 +210,7 @@ compute_mixed_file_stem() {
 import os
 from types import SimpleNamespace
 
-from examples.baselines.diffusion_policy.data_preprocess_mixed import (
+from examples.baselines.diffusion_policy.data_preprocess.data_preprocess_mixed import (
     build_output_stem,
     normalize_split_mask_config,
 )
@@ -303,7 +303,7 @@ ensure_preprocessed_dataset() {
   if [[ -n "$PREPROCESS_NUM_TRAJ" ]]; then
     PREPROCESS_ARGS+=(--num-traj "$PREPROCESS_NUM_TRAJ")
   fi
-  python examples/baselines/diffusion_policy/data_preprocess_mixed.py "${PREPROCESS_ARGS[@]}"
+  python examples/baselines/diffusion_policy/data_preprocess/data_preprocess_mixed.py "${PREPROCESS_ARGS[@]}"
 }
 
 ensure_preprocessed_dataset

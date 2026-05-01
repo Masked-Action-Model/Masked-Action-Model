@@ -75,7 +75,7 @@ ensure_default_eval_dataset() {
 
   mkdir -p "$output_dir"
   echo "[preprocess] generating default dataset for window_2D_64_2 into ${output_dir}"
-  "$PYTHON_BIN" examples/baselines/diffusion_policy/data_preprocess.py \
+  "$PYTHON_BIN" examples/baselines/diffusion_policy/data_preprocess/data_preprocess.py \
     --input-h5 "$raw_demo_h5" \
     --input-json "$raw_demo_json" \
     --output-dir "$output_dir" \

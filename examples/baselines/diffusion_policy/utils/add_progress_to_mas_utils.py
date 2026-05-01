@@ -1,7 +1,7 @@
 import torch
 
 try:
-    from data_preprocess_tools.progress_utils import (
+    from data_preprocess.utils.progress_utils import (
         MAS_ACTION_DIM,
         MAS_STEP_DIM,
         augment_mas_with_progress_torch,
@@ -9,7 +9,7 @@ try:
         pad_augmented_mas_torch,
     )
 except ModuleNotFoundError:
-    from examples.baselines.diffusion_policy.data_preprocess_tools.progress_utils import (
+    from examples.baselines.diffusion_policy.data_preprocess.utils.progress_utils import (
         MAS_ACTION_DIM,
         MAS_STEP_DIM,
         augment_mas_with_progress_torch,

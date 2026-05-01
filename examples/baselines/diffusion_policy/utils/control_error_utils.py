@@ -8,9 +8,9 @@ from h5py import File
 import torch
 
 try:
-    from data_preprocess_tools.normalize_utils import normalize_selected_dims
+    from data_preprocess.utils.normalize_utils import normalize_selected_dims
 except ModuleNotFoundError:
-    from examples.baselines.diffusion_policy.data_preprocess_tools.normalize_utils import (
+    from examples.baselines.diffusion_policy.data_preprocess.utils.normalize_utils import (
         normalize_selected_dims,
     )
 

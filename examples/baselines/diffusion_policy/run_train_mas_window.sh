@@ -171,7 +171,7 @@ ensure_preprocessed_dataset() {
   if [[ -n "$PREPROCESS_NUM_TRAJ" ]]; then
     PREPROCESS_ARGS+=(--num-traj "$PREPROCESS_NUM_TRAJ")
   fi
-  python examples/baselines/diffusion_policy/data_preprocess.py "${PREPROCESS_ARGS[@]}"
+  python examples/baselines/diffusion_policy/data_preprocess/data_preprocess.py "${PREPROCESS_ARGS[@]}"
 }
 
 ensure_preprocessed_dataset
