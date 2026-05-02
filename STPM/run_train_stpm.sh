@@ -8,7 +8,7 @@ export PYTHONPATH="${ROOT_DIR}:${ROOT_DIR}/STPM:${PYTHONPATH:-}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-maniskill}"
 export WANDB_MODE="${WANDB_MODE:-disabled}"
 
-DATASET_PATH="demos/exp_5/StackPyramid-v1/motionplanning/StackPyramin-v1.rgbd.pd_joint_pos.physx_cpu.h5"
+DATASET_PATH="${DATASET_PATH:-demos/exp_5/StackPyramid-v1/motionplanning/StackPyramin-v1.rgbd.pd_joint_pos.physx_cpu.h5}"
 if [[ -z "$DATASET_PATH" ]]; then
   echo "ERROR: DATASET_PATH is required, e.g. DATASET_PATH=demos/.../trajectory.rgbd....h5" >&2
   exit 1
@@ -18,14 +18,14 @@ if [[ ! -f "$DATASET_PATH" ]]; then
   exit 1
 fi
 
-TASK_NAME="stackpyramid"
-TASK_DESCRIPTION="pick up the red cube, place it next to the green cube, and stack the blue cube on top of the red and green cube"
-OUTPUT_DIR="STPM_stackpyramid"
-STATE_PATHS='["obs/agent/qpos","obs/agent/qvel","obs/extra/tcp_pose"]'
+TASK_NAME="${TASK_NAME:-stackpyramid}"
+TASK_DESCRIPTION="${TASK_DESCRIPTION:-pick up the red cube, place it next to the green cube, and stack the blue cube on top of the red and green cube}"
+OUTPUT_DIR="${OUTPUT_DIR:-STPM_stackpyramid}"
+STATE_PATHS="${STATE_PATHS:-auto}"
 
 SEED="${SEED:-42}"
 DEVICE="${DEVICE:-cuda}"
-CAMERA_NAMES="${CAMERA_NAMES:-base_camera}"
+CAMERA_NAMES="${CAMERA_NAMES:-auto}"
 VISION_CKPT="${VISION_CKPT:-pretrained/clip-vit-base-patch32}"
 
 BATCH_SIZE="${BATCH_SIZE:-32}"
@@ -106,7 +106,8 @@ def is_numeric_leaf(obj):
 
 
 def parse_state_paths(value):
-    if not value.strip():
+    value = value.strip()
+    if not value or value.lower() == "auto":
         return None
     try:
         parsed = ast.literal_eval(value)
@@ -115,6 +116,36 @@ def parse_state_paths(value):
     if isinstance(parsed, (str, bytes)):
         parsed = [parsed]
     return [str(x) for x in parsed]
+
+
+def parse_camera_names(value):
+    value = value.strip()
+    if not value or value.lower() == "auto":
+        return None
+    try:
+        parsed = ast.literal_eval(value)
+    except Exception:
+        parsed = [x.strip() for x in value.split(",") if x.strip()]
+    if isinstance(parsed, (str, bytes)):
+        parsed = [parsed]
+    return [str(x).strip() for x in parsed if str(x).strip()]
+
+
+def infer_camera_names(traj_group):
+    try:
+        sensor_data = h5_get(traj_group, "obs/sensor_data")
+    except KeyError:
+        raise ValueError(
+            "Failed to infer STPM cameras: no obs/sensor_data group found in dataset."
+        ) from None
+    camera_names = [
+        name
+        for name, value in sensor_data.items()
+        if isinstance(value, h5py.Group) and "rgb" in value
+    ]
+    if not camera_names:
+        raise ValueError("Failed to infer STPM cameras: no RGB camera datasets found.")
+    return camera_names
 
 
 def infer_state_paths(traj_group):
@@ -181,6 +212,7 @@ with h5py.File(dataset_path, "r") as f:
         raise ValueError(f"No traj_* groups found in {dataset_path}")
     first_traj = f[traj_keys[0]]
     state_paths = parse_state_paths(os.environ["STATE_PATHS"]) or infer_state_paths(first_traj)
+    camera_names = parse_camera_names(os.environ["CAMERA_NAMES"]) or infer_camera_names(first_traj)
     all_states = [read_state(f[k], state_paths) for k in traj_keys]
 
 states = np.concatenate(all_states, axis=0).astype(np.float32)
@@ -206,7 +238,7 @@ cfg.general.task_description = task_description
 cfg.general.repo_id = str(dataset_path)
 cfg.general.state_norm_path = str(state_norm_path)
 cfg.general.state_paths = state_paths
-cfg.general.camera_names = [x.strip() for x in os.environ["CAMERA_NAMES"].split(",") if x.strip()]
+cfg.general.camera_names = camera_names
 cfg.general.seed = int(os.environ["SEED"])
 cfg.general.device = os.environ["DEVICE"]
 
