@@ -122,6 +122,12 @@ class Args:
     diffusion_step_embed_dim: int = 64  # not very important
     noise_model: Literal["Transformer", "Unet"] = "Transformer"
     """denoiser backbone. Transformer uses DiTNoiseNet; Unet uses ConditionalUnet1D."""
+    dit_hidden_dim: int = 512
+    """DiT hidden dimension, used only when noise_model=Transformer."""
+    dit_num_blocks: int = 6
+    """Number of DiT encoder/decoder blocks, used only when noise_model=Transformer."""
+    dit_dim_feedforward: int = 2048
+    """DiT feedforward dimension, used only when noise_model=Transformer."""
     unet_dims: List[int] = field(default_factory=lambda: [64, 128, 256])
     """UNet channel dimensions, used only when noise_model=Unet."""
     n_groups: int = 8
@@ -380,6 +386,9 @@ class Agent(nn.Module):
                 ac_chunk=self.pred_horizon,
                 obs_dim=visual_feature_dim + obs_state_dim,
                 time_dim=args.diffusion_step_embed_dim,
+                hidden_dim=args.dit_hidden_dim,
+                num_blocks=args.dit_num_blocks,
+                dim_feedforward=args.dit_dim_feedforward,
                 use_mask=False,
             )
         elif args.noise_model == "Unet":

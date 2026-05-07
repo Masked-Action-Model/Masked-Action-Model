@@ -142,6 +142,12 @@ class Args:
     long_window_forward_length: Optional[int] = None
     """MAS long window length from t onward, including t; defaults to pred_horizon"""
     diffusion_step_embed_dim: int = 64  # not very important
+    dit_hidden_dim: int = 512
+    """DiT hidden dimension."""
+    dit_num_blocks: int = 6
+    """Number of DiT encoder/decoder blocks."""
+    dit_dim_feedforward: int = 2048
+    """DiT feedforward dimension."""
     short_window_horizon: int = 8
     """future MAS short window length; set to 0 to disable the short-window branch"""
     mas_long_encode_mode: Literal["1DConv", "2DConv"] = "2DConv"
@@ -738,6 +744,9 @@ class Agent(nn.Module):
             ac_chunk=self.pred_horizon,
             obs_dim=visual_feature_dim + obs_state_dim + mas_long_feature_dim + mas_short_feature_dim,
             time_dim=args.diffusion_step_embed_dim,
+            hidden_dim=args.dit_hidden_dim,
+            num_blocks=args.dit_num_blocks,
+            dim_feedforward=args.dit_dim_feedforward,
             use_mask=False,
         )
         

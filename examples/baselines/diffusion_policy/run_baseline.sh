@@ -52,6 +52,9 @@ SIM_BACKEND="${SIM_BACKEND:-physx_cpu}"
 
 NOISE_MODEL="${NOISE_MODEL:-Transformer}" # Transformer or Unet
 DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-64}"
+DIT_HIDDEN_DIM="${DIT_HIDDEN_DIM:-512}"
+DIT_NUM_BLOCKS="${DIT_NUM_BLOCKS:-6}"
+DIT_DIM_FEEDFORWARD="${DIT_DIM_FEEDFORWARD:-2048}"
 UNET_DIMS="${UNET_DIMS:-64 128 256}"
 N_GROUPS="${N_GROUPS:-8}"
 
@@ -130,6 +133,9 @@ ARGS=(
   --act-horizon "$ACT_HORIZON"
   --pred-horizon "$PRED_HORIZON"
   --diffusion-step-embed-dim "$DIFFUSION_STEP_EMBED_DIM"
+  --dit-hidden-dim "$DIT_HIDDEN_DIM"
+  --dit-num-blocks "$DIT_NUM_BLOCKS"
+  --dit-dim-feedforward "$DIT_DIM_FEEDFORWARD"
   --unet-dims $UNET_DIMS
   --n-groups "$N_GROUPS"
   --obs-mode "$OBS_MODE"

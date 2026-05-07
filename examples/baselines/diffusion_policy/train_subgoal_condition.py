@@ -124,6 +124,12 @@ class Args:
     diffusion_step_embed_dim: int = 64  # not very important
     noise_model: Literal["Transformer"] = "Transformer"
     """denoiser backbone. Subgoal condition only supports DiTNoiseNet."""
+    dit_hidden_dim: int = 512
+    """DiT hidden dimension."""
+    dit_num_blocks: int = 6
+    """Number of DiT encoder/decoder blocks."""
+    dit_dim_feedforward: int = 2048
+    """DiT feedforward dimension."""
     subgoal_dim: int = 0
     """flattened padded MAS condition dim, resolved from train/eval datasets at runtime."""
     unet_dims: List[int] = field(default_factory=lambda: [64, 128, 256])
@@ -614,6 +620,9 @@ class Agent(nn.Module):
             ac_chunk=self.pred_horizon,
             obs_dim=visual_feature_dim + obs_state_dim + subgoal_dim,
             time_dim=args.diffusion_step_embed_dim,
+            hidden_dim=args.dit_hidden_dim,
+            num_blocks=args.dit_num_blocks,
+            dim_feedforward=args.dit_dim_feedforward,
             use_mask=False,
         )
         self.num_diffusion_iters = 100
