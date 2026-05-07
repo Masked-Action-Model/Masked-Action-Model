@@ -78,6 +78,8 @@ class Args:
 
     env_id: str = "PegInsertionSide-v1"
     """the id of the environment"""
+    action_dim: int = 7
+    """action dimension: 6 for panda_stick/no-gripper tasks, 7 for gripper tasks."""
     demo_path: str = (
         "demos/PegInsertionSide-v1/trajectory.state.pd_ee_delta_pose.physx_cpu.h5"
     )
@@ -177,8 +179,12 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         pred_horizon,
         device,
         num_traj,
+        action_dim,
         action_norm_path=None,
     ):
+        self.action_dim = int(action_dim)
+        if self.action_dim not in (6, 7):
+            raise ValueError(f"action_dim must be 6 or 7, got {self.action_dim}")
         self.include_rgb = include_rgb
         self.include_depth = include_depth
         self.action_min = None
@@ -204,6 +210,11 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         trajectories["observations"] = obs_traj_dict_list
         self.obs_keys = list(_obs_traj_dict.keys())
         raw_actions = [np.asarray(action, dtype=np.float32) for action in trajectories["actions"]]
+        for traj_idx, action in enumerate(raw_actions):
+            if action.ndim != 2 or action.shape[1] != self.action_dim:
+                raise ValueError(
+                    f"traj_{traj_idx} actions must have shape (T, {self.action_dim}), got {action.shape}"
+                )
         if action_norm_path is not None and len(action_norm_path.strip()) > 0:
             action_min, action_max = load_action_denorm_stats(action_norm_path)
             self.action_norm_path = action_norm_path
@@ -345,6 +356,10 @@ class Agent(nn.Module):
         assert len(env.single_action_space.shape) == 1  # (act_dim, )
 
         self.act_dim = env.single_action_space.shape[0]
+        if self.act_dim != int(args.action_dim):
+            raise ValueError(
+                f"env action dim ({self.act_dim}) does not match args.action_dim ({args.action_dim})"
+            )
         obs_state_dim = env.single_observation_space["state"].shape[1]
         total_visual_channels = 0
         self.include_rgb = "rgb" in env.single_observation_space.keys()
@@ -508,6 +523,8 @@ def save_ckpt(run_name, tag):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    if int(args.action_dim) not in (6, 7):
+        raise ValueError(f"action_dim must be 6 or 7, got {args.action_dim}")
     ensure_raw_train_eval_split(args)
 
     if args.exp_name is None:
@@ -610,6 +627,7 @@ if __name__ == "__main__":
         pred_horizon=args.pred_horizon,
         device=device,
         num_traj=args.num_demos,
+        action_dim=args.action_dim,
         action_norm_path=args.action_norm_path,
     )
     denorm_mins = dataset.action_min

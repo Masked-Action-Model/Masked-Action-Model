@@ -80,6 +80,8 @@ class Args:
 
     env_id: str = "PegInsertionSide-v1"
     """the id of the environment"""
+    action_dim: int = 7
+    """action dimension: 6 for panda_stick/no-gripper tasks, 7 for gripper tasks."""
     demo_path: str = (
         "demos/PegInsertionSide-v1/trajectory.state.pd_ee_delta_pose.physx_cpu.h5"
     )
@@ -345,14 +347,22 @@ def select_subgoal_demo_indices(
     raise ValueError(f"unsupported mask_assign_mode={mask_assign_mode!r}")
 
 
-def build_subgoal_flat(mas, target_len: int, device=None) -> torch.Tensor:
+def build_subgoal_flat(
+    mas,
+    target_len: int,
+    action_dim: int,
+    device=None,
+) -> torch.Tensor:
+    action_dim = int(action_dim)
+    if action_dim not in (6, 7):
+        raise ValueError(f"action_dim must be 6 or 7, got {action_dim}")
     mas_np = np.asarray(mas, dtype=np.float32)
-    if mas_np.ndim != 2 or mas_np.shape[1] < 7:
-        raise ValueError(f"expected mas shape (T, >=7), got {mas_np.shape}")
+    if mas_np.ndim != 2 or mas_np.shape[1] < action_dim:
+        raise ValueError(f"expected mas shape (T, >={action_dim}), got {mas_np.shape}")
     if mas_np.shape[0] > target_len:
         raise ValueError(f"mas length {mas_np.shape[0]} exceeds target_len={target_len}")
-    padded = np.zeros((target_len, 7), dtype=np.float32)
-    padded[: mas_np.shape[0], :] = mas_np[:, :7]
+    padded = np.zeros((target_len, action_dim), dtype=np.float32)
+    padded[: mas_np.shape[0], :] = mas_np[:, :action_dim]
     tensor = torch.from_numpy(padded.reshape(-1))
     if device is not None:
         tensor = tensor.to(device=device)
@@ -363,6 +373,7 @@ def load_eval_subgoal_data(
     data_path: str,
     device,
     mas_max_length: int,
+    action_dim: int,
     num_traj: Optional[int] = None,
     traj_indices: Optional[list[int]] = None,
 ) -> dict:
@@ -375,7 +386,12 @@ def load_eval_subgoal_data(
     )
     return {
         "subgoal_flat": [
-            build_subgoal_flat(mas, target_len=mas_max_length, device=device)
+            build_subgoal_flat(
+                mas,
+                target_len=mas_max_length,
+                action_dim=action_dim,
+                device=device,
+            )
             for mas in trajectories["mas"]
         ]
     }
@@ -394,12 +410,16 @@ class SmallDemoDataset_SubgoalCondition(Dataset):  # Load everything into memory
         device,
         num_traj,
         mas_max_length,
+        action_dim,
         traj_indices=None,
     ):
+        self.action_dim = int(action_dim)
+        if self.action_dim not in (6, 7):
+            raise ValueError(f"action_dim must be 6 or 7, got {self.action_dim}")
         self.include_rgb = include_rgb
         self.include_depth = include_depth
         self.mas_max_length = int(mas_max_length)
-        self.subgoal_dim = self.mas_max_length * 7
+        self.subgoal_dim = self.mas_max_length * self.action_dim
 
         trajectories = load_demo_dataset(
             data_path,
@@ -426,11 +446,21 @@ class SmallDemoDataset_SubgoalCondition(Dataset):  # Load everything into memory
         trajectories["observations"] = obs_traj_dict_list
         self.obs_keys = list(_obs_traj_dict.keys())
         for i, action in enumerate(trajectories["actions"]):
+            action_np = np.asarray(action, dtype=np.float32)
+            if action_np.ndim != 2 or action_np.shape[1] != self.action_dim:
+                raise ValueError(
+                    f"traj_{i} actions must have shape (T, {self.action_dim}), got {action_np.shape}"
+                )
             trajectories["actions"][i] = torch.from_numpy(
-                np.asarray(action, dtype=np.float32)
+                action_np
             ).to(device=device)
         trajectories["subgoal_flat"] = [
-            build_subgoal_flat(mas, target_len=self.mas_max_length, device=device)
+            build_subgoal_flat(
+                mas,
+                target_len=self.mas_max_length,
+                action_dim=self.action_dim,
+                device=device,
+            )
             for mas in trajectories["mas"]
         ]
         print(
@@ -558,6 +588,10 @@ class Agent(nn.Module):
             raise ValueError("Subgoal condition only supports noise_model='Transformer'")
 
         self.act_dim = env.single_action_space.shape[0]
+        if self.act_dim != int(args.action_dim):
+            raise ValueError(
+                f"env action dim ({self.act_dim}) does not match args.action_dim ({args.action_dim})"
+            )
         obs_state_dim = env.single_observation_space["state"].shape[1]
         subgoal_dim = int(args.subgoal_dim)
         if subgoal_dim <= 0:
@@ -716,6 +750,8 @@ def save_ckpt(run_name, tag):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    if int(args.action_dim) not in (6, 7):
+        raise ValueError(f"action_dim must be 6 or 7, got {args.action_dim}")
     if args.raw_demo_h5 is not None and len(args.raw_demo_h5.strip()) > 0:
         raise ValueError(
             "Subgoal condition expects preprocessed single-mask datasets. "
@@ -786,13 +822,14 @@ if __name__ == "__main__":
         read_mas_max_length(args.demo_path),
         read_mas_max_length(args.eval_demo_path),
     )
-    args.subgoal_dim = mas_max_length * 7
+    args.subgoal_dim = mas_max_length * int(args.action_dim)
     action_norm_path = args.action_norm_path or args.demo_path
     denorm_mins, denorm_maxs = load_action_denorm_stats(action_norm_path)
     eval_subgoal_data = load_eval_subgoal_data(
         data_path=args.eval_demo_path,
         device=device,
         mas_max_length=mas_max_length,
+        action_dim=args.action_dim,
         num_traj=None,
         traj_indices=eval_demo_indices,
     )
@@ -910,6 +947,7 @@ if __name__ == "__main__":
         device=device,
         num_traj=None,
         mas_max_length=mas_max_length,
+        action_dim=args.action_dim,
         traj_indices=train_demo_indices,
     )
     print(

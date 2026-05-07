@@ -329,7 +329,10 @@ def evaluate_mas_window(
                     for env_idx in range(num_envs):
                         action_chunks = executed_action_chunks[env_idx]
                         if len(action_chunks) == 0:
-                            executed_actions_denorm = np.zeros((0, 7), dtype=np.float32)
+                            executed_actions_denorm = np.zeros(
+                                (0, int(agent.act_dim)),
+                                dtype=np.float32,
+                            )
                         else:
                             executed_actions_denorm = np.concatenate(action_chunks, axis=0)
                         traj_idx = int(completed_traj_ids[env_idx].item())

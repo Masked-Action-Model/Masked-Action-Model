@@ -1,5 +1,6 @@
 ALGO_NAME = "BC_Diffusion_rgbd_DiT_MAM"
-MAS_STEP_DIM = 8
+MAS_ACTION_DIM = 7
+MAS_STEP_DIM = MAS_ACTION_DIM + 1
 
 import os
 import random
@@ -25,7 +26,8 @@ from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.training_utils import EMAModel
 from h5py import File
 from gymnasium import spaces
-from mani_skill.utils import common
+from omegaconf import OmegaConf
+from mani_skill.utils import common, sapien_utils
 from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.dataset import Dataset
@@ -41,6 +43,7 @@ from utils.progress_utils import (
     augment_mask_with_progress,
     augment_mas_with_progress,
     build_dual_mas_window_obs_horizon,
+    set_mas_action_dim as set_runtime_mas_action_dim,
 )
 from utils.denormalize_utils import (compute_state_min_max,
                                      load_action_denorm_stats)
@@ -68,6 +71,7 @@ from utils.loss_utils import (
     slice_action_mask_sequence,
 )
 from utils.make_env import make_eval_envs
+from utils.stpm_utils import configure_stpm_rollout_state_mapping
 from utils.utils import (IterationBasedBatchSampler, build_state_obs_extractor,
                          convert_obs, worker_init_fn)
 from utils.video_utils import (
@@ -104,6 +108,8 @@ class Args:
 
     env_id: str = "PegInsertionSide-v1"
     """the id of the environment"""
+    action_dim: int = 7
+    """action dimension: 6 for panda_stick/no-gripper tasks, 7 for gripper tasks."""
     demo_path: str = (
         "demos/PegInsertionSide-v1/trajectory.state.pd_ee_delta_pose.physx_cpu.h5"
     )
@@ -176,6 +182,16 @@ class Args:
     """the control mode to use for the evaluation environments. Must match the control mode of the demonstration dataset."""
     obs_mode: Literal["rgb", "rgb+depth"] = "rgb+depth"
     """visual modality consumed by the policy. rgb ignores depth even when the dataset/eval env provide it."""
+    base_camera_eye: Optional[List[float]] = None
+    """Optional eval base_camera eye position [x, y, z]. Must be paired with base_camera_target."""
+    base_camera_target: Optional[List[float]] = None
+    """Optional eval base_camera look-at target [x, y, z]. Must be paired with base_camera_eye."""
+    base_camera_width: Optional[int] = None
+    """Optional eval base_camera width override."""
+    base_camera_height: Optional[int] = None
+    """Optional eval base_camera height override."""
+    base_camera_fov: Optional[float] = None
+    """Optional eval base_camera vertical fov override."""
 
     # additional tags/configs for logging purposes to wandb and shared comparisons with other algorithms
     demo_type: Optional[str] = None
@@ -187,6 +203,16 @@ def policy_uses_depth(obs_mode: str) -> bool:
     if obs_mode == "rgb+depth":
         return True
     raise ValueError(f"Unsupported obs_mode={obs_mode!r}; expected 'rgb' or 'rgb+depth'.")
+
+
+def configure_mas_dimensions(action_dim: int) -> None:
+    global MAS_ACTION_DIM, MAS_STEP_DIM
+    action_dim = int(action_dim)
+    if action_dim not in (6, 7):
+        raise ValueError(f"action_dim must be 6 or 7, got {action_dim}")
+    MAS_ACTION_DIM = action_dim
+    MAS_STEP_DIM = action_dim + 1
+    set_runtime_mas_action_dim(action_dim)
 
 
 def build_eval_batch_indices(total_items: int, batch_size: int) -> list[list[int]]:
@@ -213,6 +239,66 @@ def stpm_eval_env_obs_mode(policy_obs_mode: str) -> str:
             f"Unsupported obs_mode={policy_obs_mode!r}; expected 'rgb' or 'rgb+depth'."
         )
     return policy_obs_mode
+
+
+def _camera_config_from_metadata(camera_meta: dict) -> dict:
+    camera_cfg = {}
+    if "eye" in camera_meta or "target" in camera_meta:
+        if "eye" not in camera_meta or "target" not in camera_meta:
+            raise ValueError("camera_poses entries with eye/target must provide both.")
+        eye = list(camera_meta["eye"])
+        target = list(camera_meta["target"])
+        if len(eye) != 3 or len(target) != 3:
+            raise ValueError("camera_poses eye/target must both have length 3.")
+        camera_cfg["pose"] = sapien_utils.look_at(eye=eye, target=target)
+    elif "pose" in camera_meta:
+        pose = list(camera_meta["pose"])
+        if len(pose) != 7:
+            raise ValueError("camera_poses pose must be [x, y, z, qw, qx, qy, qz].")
+        camera_cfg["pose"] = pose
+
+    for key in ("width", "height", "fov", "near", "far", "shader_pack"):
+        if key in camera_meta:
+            camera_cfg[key] = camera_meta[key]
+    return camera_cfg
+
+
+def build_eval_sensor_configs(args: Args, stpm_encoder=None) -> dict:
+    sensor_configs = {}
+    if stpm_encoder is not None:
+        camera_poses = getattr(stpm_encoder.cfg.general, "camera_poses", None)
+        if camera_poses is not None:
+            camera_poses = OmegaConf.to_container(camera_poses, resolve=True)
+            for camera_name, camera_meta in dict(camera_poses).items():
+                if camera_meta is None:
+                    continue
+                camera_cfg = _camera_config_from_metadata(dict(camera_meta))
+                if camera_cfg:
+                    sensor_configs[str(camera_name)] = camera_cfg
+
+    base_camera_cfg = {}
+    if (args.base_camera_eye is None) != (args.base_camera_target is None):
+        raise ValueError(
+            "base_camera_eye and base_camera_target must be provided together."
+        )
+    if args.base_camera_eye is not None:
+        if len(args.base_camera_eye) != 3 or len(args.base_camera_target) != 3:
+            raise ValueError(
+                "base_camera_eye/base_camera_target must both have length 3."
+            )
+        base_camera_cfg["pose"] = sapien_utils.look_at(
+            eye=args.base_camera_eye,
+            target=args.base_camera_target,
+        )
+    if args.base_camera_width is not None:
+        base_camera_cfg["width"] = int(args.base_camera_width)
+    if args.base_camera_height is not None:
+        base_camera_cfg["height"] = int(args.base_camera_height)
+    if args.base_camera_fov is not None:
+        base_camera_cfg["fov"] = float(args.base_camera_fov)
+    if base_camera_cfg:
+        sensor_configs.setdefault("base_camera", {}).update(base_camera_cfg)
+    return sensor_configs
 
 
 def reorder_keys(d, ref_dict):
@@ -258,7 +344,18 @@ def build_eval_stpm_encoder(
     return stpm_encoder, stpm_n_obs_steps, stpm_frame_gap
 
 
-def validate_only_mas_eval_layout(envs: VectorEnv, stpm_encoder):
+def _get_eval_raw_obs_for_state_schema(env_id: str, env_kwargs: dict):
+    tmp_env = gym.make(env_id, reconfiguration_freq=1, **env_kwargs)
+    try:
+        raw_obs = getattr(tmp_env.unwrapped, "_init_raw_obs", None)
+        if raw_obs is None:
+            raw_obs, _ = tmp_env.reset()
+        return raw_obs
+    finally:
+        tmp_env.close()
+
+
+def validate_only_mas_eval_layout(envs: VectorEnv, stpm_encoder, env_id: str, env_kwargs: dict):
     rgb_shape = envs.single_observation_space["rgb"].shape
     state_shape = envs.single_observation_space["state"].shape
     camera_names = list(
@@ -280,11 +377,12 @@ def validate_only_mas_eval_layout(envs: VectorEnv, stpm_encoder):
             "Rollout RGB channels do not match the STPM checkpoint camera count, "
             f"got rgb shape {rgb_shape}, camera_names={camera_names!r}."
         )
-    if state_shape[-1] != int(stpm_encoder.state_dim):
-        raise ValueError(
-            "Current rollout state cannot be mapped to the STPM checkpoint state layout. "
-            f"Expected last dim {stpm_encoder.state_dim}, got {state_shape[-1]}."
-        )
+    raw_obs = _get_eval_raw_obs_for_state_schema(env_id, env_kwargs)
+    configure_stpm_rollout_state_mapping(
+        stpm_encoder,
+        raw_obs=raw_obs,
+        rollout_state_dim=int(state_shape[-1]),
+    )
 
 
 def move_batch_to_device(batch, device):
@@ -390,7 +488,12 @@ class SmallDemoDataset_MasWindowDiffusionPolicy(Dataset):  # Load everything int
         
         # Pre-process the actions and mas
         for i in range(len(trajectories["actions"])):
-            trajectories["actions"][i] = torch.as_tensor(trajectories["actions"][i], dtype=torch.float32)
+            action_np = np.asarray(trajectories["actions"][i], dtype=np.float32)
+            if action_np.ndim != 2 or action_np.shape[1] != int(args.action_dim):
+                raise ValueError(
+                    f"traj_{i} actions must have shape (T, {args.action_dim}), got {action_np.shape}"
+                )
+            trajectories["actions"][i] = torch.as_tensor(action_np, dtype=torch.float32)
         if "mas" in trajectories:
             for i in range(len(trajectories["mas"])):
                 raw_mas_t = torch.as_tensor(trajectories["mas"][i], dtype=torch.float32)
@@ -586,6 +689,10 @@ class Agent(nn.Module):
         assert (len(env.single_observation_space["state"].shape) == 2)  # (obs_horizon, obs_dim)
         assert len(env.single_action_space.shape) == 1  # (act_dim, )
         self.act_dim = env.single_action_space.shape[0]
+        if self.act_dim != int(args.action_dim):
+            raise ValueError(
+                f"env action dim ({self.act_dim}) does not match args.action_dim ({args.action_dim})"
+            )
         obs_state_dim = env.single_observation_space["state"].shape[1]
         self.mas_step_dim = MAS_STEP_DIM
         if self.mas_long_window_dim % self.mas_step_dim != 0:
@@ -1208,6 +1315,7 @@ def stratified_select_demo_indices(
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    configure_mas_dimensions(args.action_dim)
 
     # ------------------------------------------------------------------------ #
     # 1. Run configuration and global random seeds
@@ -1380,6 +1488,10 @@ if __name__ == "__main__":
         render_mode="rgb_array",
         human_render_camera_configs=dict(shader_pack="default")
     )
+    sensor_configs = build_eval_sensor_configs(args, stpm_encoder)
+    if sensor_configs:
+        env_kwargs["sensor_configs"] = sensor_configs
+        print(f"[stpm] eval sensor_configs from STPM config/CLI: {sensor_configs}")
     assert args.max_episode_steps != None, "max_episode_steps must be specified as imitation learning algorithms task solve speed is dependent on the data you train on"
     env_kwargs["max_episode_steps"] = args.max_episode_steps
     other_kwargs = dict(obs_horizon=args.obs_horizon)
@@ -1393,7 +1505,7 @@ if __name__ == "__main__":
         video_dir=video_dir if args.capture_video else None,
         wrappers=[FlattenRGBDObservationWrapper],
     )
-    validate_only_mas_eval_layout(envs, stpm_encoder)
+    validate_only_mas_eval_layout(envs, stpm_encoder, args.env_id, env_kwargs)
 
     if args.track:
         import wandb

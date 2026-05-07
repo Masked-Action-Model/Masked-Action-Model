@@ -47,6 +47,7 @@ except ModuleNotFoundError:
 from train_mam import (
     build_eval_batch_indices,
     build_eval_stpm_encoder,
+    configure_mas_dimensions,
     validate_only_mas_eval_layout,
 )
 from utils.control_error_utils import aggregate_control_error, save_control_error_json
@@ -212,6 +213,7 @@ def _rollout_one_eval_batch_inpaint(
                         obs_horizon=obs_horizon,
                         short_window_horizon=short_window_horizon,
                         state_dtype=obs["state"].dtype,
+                        mas_step_dim=int(agent.act_dim) + 1,
                     )
 
                 mas_inpaint, mas_inpaint_mask = build_current_inpaint_mas_mask(
@@ -269,7 +271,10 @@ def _rollout_one_eval_batch_inpaint(
                     for env_idx, episode in enumerate(final_episodes):
                         action_chunks = executed_action_chunks[env_idx]
                         if len(action_chunks) == 0:
-                            executed_actions_denorm = np.zeros((0, 7), dtype=np.float32)
+                            executed_actions_denorm = np.zeros(
+                                (0, int(agent.act_dim)),
+                                dtype=np.float32,
+                            )
                         else:
                             executed_actions_denorm = np.concatenate(action_chunks, axis=0)
                         rollout_records.append(
@@ -295,6 +300,7 @@ def _rollout_one_eval_batch_inpaint(
 
 def main():
     args = tyro.cli(Args)
+    configure_mas_dimensions(args.action_dim)
 
     if args.long_window_horizon is None:
         args.long_window_horizon = args.pred_horizon

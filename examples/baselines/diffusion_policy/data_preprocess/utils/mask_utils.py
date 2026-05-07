@@ -172,12 +172,15 @@ def validate_mixed_mask_config(
         )
 
 
-def _ensure_2d_action(action: np.ndarray) -> np.ndarray:
+def _ensure_2d_action(action: np.ndarray, action_dim: int = 7) -> np.ndarray:
     action = np.asarray(action, dtype=np.float32)
+    action_dim = int(action_dim)
+    if action_dim not in (6, 7):
+        raise ValueError(f"action_dim must be 6 or 7, got {action_dim}")
     if action.ndim != 2:
         raise ValueError(f"action must be 2D, got shape {action.shape}")
-    if action.shape[1] != 7:
-        raise ValueError(f"expected action dim 7, got shape {action.shape}")
+    if action.shape[1] != action_dim:
+        raise ValueError(f"expected action dim {action_dim}, got shape {action.shape}")
     return action
 
 
@@ -197,13 +200,14 @@ def apply_mask_to_actions(
     retain_ratio: float | None = None,
     mask_seq_len: int | None = None,
     masked_value: float = MASKED_VALUE,
+    action_dim: int = 7,
 ) -> Tuple[np.ndarray, np.ndarray]:
     validate_mask_config(
         mask_type=mask_type,
         retain_ratio=retain_ratio,
         mask_seq_len=mask_seq_len,
     )
-    action = _ensure_2d_action(action)
+    action = _ensure_2d_action(action, action_dim=action_dim)
     n, m = action.shape
     masked = np.full_like(action, fill_value=np.float32(masked_value))
     keep_mask = np.zeros((n, m), dtype=bool)

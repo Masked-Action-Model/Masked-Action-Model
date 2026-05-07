@@ -47,6 +47,8 @@ try:
         MAS_ACTION_DIM,
         MAS_STEP_DIM,
         augment_mas_with_progress_np,
+        mas_step_dim_for_action_dim,
+        validate_action_dim,
     )
 except ModuleNotFoundError:
     from data_preprocess.data_preprocess import (
@@ -80,6 +82,8 @@ except ModuleNotFoundError:
         MAS_ACTION_DIM,
         MAS_STEP_DIM,
         augment_mas_with_progress_np,
+        mas_step_dim_for_action_dim,
+        validate_action_dim,
     )
 
 
@@ -116,6 +120,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="PickCube-v1",
         help="环境 id，仅用于记录 meta 和后续对齐",
+    )
+    parser.add_argument(
+        "--action-dim",
+        type=int,
+        choices=[6, 7],
+        default=7,
+        help="动作维度：6=无夹爪 panda_stick/pd_ee_pose，7=有夹爪 panda/pd_ee_pose",
     )
     parser.add_argument(
         "--mask-assign-mode",
@@ -571,7 +582,10 @@ def build_split_metadata_json(
     mask_assign_mode: str,
     split_seed: int,
     mask_seed: int,
+    action_dim: int,
 ) -> dict:
+    action_dim = validate_action_dim(action_dim)
+    mas_step_dim = mas_step_dim_for_action_dim(action_dim)
     mask_composition_list = [float(spec["ratio"]) for spec in mask_specs]
     mask_ratio_list = [_mask_param_repr(spec) for spec in mask_specs]
     expanded_source_episode_ids = [
@@ -605,8 +619,8 @@ def build_split_metadata_json(
             "requested_eval_mask_specs": copy.deepcopy(requested_eval_mask_specs),
             "split_seed": int(split_seed),
             "mask_seed": int(mask_seed),
-            "mas_action_dim": MAS_ACTION_DIM,
-            "mas_dim": MAS_STEP_DIM,
+            "mas_action_dim": action_dim,
+            "mas_dim": mas_step_dim,
         },
     }
     episodes = source_metadata.get("episodes", [])
@@ -729,7 +743,11 @@ def write_split_h5(
     split_seed: int,
     mask_seed: int,
     input_json: Path,
+    action_dim: int,
 ) -> None:
+    action_dim = validate_action_dim(action_dim)
+    mas_step_dim = mas_step_dim_for_action_dim(action_dim)
+    normalized_action_dims = np.arange(min(6, action_dim), dtype=np.int32)
     ensure_parent_dir(output_h5)
     with h5py.File(input_h5, "r") as src_file, h5py.File(output_h5, "w") as dst_file:
         meta = dst_file.create_group("meta")
@@ -737,9 +755,9 @@ def write_split_h5(
         meta.create_dataset("action_max", data=np.asarray(action_max, dtype=np.float32))
         meta.create_dataset("state_min", data=np.asarray(state_min, dtype=np.float32))
         meta.create_dataset("state_max", data=np.asarray(state_max, dtype=np.float32))
-        meta.create_dataset("action_dim", data=np.int32(MAS_ACTION_DIM))
+        meta.create_dataset("action_dim", data=np.int32(action_dim))
         meta.create_dataset("state_dim", data=np.int32(state_min.shape[0]))
-        meta.create_dataset("mas_dim", data=np.int32(MAS_STEP_DIM))
+        meta.create_dataset("mas_dim", data=np.int32(mas_step_dim))
         meta.create_dataset("num_episodes", data=np.int32(len(mask_jobs)))
         meta.create_dataset("mask_value", data=np.float32(mask_value))
         meta.create_dataset("split_seed", data=np.int32(split_seed))
@@ -753,7 +771,7 @@ def write_split_h5(
         )
         meta.create_dataset(
             "normalized_action_dims",
-            data=np.asarray([0, 1, 2, 3, 4, 5], dtype=np.int32),
+            data=normalized_action_dims,
         )
         meta.create_dataset(
             "source_episode_ids",
@@ -787,11 +805,15 @@ def write_split_h5(
             mask_spec = job["mask_spec"]
 
             actions = np.asarray(src_traj["actions"][()], dtype=np.float32)
+            if actions.ndim != 2 or actions.shape[1] != action_dim:
+                raise ValueError(
+                    f"traj_{source_episode_id}/actions must have shape (T, {action_dim}), got {actions.shape}"
+                )
             normalized_actions = normalize_selected_dims(
                 actions,
                 mins=action_min,
                 maxs=action_max,
-                dims=range(6),
+                dims=range(len(normalized_action_dims)),
             )
             state = load_state_matrix_from_obs_group(src_traj["obs"])
             normalized_state = normalize_selected_dims(
@@ -814,10 +836,12 @@ def write_split_h5(
                 retain_ratio=mask_spec["retain_ratio"],
                 mask_seq_len=mask_spec["mask_seq_len"],
                 masked_value=mask_value,
+                action_dim=action_dim,
             )
             mas = augment_mas_with_progress_np(
                 masked_actions,
                 traj_len=normalized_actions.shape[0],
+                action_dim=action_dim,
             )
 
             for key in src_traj.keys():
@@ -884,6 +908,7 @@ def _summarize_assignments(
 
 def main() -> None:
     args = parse_args()
+    args.action_dim = validate_action_dim(args.action_dim)
     train_mask_specs = normalize_split_mask_config(
         args,
         split="train",
@@ -927,7 +952,7 @@ def main() -> None:
         validate_dataset_alignment(src_file, metadata, traj_keys)
         source_episode_ids = [int(traj_key.split("_")[-1]) for traj_key in traj_keys]
         action_min, action_max = compute_global_min_max(
-            iter_selected_action_arrays(src_file, traj_keys)
+            iter_selected_action_arrays(src_file, traj_keys, action_dim=args.action_dim)
         )
         state_min, state_max = compute_global_min_max(
             iter_selected_state_arrays(src_file, traj_keys)
@@ -981,6 +1006,7 @@ def main() -> None:
         split_seed=args.split_seed,
         mask_seed=args.mask_seed,
         input_json=input_json,
+        action_dim=args.action_dim,
     )
     write_json(
         train_json,
@@ -998,6 +1024,7 @@ def main() -> None:
             mask_assign_mode=args.mask_assign_mode,
             split_seed=args.split_seed,
             mask_seed=args.mask_seed,
+            action_dim=args.action_dim,
         ),
     )
 
@@ -1021,6 +1048,7 @@ def main() -> None:
             split_seed=args.split_seed,
             mask_seed=args.mask_seed + 1_000_003,
             input_json=input_json,
+            action_dim=args.action_dim,
         )
         write_json(
             eval_json,
@@ -1038,6 +1066,7 @@ def main() -> None:
                 mask_assign_mode=args.mask_assign_mode,
                 split_seed=args.split_seed,
                 mask_seed=args.mask_seed + 1_000_003,
+                action_dim=args.action_dim,
             ),
         )
 
@@ -1053,7 +1082,8 @@ def main() -> None:
         _summarize_assignments("eval", eval_jobs)
     print(
         "[data_preprocess_mixed] stats: "
-        f"action_dim={MAS_ACTION_DIM}, state_dim={state_min.shape[0]}, mas_dim={MAS_STEP_DIM}"
+        f"action_dim={args.action_dim}, state_dim={state_min.shape[0]}, "
+        f"mas_dim={mas_step_dim_for_action_dim(args.action_dim)}"
     )
 
 

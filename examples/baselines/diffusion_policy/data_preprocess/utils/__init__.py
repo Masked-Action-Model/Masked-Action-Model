@@ -23,8 +23,11 @@ from .progress_utils import (
     augment_mas_with_progress_np,
     augment_mas_with_progress_torch,
     build_progress_column_torch,
+    mas_step_dim_for_action_dim,
     pad_augmented_mas_np,
     pad_augmented_mas_torch,
+    set_mas_action_dim,
+    validate_action_dim,
 )
 
 __all__ = [
@@ -42,11 +45,14 @@ __all__ = [
     "list_traj_keys",
     "load_action_stats_from_path",
     "normalize_selected_dims",
+    "mas_step_dim_for_action_dim",
     "pad_augmented_mas_np",
     "pad_augmented_mas_torch",
     "read_json",
     "validate_mask_config",
     "validate_mixed_mask_config",
+    "set_mas_action_dim",
+    "validate_action_dim",
     "write_json",
     "write_string_dataset",
 ]

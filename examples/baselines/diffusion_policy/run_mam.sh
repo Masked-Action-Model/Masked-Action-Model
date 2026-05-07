@@ -10,6 +10,7 @@ export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
 # -----------------------------------------------------------------------------
 
 ENV_ID="${ENV_ID:-PickCube-v1}"
+ACTION_DIM="${ACTION_DIM:-7}" # 7=有夹爪，6=无夹爪/panda_stick
 EXP_NAME="${EXP_NAME:-PickCube_mam}"
 SEED="${SEED:-1}"
 TORCH_DETERMINISTIC="${TORCH_DETERMINISTIC:-true}"
@@ -151,6 +152,14 @@ echo "[mam-mask] assign_mode=${PREPROCESS_MASK_ASSIGN_MODE}"
 echo "[mam-mask] types=${MASK_TYPE_LIST}"
 echo "[mam-mask] ratios=${MASK_RATIO_LIST}"
 echo "[mam-mask] composition=${MASK_COMPOSITION_LIST}"
+
+case "$ACTION_DIM" in
+  6|7) ;;
+  *)
+    echo "ERROR: ACTION_DIM must be 6 or 7, got: $ACTION_DIM" >&2
+    exit 1
+    ;;
+esac
 
 # -----------------------------------------------------------------------------
 # 4. STPM params 
@@ -329,6 +338,7 @@ ensure_preprocessed_dataset() {
       --output-dir "$PREPROCESSED_DATA_DIR"
       --output-prefix "$PREPROCESSED_DATA_PREFIX"
       --env-id "$ENV_ID"
+      --action-dim "$ACTION_DIM"
       --mask-type "$SINGLE_MASK_TYPE"
       --retain-ratio "$SINGLE_MASK_RETAIN_RATIO"
       --mask-seq-len "$SINGLE_MASK_SEQ_LEN"
@@ -345,6 +355,7 @@ ensure_preprocessed_dataset() {
       --output-dir "$PREPROCESSED_DATA_DIR"
       --output-prefix "$PREPROCESSED_DATA_PREFIX"
       --env-id "$ENV_ID"
+      --action-dim "$ACTION_DIM"
       --mask-assign-mode "$PREPROCESS_MASK_ASSIGN_MODE"
       --train-num-mask-type "$TRAIN_NUM_MASK_TYPE"
       --train-mask-type-list "$TRAIN_MASK_TYPE_LIST"
@@ -373,6 +384,7 @@ ARGS=(
   --seed "$SEED"
   --wandb-project-name "$WANDB_PROJECT_NAME"
   --env-id "$ENV_ID"
+  --action-dim "$ACTION_DIM"
   --demo-path "$DEMO_PATH"
   --test-demo-path "$TEST_DEMO_PATH"
   --eval-demo-metadata-path "$EVAL_DEMO_METADATA_PATH"

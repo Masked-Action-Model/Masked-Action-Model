@@ -11,6 +11,7 @@ export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-maniskill}"
 # -----------------------------------------------------------------------------
 
 ENV_ID="${ENV_ID:-PickCube-v1}"
+ACTION_DIM="${ACTION_DIM:-7}" # 7=有夹爪，6=无夹爪/panda_stick
 EXP_NAME="${EXP_NAME:-PickCube_subgoal_condition}"
 SEED="${SEED:-1}"
 TORCH_DETERMINISTIC="${TORCH_DETERMINISTIC:-true}"
@@ -128,6 +129,14 @@ EVAL_DEMO_METADATA_PATH="${EVAL_DEMO_METADATA_PATH:-${PREPROCESSED_DATA_DIR}/${P
 TRAIN_DEMO_METADATA_PATH="${TRAIN_DEMO_METADATA_PATH:-${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_train.json}"
 ACTION_NORM_PATH="${ACTION_NORM_PATH:-${DEMO_PATH}}"
 
+case "$ACTION_DIM" in
+  6|7) ;;
+  *)
+    echo "ERROR: ACTION_DIM must be 6 or 7, got: $ACTION_DIM" >&2
+    exit 1
+    ;;
+esac
+
 # -----------------------------------------------------------------------------
 # 3. Train/eval params
 # -----------------------------------------------------------------------------
@@ -190,6 +199,7 @@ ensure_preprocessed_dataset() {
     --output-dir "$PREPROCESSED_DATA_DIR"
     --output-prefix "$PREPROCESSED_DATA_PREFIX"
     --env-id "$ENV_ID"
+    --action-dim "$ACTION_DIM"
     --mask-type "$SINGLE_MASK_TYPE"
     --retain-ratio "$SINGLE_MASK_RETAIN_RATIO"
     --mask-seq-len "$SINGLE_MASK_SEQ_LEN"
@@ -222,6 +232,7 @@ ARGS=(
   --seed "$SEED"
   --wandb-project-name "$WANDB_PROJECT_NAME"
   --env-id "$ENV_ID"
+  --action-dim "$ACTION_DIM"
   --demo-path "$DEMO_PATH"
   --eval-demo-path "$EVAL_DEMO_PATH"
   --eval-demo-metadata-path "$EVAL_DEMO_METADATA_PATH"

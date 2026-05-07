@@ -38,6 +38,8 @@ try:
         MAS_ACTION_DIM,
         MAS_STEP_DIM,
         augment_mas_with_progress_np,
+        mas_step_dim_for_action_dim,
+        validate_action_dim,
     )
 except ModuleNotFoundError:
     from data_preprocess.utils.io_utils import (
@@ -65,6 +67,8 @@ except ModuleNotFoundError:
         MAS_ACTION_DIM,
         MAS_STEP_DIM,
         augment_mas_with_progress_np,
+        mas_step_dim_for_action_dim,
+        validate_action_dim,
     )
 
 
@@ -101,6 +105,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="PickCube-v1",
         help="环境 id，仅用于记录 meta 和后续对齐",
+    )
+    parser.add_argument(
+        "--action-dim",
+        type=int,
+        choices=[6, 7],
+        default=7,
+        help="动作维度：6=无夹爪 panda_stick/pd_ee_pose，7=有夹爪 panda/pd_ee_pose",
     )
     parser.add_argument(
         "--mask-type",
@@ -220,14 +231,17 @@ def load_state_matrix_from_obs_group(obs_group: h5py.Group) -> np.ndarray:
 def iter_selected_action_arrays(
     h5_file: h5py.File,
     traj_keys: Iterable[str],
+    action_dim: int = MAS_ACTION_DIM,
 ) -> Iterable[np.ndarray]:
+    action_dim = validate_action_dim(action_dim)
+    norm_dims = min(6, action_dim)
     for traj_key in traj_keys:
         actions = np.asarray(h5_file[traj_key]["actions"][()], dtype=np.float32)
-        if actions.ndim != 2 or actions.shape[1] != MAS_ACTION_DIM:
+        if actions.ndim != 2 or actions.shape[1] != action_dim:
             raise ValueError(
-                f"{traj_key}/actions must have shape (T, {MAS_ACTION_DIM}), got {actions.shape}"
+                f"{traj_key}/actions must have shape (T, {action_dim}), got {actions.shape}"
             )
-        yield actions[:, :6]
+        yield actions[:, :norm_dims]
 
 
 def iter_selected_state_arrays(
@@ -286,7 +300,10 @@ def build_split_metadata_json(
     mask_seq_len: int | None,
     split_seed: int,
     mask_seed: int,
+    action_dim: int,
 ) -> dict:
+    action_dim = validate_action_dim(action_dim)
+    mas_step_dim = mas_step_dim_for_action_dim(action_dim)
     output_metadata = {
         "env_info": copy.deepcopy(source_metadata.get("env_info", {})),
         "commit_info": copy.deepcopy(source_metadata.get("commit_info", {})),
@@ -302,8 +319,8 @@ def build_split_metadata_json(
             "mask_seq_len": mask_seq_len,
             "split_seed": int(split_seed),
             "mask_seed": int(mask_seed),
-            "mas_action_dim": MAS_ACTION_DIM,
-            "mas_dim": MAS_STEP_DIM,
+            "mas_action_dim": action_dim,
+            "mas_dim": mas_step_dim,
         },
     }
     episodes = source_metadata.get("episodes", [])
@@ -336,7 +353,11 @@ def write_split_h5(
     split_seed: int,
     mask_seed: int,
     input_json: Path,
+    action_dim: int,
 ) -> None:
+    action_dim = validate_action_dim(action_dim)
+    mas_step_dim = mas_step_dim_for_action_dim(action_dim)
+    normalized_action_dims = np.arange(min(6, action_dim), dtype=np.int32)
     ensure_parent_dir(output_h5)
     with h5py.File(input_h5, "r") as src_file, h5py.File(output_h5, "w") as dst_file:
         meta = dst_file.create_group("meta")
@@ -344,9 +365,9 @@ def write_split_h5(
         meta.create_dataset("action_max", data=np.asarray(action_max, dtype=np.float32))
         meta.create_dataset("state_min", data=np.asarray(state_min, dtype=np.float32))
         meta.create_dataset("state_max", data=np.asarray(state_max, dtype=np.float32))
-        meta.create_dataset("action_dim", data=np.int32(MAS_ACTION_DIM))
+        meta.create_dataset("action_dim", data=np.int32(action_dim))
         meta.create_dataset("state_dim", data=np.int32(state_min.shape[0]))
-        meta.create_dataset("mas_dim", data=np.int32(MAS_STEP_DIM))
+        meta.create_dataset("mas_dim", data=np.int32(mas_step_dim))
         meta.create_dataset("num_episodes", data=np.int32(len(source_episode_ids)))
         meta.create_dataset("mask_value", data=np.float32(mask_value))
         meta.create_dataset("split_seed", data=np.int32(split_seed))
@@ -355,7 +376,7 @@ def write_split_h5(
         meta.create_dataset("states_normalized", data=np.bool_(True))
         meta.create_dataset("mas_has_progress", data=np.bool_(True))
         meta.create_dataset("state_path", data=np.asarray("obs/state", dtype=h5py.string_dtype("utf-8")))
-        meta.create_dataset("normalized_action_dims", data=np.asarray([0, 1, 2, 3, 4, 5], dtype=np.int32))
+        meta.create_dataset("normalized_action_dims", data=normalized_action_dims)
         meta.create_dataset(
             "source_episode_ids",
             data=np.asarray(source_episode_ids, dtype=np.int32),
@@ -375,11 +396,15 @@ def write_split_h5(
             dst_traj = dst_file.create_group(f"traj_{local_episode_id}")
 
             actions = np.asarray(src_traj["actions"][()], dtype=np.float32)
+            if actions.ndim != 2 or actions.shape[1] != action_dim:
+                raise ValueError(
+                    f"traj_{source_episode_id}/actions must have shape (T, {action_dim}), got {actions.shape}"
+                )
             normalized_actions = normalize_selected_dims(
                 actions,
                 mins=action_min,
                 maxs=action_max,
-                dims=range(6),
+                dims=range(len(normalized_action_dims)),
             )
             state = load_state_matrix_from_obs_group(src_traj["obs"])
             normalized_state = normalize_selected_dims(
@@ -402,10 +427,12 @@ def write_split_h5(
                 retain_ratio=retain_ratio,
                 mask_seq_len=mask_seq_len,
                 masked_value=mask_value,
+                action_dim=action_dim,
             )
             mas = augment_mas_with_progress_np(
                 masked_actions,
                 traj_len=normalized_actions.shape[0],
+                action_dim=action_dim,
             )
 
             for key in src_traj.keys():
@@ -430,6 +457,7 @@ def write_split_h5(
 
 def main() -> None:
     args = parse_args()
+    args.action_dim = validate_action_dim(args.action_dim)
     validate_mask_config(
         mask_type=args.mask_type,
         retain_ratio=args.retain_ratio if args.mask_type in MASK_TYPES_REQUIRING_RATIO else None,
@@ -468,7 +496,7 @@ def main() -> None:
         validate_dataset_alignment(src_file, metadata, traj_keys)
         source_episode_ids = [int(traj_key.split("_")[-1]) for traj_key in traj_keys]
         action_min, action_max = compute_global_min_max(
-            iter_selected_action_arrays(src_file, traj_keys)
+            iter_selected_action_arrays(src_file, traj_keys, action_dim=args.action_dim)
         )
         state_min, state_max = compute_global_min_max(
             iter_selected_state_arrays(src_file, traj_keys)
@@ -508,6 +536,7 @@ def main() -> None:
         split_seed=args.split_seed,
         mask_seed=args.mask_seed,
         input_json=input_json,
+        action_dim=args.action_dim,
     )
     write_json(
         train_json,
@@ -523,6 +552,7 @@ def main() -> None:
             mask_seq_len=args.mask_seq_len if args.mask_type in MASK_TYPES_REQUIRING_SEQ_LEN else None,
             split_seed=args.split_seed,
             mask_seed=args.mask_seed,
+            action_dim=args.action_dim,
         ),
     )
 
@@ -544,6 +574,7 @@ def main() -> None:
             split_seed=args.split_seed,
             mask_seed=args.mask_seed,
             input_json=input_json,
+            action_dim=args.action_dim,
         )
         write_json(
             eval_json,
@@ -559,6 +590,7 @@ def main() -> None:
                 mask_seq_len=args.mask_seq_len if args.mask_type in MASK_TYPES_REQUIRING_SEQ_LEN else None,
                 split_seed=args.split_seed,
                 mask_seed=args.mask_seed,
+                action_dim=args.action_dim,
             ),
         )
 
@@ -569,7 +601,8 @@ def main() -> None:
     )
     print(
         "[data_preprocess] stats: "
-        f"action_dim={MAS_ACTION_DIM}, state_dim={state_min.shape[0]}, mas_dim={MAS_STEP_DIM}"
+        f"action_dim={args.action_dim}, state_dim={state_min.shape[0]}, "
+        f"mas_dim={mas_step_dim_for_action_dim(args.action_dim)}"
     )
 
 

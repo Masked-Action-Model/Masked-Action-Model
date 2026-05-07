@@ -79,9 +79,9 @@ def normalize_rollout_actions(
 ) -> np.ndarray:
     """Map executed rollout actions back into the normalized control space."""
     actions_denorm = np.asarray(actions_denorm, dtype=np.float32)
-    if actions_denorm.ndim != 2 or actions_denorm.shape[1] != 7:
+    if actions_denorm.ndim != 2 or actions_denorm.shape[1] not in (6, 7):
         raise ValueError(
-            f"expected executed actions shape (T, 7), got {actions_denorm.shape}"
+            f"expected executed actions shape (T, 6|7), got {actions_denorm.shape}"
         )
 
     action_min = np.asarray(action_min, dtype=np.float32)
@@ -91,35 +91,44 @@ def normalize_rollout_actions(
             f"invalid action min/max shape: {action_min.shape} vs {action_max.shape}"
         )
 
-    norm_dims = min(int(action_min.shape[0]), actions_denorm.shape[1] - 1)
+    norm_dims = min(int(action_min.shape[0]), actions_denorm.shape[1])
     actions_norm = normalize_selected_dims(
         actions_denorm,
         mins=action_min,
         maxs=action_max,
         dims=range(norm_dims),
     )
-    # Gripper dim is already in [-1, 1] for current datasets.
-    actions_norm[:, -1] = actions_denorm[:, -1]
+    if actions_denorm.shape[1] > norm_dims:
+        # Gripper dim is already in [-1, 1] for current 7D datasets.
+        actions_norm[:, norm_dims:] = actions_denorm[:, norm_dims:]
     return actions_norm.astype(np.float32)
 
 
 def extract_known_control_points(
     mas_t: np.ndarray,
     mask_t: np.ndarray,
+    action_dim: int,
 ) -> list[dict]:
     """Return valid masked control points, one item per time step with known dims."""
     mas_t = np.asarray(mas_t, dtype=np.float32)
     mask_t = np.asarray(mask_t, dtype=np.float32)
-    if mas_t.ndim != 2 or mas_t.shape[1] < 7:
-        raise ValueError(f"expected mas shape (T, >=7), got {mas_t.shape}")
-    if mask_t.ndim != 2 or mask_t.shape[0] != mas_t.shape[0] or mask_t.shape[1] < 7:
+    action_dim = int(action_dim)
+    if action_dim not in (6, 7):
+        raise ValueError(f"action_dim must be 6 or 7, got {action_dim}")
+    if mas_t.ndim != 2 or mas_t.shape[1] < action_dim:
+        raise ValueError(f"expected mas shape (T, >={action_dim}), got {mas_t.shape}")
+    if (
+        mask_t.ndim != 2
+        or mask_t.shape[0] != mas_t.shape[0]
+        or mask_t.shape[1] < action_dim
+    ):
         raise ValueError(
-            f"expected mask shape ({mas_t.shape[0]}, >=7), got {mask_t.shape}"
+            f"expected mask shape ({mas_t.shape[0]}, >={action_dim}), got {mask_t.shape}"
         )
 
     points = []
     for step_idx in range(mas_t.shape[0]):
-        dims_idx = np.where(mask_t[step_idx, :7] > 0.5)[0].astype(np.int64)
+        dims_idx = np.where(mask_t[step_idx, :action_dim] > 0.5)[0].astype(np.int64)
         if dims_idx.size == 0:
             continue
         points.append(
@@ -139,12 +148,17 @@ def compute_control_error_for_traj(
 ) -> dict:
     """Compute CE for a single rollout trajectory."""
     rollout_actions_norm = np.asarray(rollout_actions_norm, dtype=np.float32)
-    if rollout_actions_norm.ndim != 2 or rollout_actions_norm.shape[1] != 7:
+    if rollout_actions_norm.ndim != 2 or rollout_actions_norm.shape[1] not in (6, 7):
         raise ValueError(
-            f"expected rollout_actions_norm shape (T, 7), got {rollout_actions_norm.shape}"
+            f"expected rollout_actions_norm shape (T, 6|7), got {rollout_actions_norm.shape}"
         )
+    action_dim = int(rollout_actions_norm.shape[1])
 
-    known_points = extract_known_control_points(mas_t=mas_t, mask_t=mask_t)
+    known_points = extract_known_control_points(
+        mas_t=mas_t,
+        mask_t=mask_t,
+        action_dim=action_dim,
+    )
     if len(known_points) == 0:
         return dict(
             ce_traj=np.nan,

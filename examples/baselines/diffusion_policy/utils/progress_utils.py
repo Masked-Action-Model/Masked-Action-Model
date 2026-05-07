@@ -7,6 +7,8 @@ try:
         augment_mas_with_progress_torch,
         build_progress_column_torch,
         pad_augmented_mas_torch,
+        set_mas_action_dim as _set_data_preprocess_mas_action_dim,
+        validate_action_dim,
     )
 except ModuleNotFoundError:
     from examples.baselines.diffusion_policy.data_preprocess.utils.progress_utils import (
@@ -15,7 +17,17 @@ except ModuleNotFoundError:
         augment_mas_with_progress_torch,
         build_progress_column_torch,
         pad_augmented_mas_torch,
+        set_mas_action_dim as _set_data_preprocess_mas_action_dim,
+        validate_action_dim,
     )
+
+
+def set_mas_action_dim(action_dim: int) -> None:
+    global MAS_ACTION_DIM, MAS_STEP_DIM
+    action_dim = validate_action_dim(action_dim)
+    _set_data_preprocess_mas_action_dim(action_dim)
+    MAS_ACTION_DIM = action_dim
+    MAS_STEP_DIM = action_dim + 1
 
 
 def build_progress_column(traj_len: int, mas_len: int, device: torch.device) -> torch.Tensor:
@@ -23,7 +35,11 @@ def build_progress_column(traj_len: int, mas_len: int, device: torch.device) -> 
 
 
 def augment_mas_with_progress(mas_t: torch.Tensor, traj_len: int) -> torch.Tensor:
-    return augment_mas_with_progress_torch(mas_t=mas_t, traj_len=traj_len)
+    return augment_mas_with_progress_torch(
+        mas_t=mas_t,
+        traj_len=traj_len,
+        action_dim=MAS_ACTION_DIM,
+    )
 
 
 def augment_mask_with_progress(
@@ -44,6 +60,7 @@ def augment_mask_with_progress(
         progress_source = augment_mas_with_progress_torch(
             mas_t=mas_t.to(device=mask_t.device, dtype=torch.float32),
             traj_len=traj_len,
+            action_dim=MAS_ACTION_DIM,
         )
         progress_col = progress_source[:, -1:].to(device=mask_t.device, dtype=mask_t.dtype)
     else:
@@ -66,6 +83,7 @@ def pad_mas_to_length(
         target_len=target_len,
         traj_len=traj_len,
         masked_value=masked_value,
+        action_dim=MAS_ACTION_DIM,
     )
 
 

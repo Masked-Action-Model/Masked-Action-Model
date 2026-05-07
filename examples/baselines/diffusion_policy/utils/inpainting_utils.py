@@ -47,20 +47,23 @@ def build_current_inpaint_mas_mask(
         local_traj_id = int(traj_id.item())
         mas_t = mas_list[local_traj_id].to(device=device, dtype=dtype)
         mask_t = mas_mask_list[local_traj_id].to(device=device, dtype=dtype)
-        if mas_t.ndim != 2 or mas_t.shape[1] < 8:
-            raise ValueError(f"expected augmented mas shape (T, >=8), got {tuple(mas_t.shape)}")
+        if mas_t.ndim != 2 or mas_t.shape[1] < 2:
+            raise ValueError(
+                f"expected augmented mas shape (T, action_dim+1), got {tuple(mas_t.shape)}"
+            )
         if mask_t.shape != mas_t.shape:
             raise ValueError(
                 f"expected mask shape {tuple(mas_t.shape)}, got {tuple(mask_t.shape)}"
             )
+        action_dim = int(mas_t.shape[1]) - 1
 
         progress_col = mas_t[:, -1]
         target_progress = torch.clamp(current_progress[batch_idx, 0], min=0.0, max=1.0)
         anchor_idx = int(torch.argmin(torch.abs(progress_col - target_progress)).item())
         end_idx = min(anchor_idx + pred_horizon, mas_t.shape[0])
 
-        future_mas = mas_t[anchor_idx:end_idx, :7]
-        future_mask = mask_t[anchor_idx:end_idx, :7]
+        future_mas = mas_t[anchor_idx:end_idx, :action_dim]
+        future_mask = mask_t[anchor_idx:end_idx, :action_dim]
         future_mas = _pad_last_step(future_mas, pred_horizon)
         future_mask = _pad_last_step(future_mask, pred_horizon)
 
@@ -105,7 +108,7 @@ def build_inpaint_mas_mask(
 
     action_known_0 = mas_inpaint.new_zeros((batch_size, pred_horizon, action_dim))
     action_mask = mas_inpaint.new_zeros((batch_size, pred_horizon, action_dim))
-    known_dims = min(int(action_dim), int(mas_inpaint.shape[-1]), 7)
+    known_dims = min(int(action_dim), int(mas_inpaint.shape[-1]))
     copy_len = min(int(mas_inpaint.shape[1]), pred_horizon - start)
 
     action_known_0[:, start : start + copy_len, :known_dims] = mas_inpaint[

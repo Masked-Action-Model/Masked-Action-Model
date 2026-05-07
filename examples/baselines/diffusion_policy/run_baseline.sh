@@ -40,6 +40,7 @@ OVERWRITE_SPLIT="${OVERWRITE_SPLIT:-false}"
 # -----------------------------------------------------------------------------
 
 ENV_ID="${ENV_ID:-PickCube-v1}"
+ACTION_DIM="${ACTION_DIM:-7}" # 7=有夹爪，6=无夹爪/panda_stick
 CONTROL_MODE="${CONTROL_MODE:-pd_ee_pose}"
 OBS_MODE="${OBS_MODE:-rgb}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-100}"
@@ -99,6 +100,13 @@ case "$NOISE_MODEL" in
     exit 1
     ;;
 esac
+case "$ACTION_DIM" in
+  6|7) ;;
+  *)
+    echo "ERROR: ACTION_DIM must be 6 or 7, got: $ACTION_DIM" >&2
+    exit 1
+    ;;
+esac
 
 # -----------------------------------------------------------------------------
 # 8. Build args
@@ -108,6 +116,7 @@ ARGS=(
   --seed "$SEED"
   --wandb-project-name "$WANDB_PROJECT_NAME"
   --env-id "$ENV_ID"
+  --action-dim "$ACTION_DIM"
   --raw-demo-h5 "$RAW_DEMO_H5"
   --raw-demo-json "$RAW_DEMO_JSON"
   --split-output-dir "$SPLIT_OUTPUT_DIR"

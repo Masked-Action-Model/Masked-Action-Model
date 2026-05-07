@@ -42,6 +42,12 @@ class ReWiNDWorkspace:
         configured_camera_names = getattr(cfg.general, "camera_names", "auto")
         self.camera_names = resolve_camera_names(cfg.general.repo_id, configured_camera_names)
         cfg.general.camera_names = self.camera_names
+        camera_poses = getattr(cfg.general, "camera_poses", None)
+        self.camera_poses = (
+            OmegaConf.to_container(camera_poses, resolve=True)
+            if camera_poses is not None
+            else {}
+        )
         cfg.general.state_paths = resolve_state_paths(
             list(getattr(cfg.general, "state_paths", [])) or None
         )
@@ -57,6 +63,8 @@ class ReWiNDWorkspace:
             )
         cfg.model.state_dim = inferred_state_dim
         print(f"[Init] STPM cameras: {self.camera_names}")
+        if self.camera_poses:
+            print(f"[Init] STPM camera_poses: {self.camera_poses}")
         print(f"[Init] STPM state_paths: {list(cfg.general.state_paths)}")
         print(f"[Init] STPM state_dim: {cfg.model.state_dim}")
         self.task_description = str(

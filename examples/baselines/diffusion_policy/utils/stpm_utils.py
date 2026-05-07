@@ -24,6 +24,103 @@ def _progress_delta_from_traj_len(traj_len: int) -> float:
     return 1.0 / float(traj_len - 1)
 
 
+STATELESS_OBS_KEYS = {"sensor_data", "sensor_param"}
+
+
+def _state_leaf_dim(value) -> int:
+    shape = tuple(getattr(value, "shape", ()))
+    if len(shape) <= 1:
+        return 1
+    dim = 1
+    for size in shape[1:]:
+        dim *= int(size)
+    return int(dim)
+
+
+def _flatten_rollout_state_schema(raw_obs: dict, prefix: str = "obs") -> list[tuple[str, int]]:
+    schema = []
+    for key, value in raw_obs.items():
+        if key in STATELESS_OBS_KEYS:
+            continue
+        path = f"{prefix}/{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            schema.extend(_flatten_rollout_state_schema(value, path))
+        else:
+            schema.append((path, _state_leaf_dim(value)))
+    return schema
+
+
+def _schema_offsets(schema: list[tuple[str, int]]) -> dict[str, tuple[int, int]]:
+    offsets = {}
+    offset = 0
+    for path, dim in schema:
+        next_offset = offset + int(dim)
+        offsets[path] = (offset, next_offset)
+        offset = next_offset
+    return offsets
+
+
+def configure_stpm_rollout_state_mapping(
+    stpm_encoder,
+    raw_obs: dict,
+    rollout_state_dim: int,
+):
+    schema = _flatten_rollout_state_schema(raw_obs)
+    schema_dim = sum(dim for _, dim in schema)
+    if schema_dim != int(rollout_state_dim):
+        raise ValueError(
+            "Rollout raw observation schema does not match flattened state dim: "
+            f"schema_dim={schema_dim}, rollout_state_dim={rollout_state_dim}, schema={schema!r}"
+        )
+
+    state_paths = list(getattr(stpm_encoder, "state_paths", []))
+    expected_state_dim = int(stpm_encoder.state_dim)
+    offsets = _schema_offsets(schema)
+    if not state_paths:
+        if schema_dim != expected_state_dim:
+            raise ValueError(
+                "STPM checkpoint has no state_paths and rollout state dim differs from "
+                f"checkpoint state_dim: rollout={schema_dim}, checkpoint={expected_state_dim}."
+            )
+        stpm_encoder.rollout_state_schema = schema
+        stpm_encoder.rollout_state_index_by_path = None
+        return
+
+    missing_paths = [path for path in state_paths if path not in offsets]
+    if missing_paths:
+        if schema_dim == expected_state_dim:
+            stpm_encoder.rollout_state_schema = schema
+            stpm_encoder.rollout_state_index_by_path = None
+            _debug_print_once(
+                "stpm_state_identity_missing_paths",
+                "[stpm] rollout state dim matches checkpoint, but some checkpoint "
+                f"state_paths are absent from raw obs schema; using identity state. "
+                f"missing={missing_paths}, schema={schema}",
+            )
+            return
+        raise ValueError(
+            "Current rollout state cannot be mapped to the STPM checkpoint state layout. "
+            f"Missing paths={missing_paths}, checkpoint_state_paths={state_paths}, "
+            f"rollout_schema={schema}."
+        )
+
+    mapped_dim = sum(offsets[path][1] - offsets[path][0] for path in state_paths)
+    if mapped_dim != expected_state_dim:
+        raise ValueError(
+            "Mapped rollout state dim does not match STPM checkpoint state_dim: "
+            f"mapped={mapped_dim}, checkpoint={expected_state_dim}, "
+            f"state_paths={state_paths}, rollout_schema={schema}."
+        )
+
+    stpm_encoder.rollout_state_schema = schema
+    stpm_encoder.rollout_state_index_by_path = offsets
+    _debug_print_once(
+        "stpm_state_schema_mapping",
+        f"[stpm] rollout state mapping ready: rollout_dim={schema_dim}, "
+        f"checkpoint_dim={expected_state_dim}, state_paths={state_paths}",
+    )
+
+
 PICKCUBE_QPOS_DIM = 9
 PICKCUBE_QVEL_DIM = 9
 PICKCUBE_IS_GRASPED_DIM = 1
@@ -50,6 +147,54 @@ LEGACY_PICKCUBE_STPM_STATE_PATHS = [
     "obs/extra/tcp_pose",
     "obs/extra/is_grasped",
 ]
+PICKCUBE_STATE_PATH_DIMS = {
+    "obs/agent/qpos": PICKCUBE_QPOS_DIM,
+    "obs/agent/qvel": PICKCUBE_QVEL_DIM,
+    "obs/extra/is_grasped": PICKCUBE_IS_GRASPED_DIM,
+    "obs/extra/tcp_pose": PICKCUBE_TCP_POSE_DIM,
+    "obs/extra/goal_pos": PICKCUBE_GOAL_POS_DIM,
+}
+
+
+def _state_dim_for_paths(state_paths: list[str]) -> int | None:
+    dims = [PICKCUBE_STATE_PATH_DIMS.get(path) for path in state_paths]
+    if any(dim is None for dim in dims):
+        return None
+    return int(sum(dims))
+
+
+def _slice_state_by_paths(
+    rollout_state: torch.Tensor,
+    source_paths: list[str],
+    target_paths: list[str],
+) -> torch.Tensor:
+    source_dim = _state_dim_for_paths(source_paths)
+    target_dim = _state_dim_for_paths(target_paths)
+    if source_dim is None or target_dim is None:
+        raise ValueError(
+            "Cannot reorder STPM state because at least one state path has no known "
+            f"PickCube dimension. source_paths={source_paths!r}, target_paths={target_paths!r}"
+        )
+    if rollout_state.numel() != source_dim:
+        raise ValueError(
+            "Cannot reorder STPM state because rollout dim does not match source schema: "
+            f"rollout={rollout_state.numel()}, source_dim={source_dim}, source_paths={source_paths!r}"
+        )
+
+    slices = {}
+    offset = 0
+    for path in source_paths:
+        next_offset = offset + PICKCUBE_STATE_PATH_DIMS[path]
+        slices[path] = rollout_state[offset:next_offset]
+        offset = next_offset
+
+    missing_paths = [path for path in target_paths if path not in slices]
+    if missing_paths:
+        raise ValueError(
+            "Cannot reorder STPM state because rollout schema is missing checkpoint paths: "
+            f"missing={missing_paths!r}, source_paths={source_paths!r}, target_paths={target_paths!r}"
+        )
+    return torch.cat([slices[path] for path in target_paths], dim=0)
 
 
 def validate_stpm_eval_setup(stpm_encoder, stpm_n_obs_steps: int, stpm_frame_gap: int):
@@ -144,45 +289,86 @@ def _prepare_rollout_state_for_stpm(rollout_state: torch.Tensor, stpm_encoder):
             f"Expected single rollout state frame to be 1D, got shape {tuple(rollout_state.shape)}"
         )
     expected_state_dim = int(stpm_encoder.state_dim)
-    if rollout_state.numel() != expected_state_dim:
-        raise ValueError(
-            "Rollout state dim does not match STPM checkpoint state_dim: "
-            f"rollout={rollout_state.numel()}, checkpoint={expected_state_dim}."
-        )
     state_paths = list(getattr(stpm_encoder, "state_paths", []))
+    rollout_offsets = getattr(stpm_encoder, "rollout_state_index_by_path", None)
+    if rollout_offsets is not None and state_paths:
+        if rollout_state.numel() != sum(
+            end - start for start, end in rollout_offsets.values()
+        ):
+            raise ValueError(
+                "Rollout state dim does not match configured rollout schema: "
+                f"rollout={rollout_state.numel()}, schema={getattr(stpm_encoder, 'rollout_state_schema', None)!r}"
+            )
+        missing_paths = [path for path in state_paths if path not in rollout_offsets]
+        if missing_paths:
+            raise ValueError(
+                "Configured rollout schema is missing STPM checkpoint paths: "
+                f"missing={missing_paths}, state_paths={state_paths!r}"
+            )
+        mapped_pieces = []
+        for path in state_paths:
+            start, end = rollout_offsets[path]
+            mapped_pieces.append(rollout_state[start:end])
+        mapped = torch.cat(mapped_pieces, dim=0)
+        if mapped.numel() != expected_state_dim:
+            raise ValueError(
+                "Mapped STPM state dim does not match checkpoint state_dim: "
+                f"mapped={mapped.numel()}, checkpoint={expected_state_dim}, state_paths={state_paths!r}"
+            )
+        return mapped
+
+    target_dim = _state_dim_for_paths(state_paths)
+    if target_dim is not None and target_dim != expected_state_dim:
+        raise ValueError(
+            "STPM checkpoint state_dim does not match its state_paths dimensions: "
+            f"checkpoint={expected_state_dim}, state_paths_dim={target_dim}, state_paths={state_paths!r}"
+        )
+
     if state_paths in ([], ROLLOUT_DEFAULT_STATE_PATHS):
+        if rollout_state.numel() != expected_state_dim:
+            raise ValueError(
+                "Rollout state dim does not match STPM checkpoint state_dim: "
+                f"rollout={rollout_state.numel()}, checkpoint={expected_state_dim}."
+            )
         _debug_print_once(
             "check5_state_identity",
             f"[check5] STPM state uses rollout order directly: dim={rollout_state.numel()}",
         )
         return rollout_state
 
-    if state_paths != LEGACY_PICKCUBE_STPM_STATE_PATHS or rollout_state.numel() != PICKCUBE_ROLLOUT_STATE_DIM:
-        raise ValueError(
-            "STPM checkpoint state_paths do not match the rollout flattened state order. "
-            "Retrain STPM with state_paths matching rollout order, or add an explicit "
-            f"state reorder mapping. state_paths={state_paths!r}"
+    if rollout_state.numel() == PICKCUBE_ROLLOUT_STATE_DIM:
+        reordered = _slice_state_by_paths(
+            rollout_state,
+            source_paths=ROLLOUT_DEFAULT_STATE_PATHS,
+            target_paths=state_paths,
         )
+        if reordered.numel() != expected_state_dim:
+            raise ValueError(
+                "Reordered STPM state dim does not match checkpoint state_dim: "
+                f"reordered={reordered.numel()}, checkpoint={expected_state_dim}, state_paths={state_paths!r}"
+            )
+        _debug_print_once(
+            "check5_state_reorder",
+            f"[check5] STPM state reordered from rollout default order to checkpoint order: "
+            f"input_dim={rollout_state.numel()}, reordered_dim={reordered.numel()}, "
+            f"state_paths={state_paths}",
+        )
+        return reordered
 
-    qpos_end = PICKCUBE_QPOS_DIM
-    qvel_end = qpos_end + PICKCUBE_QVEL_DIM
-    is_grasped_end = qvel_end + PICKCUBE_IS_GRASPED_DIM
-    tcp_pose_end = is_grasped_end + PICKCUBE_TCP_POSE_DIM
-    goal_pos_end = tcp_pose_end + PICKCUBE_GOAL_POS_DIM
+    if rollout_state.numel() == expected_state_dim:
+        _debug_print_once(
+            "check5_state_checkpoint_order",
+            f"[check5] STPM state uses checkpoint order directly: dim={rollout_state.numel()}, "
+            f"state_paths={state_paths}",
+        )
+        return rollout_state
 
-    qpos = rollout_state[:qpos_end]
-    qvel = rollout_state[qpos_end:qvel_end]
-    is_grasped = rollout_state[qvel_end:is_grasped_end]
-    tcp_pose = rollout_state[is_grasped_end:tcp_pose_end]
-    goal_pos = rollout_state[tcp_pose_end:goal_pos_end]
-
-    reordered = torch.cat((qpos, qvel, goal_pos, tcp_pose, is_grasped), dim=0)
-    _debug_print_once(
-        "check5_legacy_reorder",
-        f"[check5] legacy PickCube STPM state reorder validated: input_dim={rollout_state.numel()}, "
-        f"reordered_dim={reordered.numel()}, order=(qpos,qvel,goal_pos,tcp_pose,is_grasped)",
+    raise ValueError(
+        "STPM checkpoint state_paths do not match the rollout flattened state order. "
+        "Retrain STPM with state_paths matching rollout order, or add an explicit "
+        f"state reorder mapping. rollout_dim={rollout_state.numel()}, "
+        f"checkpoint_dim={expected_state_dim}, state_paths={state_paths!r}"
     )
-    return reordered
 
 
 def _build_stpm_rgb_frame(rgb_frame: torch.Tensor, num_cameras: int):

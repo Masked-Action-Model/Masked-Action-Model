@@ -18,6 +18,7 @@ from train_mam import (
     _load_state_norm_stats_from_meta,
     build_eval_batch_indices,
     build_eval_stpm_encoder,
+    configure_mas_dimensions,
     validate_only_mas_eval_layout,
 )
 from utils.control_error_utils import (
@@ -55,6 +56,7 @@ class Args:
     stpm_config_path: str = "STPM/config/rewind_maniskill.yaml"
 
     env_id: str = "PickCube-v1"
+    action_dim: int = 7
     control_mode: str = "pd_ee_pose"
     max_episode_steps: int = 200
     num_eval_demos: int = 5
@@ -139,6 +141,7 @@ def _compute_expected_obs_cond_dim(
     mas_long_conv_output_dim: int,
     short_window_horizon: int,
     legacy_short_mask_branch: bool = False,
+    mas_step_dim: int = MAS_STEP_DIM,
 ) -> int:
     visual_feature_dim = 256
     obs_state_dim = int(envs.single_observation_space["state"].shape[1])
@@ -149,9 +152,9 @@ def _compute_expected_obs_cond_dim(
     if int(short_window_horizon) <= 0:
         mas_short_feature_dim = 0
     elif legacy_short_mask_branch:
-        mas_short_feature_dim = 2 * int(short_window_horizon) * MAS_STEP_DIM
+        mas_short_feature_dim = 2 * int(short_window_horizon) * mas_step_dim
     else:
-        mas_short_feature_dim = int(short_window_horizon) * MAS_STEP_DIM
+        mas_short_feature_dim = int(short_window_horizon) * mas_step_dim
     return visual_feature_dim + obs_state_dim + mas_long_feature_dim + mas_short_feature_dim
 
 
@@ -161,8 +164,9 @@ def _build_legacy_short_mask_feature(
     obs_horizon: int,
     short_window_horizon: int,
     state_dtype: torch.dtype,
+    mas_step_dim: int = MAS_STEP_DIM,
 ) -> torch.Tensor:
-    expected_dim = int(short_window_horizon) * MAS_STEP_DIM
+    expected_dim = int(short_window_horizon) * mas_step_dim
     if mas_short_window.shape[-1] != expected_dim:
         raise ValueError(
             "legacy short-window 兼容模式下 short window 维度不匹配: "
@@ -179,19 +183,19 @@ def _build_legacy_short_mask_feature(
         batch_size,
         obs_horizon,
         short_window_horizon,
-        MAS_STEP_DIM,
+        mas_step_dim,
     )
     mas_mask = mas_short_window_mask.to(dtype=state_dtype).reshape(
         batch_size,
         obs_horizon,
         short_window_horizon,
-        MAS_STEP_DIM,
+        mas_step_dim,
     )
     raw_mas = mas_short_window.reshape(
         batch_size,
         obs_horizon,
         short_window_horizon,
-        MAS_STEP_DIM,
+        mas_step_dim,
     )
     mas_value[..., :-1] = mas_value[..., :-1] * mas_mask[..., :-1]
     mas_mask[..., -1] = raw_mas[..., -1].to(dtype=state_dtype)
@@ -211,6 +215,7 @@ def _validate_checkpoint_obs_cond_dim(args: Args, envs, state_dict: dict) -> Non
         mas_long_conv_output_dim=args.mas_long_conv_output_dim,
         short_window_horizon=args.short_window_horizon,
         legacy_short_mask_branch=args.legacy_short_mask_branch,
+        mas_step_dim=int(args.action_dim) + 1,
     )
     if checkpoint_obs_dim != expected_obs_dim:
         if args.legacy_short_mask_branch:
@@ -241,10 +246,16 @@ def _build_agent_runtime_args(args: Args):
         act_horizon=int(args.act_horizon),
         pred_horizon=int(args.pred_horizon),
         long_window_horizon=int(long_window_horizon),
+        long_window_backward_length=0,
+        long_window_forward_length=int(long_window_horizon),
         short_window_horizon=short_window_horizon,
         mas_long_encode_mode=args.mas_long_encode_mode,
         mas_long_conv_output_dim=mas_long_conv_output_dim,
+        loss_mode="average",
+        loss_mask_area_weight=0.2,
+        obs_mode="rgb+depth",
         diffusion_step_embed_dim=int(args.diffusion_step_embed_dim),
+        action_dim=int(args.action_dim),
     )
 
 
@@ -483,6 +494,7 @@ def _rollout_one_eval_batch(
                     obs_horizon=obs_horizon,
                     short_window_horizon=short_window_horizon,
                     state_dtype=obs["state"].dtype,
+                    mas_step_dim=int(agent.act_dim) + 1,
                 )
 
             action_seq = agent.get_action(obs)
@@ -520,7 +532,10 @@ def _rollout_one_eval_batch(
                 for env_idx, episode in enumerate(final_episodes):
                     action_chunks = executed_action_chunks[env_idx]
                     if len(action_chunks) == 0:
-                        executed_actions_denorm = np.zeros((0, 7), dtype=np.float32)
+                        executed_actions_denorm = np.zeros(
+                            (0, int(agent.act_dim)),
+                            dtype=np.float32,
+                        )
                     else:
                         executed_actions_denorm = np.concatenate(action_chunks, axis=0)
                     rollout_records.append(
@@ -610,6 +625,7 @@ def _compute_control_error_results(
 def main():
     # 1. 解析命令行并补齐和训练脚本一致的默认窗口长度。
     args = tyro.cli(Args)
+    configure_mas_dimensions(args.action_dim)
 
     if args.long_window_horizon is None:
         args.long_window_horizon = args.pred_horizon

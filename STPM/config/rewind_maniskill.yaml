@@ -4,6 +4,7 @@ general:
   repo_id: demos/data_1/data_1_train.h5                   # dataset .h5 path
   state_norm_path: STPM/pickcube_state_norm_train.json  
   camera_names: "auto"
+  camera_poses: {}
   state_paths: ["obs/agent/qpos", "obs/agent/qvel", "obs/extra/is_grasped", "obs/extra/tcp_pose", "obs/extra/goal_pos"]
   seed: 42
   device: "cuda"  

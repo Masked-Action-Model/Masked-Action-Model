@@ -26,6 +26,7 @@ STATE_PATHS="${STATE_PATHS:-auto}"
 SEED="${SEED:-42}"
 DEVICE="${DEVICE:-cuda}"
 CAMERA_NAMES="${CAMERA_NAMES:-auto}"
+CAMERA_POSES_JSON="${CAMERA_POSES_JSON:-}"
 VISION_CKPT="${VISION_CKPT:-pretrained/clip-vit-base-patch32}"
 
 BATCH_SIZE="${BATCH_SIZE:-32}"
@@ -59,7 +60,7 @@ SAVE_EVERY="${SAVE_EVERY:-5000}"
 VAL_PORTION="${VAL_PORTION:-0.1}"
 
 export \
-  DATASET_PATH TASK_NAME TASK_DESCRIPTION OUTPUT_DIR STATE_PATHS SEED DEVICE CAMERA_NAMES VISION_CKPT \
+  DATASET_PATH TASK_NAME TASK_DESCRIPTION OUTPUT_DIR STATE_PATHS SEED DEVICE CAMERA_NAMES CAMERA_POSES_JSON VISION_CKPT \
   BATCH_SIZE NUM_WORKERS VAL_BATCH_SIZE VAL_NUM_WORKERS D_MODEL N_LAYERS N_HEADS \
   DROPOUT N_OBS_STEPS FRAME_GAP NO_STATE RESUME_TRAINING MODEL_PATH LR WEIGHT_DECAY \
   BETA1 BETA2 EPS WARMUP_STEPS TOTAL_STEPS NUM_EPOCHS GRAD_CLIP LOG_EVERY EVAL_EVERY \
@@ -239,6 +240,8 @@ cfg.general.repo_id = str(dataset_path)
 cfg.general.state_norm_path = str(state_norm_path)
 cfg.general.state_paths = state_paths
 cfg.general.camera_names = camera_names
+if os.environ["CAMERA_POSES_JSON"].strip():
+    cfg.general.camera_poses = json.loads(os.environ["CAMERA_POSES_JSON"])
 cfg.general.seed = int(os.environ["SEED"])
 cfg.general.device = os.environ["DEVICE"]
 
