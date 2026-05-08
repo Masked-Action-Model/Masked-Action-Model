@@ -91,3 +91,46 @@
   - `bash -n` 通过三个入口脚本。
   - `py_compile` 通过修改过的 Python 文件。
   - 已用 synthetic `(T, 6)` action 验证 mask、MAS progress、MAS window shape：`mas=(T,7)`。
+
+## pushT数据集replay问题
+
+当前repo里的replay脚本好像只能把joint_pos转化成其他control mode
+但下载的官方pushT demo并没有joint_pos这一控制模式（见demos/pushT/rl）
+
+我想要你写一个replay脚本，用现有三种数据类型中的任意一种replay成pdeepose。
+
+分析一下可行性：
+
+- 可行。官方 PushT RL 三类数据本地实际路径为 `demos/PushT-v1/rl/`，分别是：
+  - `trajectory.none.pd_joint_delta_pos.physx_cuda.h5`
+  - `trajectory.none.pd_ee_delta_pos.physx_cuda.h5`
+  - `trajectory.none.pd_ee_delta_pose.physx_cuda.h5`
+- 三类数据都带完整 `env_states`，每条轨迹的 `env_states` 比 `actions` 多 1 帧，可从 `env_states[t+1]` 还原下一帧 TCP pose。
+- `pd_ee_pose` 对 `panda_stick` 是 6 维非归一化绝对动作：`[x, y, z, roll, pitch, yaw]`，坐标在机器人 base frame 下。
+- 现有 `mani_skill.trajectory.replay_trajectory` 不能直接做这个转换，因为它只支持从 `pd_joint_pos` / `pd_joint_delta_pos` 转部分控制模式；PushT 官方 RL 数据不是 `pd_joint_pos`。
+- 已新增脚本：`scripts/data_generation/replay_pusht_rl_to_pd_ee_pose.py`。
+  - 输入任一 PushT RL h5/json。
+  - 用 `env_states[t+1]` 的 TCP pose 生成 `pd_ee_pose` action。
+  - 每步执行后强制同步到原始 `env_states[t+1]`，并修正记录 buffer 的 obs/env_state/success，避免 CPU replay 漂移。
+  - 默认单环境 `physx_cpu`，绕开 GPU 并行 replay 不支持跨控制模式的问题。
+
+示例命令：
+
+```bash
+python scripts/data_generation/replay_pusht_rl_to_pd_ee_pose.py \
+  --traj-path demos/PushT-v1/rl/trajectory.none.pd_ee_delta_pose.physx_cuda.h5 \
+  --obs-mode rgb+state \
+  --sim-backend physx_cpu \
+  --overwrite
+```
+
+如果想先小样本检查：
+
+```bash
+python scripts/data_generation/replay_pusht_rl_to_pd_ee_pose.py \
+  --traj-path demos/PushT-v1/rl/trajectory.none.pd_ee_delta_pose.physx_cuda.h5 \
+  --obs-mode state \
+  --output-dir /tmp/pusht_pd_ee_pose_smoke \
+  --count 1 \
+  --overwrite
+```

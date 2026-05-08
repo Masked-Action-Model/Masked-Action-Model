@@ -77,6 +77,7 @@ from utils.utils import (IterationBasedBatchSampler, build_state_obs_extractor,
 from utils.video_utils import (
     clear_iteration_artifacts,
 )
+from data_preprocess.utils.obs_utils import build_state_schema_from_obs
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
@@ -373,17 +374,21 @@ def validate_only_mas_eval_layout(envs: VectorEnv, stpm_encoder, env_id: str, en
     )
     expected_rgb_channels = 3 * len(camera_names)
 
-    if not camera_names or camera_names[0] != "base_camera":
-        raise ValueError(
-            "STPM-driven eval expects base_camera as the first camera, "
-            f"got camera_names={camera_names!r}."
-        )
+    if not camera_names:
+        raise ValueError("STPM-driven eval requires at least one checkpoint camera.")
     if rgb_shape[-1] != expected_rgb_channels:
         raise ValueError(
             "Rollout RGB channels do not match the STPM checkpoint camera count, "
             f"got rgb shape {rgb_shape}, camera_names={camera_names!r}."
         )
     raw_obs = _get_eval_raw_obs_for_state_schema(env_id, env_kwargs)
+    rollout_camera_names = list(raw_obs.get("sensor_data", {}).keys())
+    if rollout_camera_names != camera_names:
+        raise ValueError(
+            "Rollout camera order does not match the STPM checkpoint camera order. "
+            f"rollout={rollout_camera_names!r}, checkpoint={camera_names!r}. "
+            "Set STPM config camera_names/camera configs to match the eval env."
+        )
     configure_stpm_rollout_state_mapping(
         stpm_encoder,
         raw_obs=raw_obs,
@@ -420,8 +425,89 @@ def _load_state_norm_stats_from_meta(meta: dict):
         np.asarray(meta["state_max"], dtype=np.float32),
     )
 
+
+def _decode_meta_scalar(value):
+    value = np.asarray(value)
+    if value.shape != ():
+        return value
+    item = value.item()
+    if isinstance(item, bytes):
+        return item.decode("utf-8")
+    return item
+
+
+def _load_state_schema_from_meta(meta: dict):
+    raw_schema = meta.get("state_schema_json")
+    if raw_schema is None:
+        return None
+    raw_schema = _decode_meta_scalar(raw_schema)
+    if isinstance(raw_schema, bytes):
+        raw_schema = raw_schema.decode("utf-8")
+    if not isinstance(raw_schema, str) or len(raw_schema.strip()) == 0:
+        return None
+    return json.loads(raw_schema)
+
+
+def _schema_signature(schema: list[dict]) -> list[tuple[str, int]]:
+    return [(str(entry["path"]), int(entry["dim"])) for entry in schema]
+
+
+def _validate_mam_state_alignment(
+    data_path: str,
+    dataset_meta: dict,
+    obs_space,
+    state_obs_extractor,
+) -> None:
+    dataset_schema = _load_state_schema_from_meta(dataset_meta)
+    if dataset_schema is None:
+        raise ValueError(
+            "MAM preprocessed dataset has no meta/state_schema_json, so state "
+            f"alignment cannot be verified: {data_path}. Regenerate the dataset "
+            "with the current diffusion_policy preprocessing scripts."
+        )
+    env_schema = build_state_schema_from_obs(obs_space, has_leading_axis=False)
+    dataset_sig = _schema_signature(dataset_schema)
+    env_sig = _schema_signature(env_schema)
+    if dataset_sig != env_sig:
+        raise ValueError(
+            "MAM state schema mismatch between preprocessed dataset and env rollout. "
+            f"dataset={dataset_sig}, env={env_sig}, data_path={data_path}. "
+            "Regenerate the preprocessed dataset with the current diffusion_policy state extractor."
+        )
+    state_min, state_max = _load_state_norm_stats_from_meta(dataset_meta)
+    expected_dim = sum(dim for _, dim in dataset_sig)
+    if state_min is not None and int(state_min.shape[0]) != expected_dim:
+        raise ValueError(
+            f"MAM state_min dim={state_min.shape[0]} does not match schema dim={expected_dim}"
+        )
+    if state_max is not None and int(state_max.shape[0]) != expected_dim:
+        raise ValueError(
+            f"MAM state_max dim={state_max.shape[0]} does not match schema dim={expected_dim}"
+        )
+    normalized_state_dims = dataset_meta.get("normalized_state_dims")
+    if normalized_state_dims is not None:
+        normalized_state_dims = np.asarray(normalized_state_dims, dtype=np.int64)
+        expected = np.arange(expected_dim, dtype=np.int64)
+        if normalized_state_dims.shape != expected.shape or not np.array_equal(
+            normalized_state_dims, expected
+        ):
+            raise ValueError(
+                "MAM dataset does not mark all state dims as normalized: "
+                f"normalized_state_dims={normalized_state_dims.tolist()}, expected={expected.tolist()}"
+            )
+    print(f"[state_norm] state schema aligned and fully normalized, dim={expected_dim}")
+
 class SmallDemoDataset_MasWindowDiffusionPolicy(Dataset):  # Load everything into memory
-    def __init__(self, data_path, obs_process_fn, obs_space, device, num_traj, traj_indices=None):
+    def __init__(
+        self,
+        data_path,
+        obs_process_fn,
+        obs_space,
+        device,
+        num_traj,
+        traj_indices=None,
+        state_obs_extractor=None,
+    ):
         self.include_depth = policy_uses_depth(args.obs_mode)
 
         load_keys = ["observations", "actions", "mas", "mask", "env_states", "success", "terminated", "truncated"]
@@ -433,6 +519,12 @@ class SmallDemoDataset_MasWindowDiffusionPolicy(Dataset):  # Load everything int
             traj_indices=traj_indices,
         )
         dataset_meta = load_dataset_meta(data_path)
+        _validate_mam_state_alignment(
+            data_path=data_path,
+            dataset_meta=dataset_meta,
+            obs_space=obs_space,
+            state_obs_extractor=state_obs_extractor,
+        )
         self.state_is_normalized = _meta_flag(dataset_meta, "states_normalized", False)
         print(
             f"[obs-mode] policy obs_mode={args.obs_mode}, "
@@ -1552,11 +1644,12 @@ if __name__ == "__main__":
     orignal_obs_space = tmp_env.observation_space
     tmp_env.close()
 
+    state_obs_extractor = build_state_obs_extractor(args.env_id)
     obs_process_fn = partial(
         convert_obs,
         concat_fn=partial(np.concatenate, axis=-1),  # merge camera outputs
         transpose_fn=partial(np.transpose, axes=(0, 3, 1, 2)),  # (B, H, W, C) -> (B, C, H, W)
-        state_obs_extractor=build_state_obs_extractor(args.env_id),
+        state_obs_extractor=state_obs_extractor,
         depth=policy_uses_depth(args.obs_mode),
     )
 
@@ -1605,6 +1698,7 @@ if __name__ == "__main__":
         device=device,
         num_traj=None,
         traj_indices=train_demo_indices,
+        state_obs_extractor=state_obs_extractor,
     )
 
     dataset.debug_print_sample(0)

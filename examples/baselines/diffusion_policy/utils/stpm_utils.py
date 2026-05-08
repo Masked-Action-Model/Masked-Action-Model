@@ -210,11 +210,8 @@ def validate_stpm_eval_setup(stpm_encoder, stpm_n_obs_steps: int, stpm_frame_gap
             [getattr(stpm_encoder, "camera_name", "base_camera")],
         )
     )
-    if not camera_names or camera_names[0] != "base_camera":
-        raise ValueError(
-            "STPM-driven only-mas evaluation expects base_camera as the first camera, "
-            f"got camera_names={camera_names!r}."
-        )
+    if not camera_names:
+        raise ValueError("STPM-driven only-mas evaluation requires at least one camera.")
     if int(stpm_n_obs_steps) <= 0:
         raise ValueError(f"stpm_n_obs_steps must be positive, got {stpm_n_obs_steps}")
     if int(stpm_frame_gap) <= 0:

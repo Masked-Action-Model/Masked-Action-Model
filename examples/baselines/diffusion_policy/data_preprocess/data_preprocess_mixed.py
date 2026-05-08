@@ -18,9 +18,11 @@ if __package__ in (None, ""):
 try:
     from examples.baselines.diffusion_policy.data_preprocess.data_preprocess import (
         default_output_dir,
+        build_state_schema_from_obs_group,
         iter_selected_action_arrays,
         iter_selected_state_arrays,
         load_state_matrix_from_obs_group,
+        state_schema_paths,
         split_source_episode_ids,
         validate_dataset_alignment,
         validate_inputs,
@@ -53,9 +55,11 @@ try:
 except ModuleNotFoundError:
     from data_preprocess.data_preprocess import (
         default_output_dir,
+        build_state_schema_from_obs_group,
         iter_selected_action_arrays,
         iter_selected_state_arrays,
         load_state_matrix_from_obs_group,
+        state_schema_paths,
         split_source_episode_ids,
         validate_dataset_alignment,
         validate_inputs,
@@ -744,6 +748,7 @@ def write_split_h5(
     mask_seed: int,
     input_json: Path,
     action_dim: int,
+    state_schema: list[dict[str, Any]],
 ) -> None:
     action_dim = validate_action_dim(action_dim)
     mas_step_dim = mas_step_dim_for_action_dim(action_dim)
@@ -757,6 +762,10 @@ def write_split_h5(
         meta.create_dataset("state_max", data=np.asarray(state_max, dtype=np.float32))
         meta.create_dataset("action_dim", data=np.int32(action_dim))
         meta.create_dataset("state_dim", data=np.int32(state_min.shape[0]))
+        meta.create_dataset(
+            "normalized_state_dims",
+            data=np.arange(state_min.shape[0], dtype=np.int32),
+        )
         meta.create_dataset("mas_dim", data=np.int32(mas_step_dim))
         meta.create_dataset("num_episodes", data=np.int32(len(mask_jobs)))
         meta.create_dataset("mask_value", data=np.float32(mask_value))
@@ -769,6 +778,8 @@ def write_split_h5(
             "state_path",
             data=np.asarray("obs/state", dtype=h5py.string_dtype("utf-8")),
         )
+        write_string_dataset(meta, "state_paths", state_schema_paths(state_schema))
+        write_string_dataset(meta, "state_schema_json", json.dumps(state_schema, sort_keys=True))
         meta.create_dataset(
             "normalized_action_dims",
             data=normalized_action_dims,
@@ -957,6 +968,12 @@ def main() -> None:
         state_min, state_max = compute_global_min_max(
             iter_selected_state_arrays(src_file, traj_keys)
         )
+        state_schema = build_state_schema_from_obs_group(src_file[traj_keys[0]]["obs"])
+        state_schema_dim = sum(int(entry["dim"]) for entry in state_schema)
+        if state_schema_dim != int(state_min.shape[0]):
+            raise ValueError(
+                f"state schema dim={state_schema_dim} does not match state stats dim={state_min.shape[0]}"
+            )
 
     train_ids, eval_ids = split_source_episode_ids(
         source_episode_ids=source_episode_ids,
@@ -1007,6 +1024,7 @@ def main() -> None:
         mask_seed=args.mask_seed,
         input_json=input_json,
         action_dim=args.action_dim,
+        state_schema=state_schema,
     )
     write_json(
         train_json,
@@ -1049,6 +1067,7 @@ def main() -> None:
             mask_seed=args.mask_seed + 1_000_003,
             input_json=input_json,
             action_dim=args.action_dim,
+            state_schema=state_schema,
         )
         write_json(
             eval_json,

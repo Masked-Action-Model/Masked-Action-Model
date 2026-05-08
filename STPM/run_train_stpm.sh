@@ -74,8 +74,6 @@ import os
 import re
 from pathlib import Path
 
-import h5py
-import numpy as np
 from omegaconf import OmegaConf
 
 
@@ -91,19 +89,6 @@ def slugify(value):
     value = re.sub(r"[^A-Za-z0-9]+", "_", value)
     value = re.sub(r"_+", "_", value).strip("_").lower()
     return value or "stpm"
-
-
-def h5_get(group, path):
-    cur = group
-    for part in path.split("/"):
-        if not part:
-            continue
-        cur = cur[part]
-    return cur
-
-
-def is_numeric_leaf(obj):
-    return isinstance(obj, h5py.Dataset) and np.issubdtype(obj.dtype, np.number)
 
 
 def parse_state_paths(value):
@@ -132,103 +117,14 @@ def parse_camera_names(value):
     return [str(x).strip() for x in parsed if str(x).strip()]
 
 
-def infer_camera_names(traj_group):
-    try:
-        sensor_data = h5_get(traj_group, "obs/sensor_data")
-    except KeyError:
-        raise ValueError(
-            "Failed to infer STPM cameras: no obs/sensor_data group found in dataset."
-        ) from None
-    camera_names = [
-        name
-        for name, value in sensor_data.items()
-        if isinstance(value, h5py.Group) and "rgb" in value
-    ]
-    if not camera_names:
-        raise ValueError("Failed to infer STPM cameras: no RGB camera datasets found.")
-    return camera_names
-
-
-def infer_state_paths(traj_group):
-    paths = []
-    for path in ("obs/agent/qpos", "obs/agent/qvel"):
-        try:
-            if is_numeric_leaf(h5_get(traj_group, path)):
-                paths.append(path)
-        except KeyError:
-            pass
-
-    extra_paths = []
-    try:
-        extra = h5_get(traj_group, "obs/extra")
-    except KeyError:
-        extra = None
-    if extra is not None:
-        def visit(group, prefix):
-            for key, value in group.items():
-                path = f"{prefix}/{key}" if prefix else key
-                if isinstance(value, h5py.Group):
-                    visit(value, path)
-                elif is_numeric_leaf(value):
-                    extra_paths.append(f"obs/extra/{path}")
-        visit(extra, "")
-
-    priority = {"goal_pos": 0, "tcp_pose": 1, "is_grasped": 2}
-    extra_paths.sort(key=lambda p: (priority.get(p.split("/")[-1], 99), p))
-    paths.extend(extra_paths)
-    if not paths:
-        raise ValueError("Failed to infer numeric STPM state paths from dataset.")
-    return paths
-
-
-def read_state(traj_group, state_paths):
-    pieces = []
-    expected_len = None
-    for path in state_paths:
-        data = h5_get(traj_group, path)[:].astype(np.float32)
-        if data.ndim == 1:
-            data = data.reshape(-1, 1)
-        elif data.ndim > 2:
-            data = data.reshape(data.shape[0], -1)
-        if expected_len is None:
-            expected_len = data.shape[0]
-        elif data.shape[0] != expected_len:
-            raise ValueError(f"State path {path} has length {data.shape[0]}, expected {expected_len}")
-        pieces.append(data)
-    return np.concatenate(pieces, axis=-1).astype(np.float32)
-
-
 dataset_path = Path(os.environ["DATASET_PATH"]).expanduser()
 task_name = os.environ["TASK_NAME"].strip() or dataset_path.stem
 task_description = os.environ["TASK_DESCRIPTION"].strip() or task_name
 output_dir = Path(os.environ["OUTPUT_DIR"].strip() or f"STPM_task_{slugify(task_name)}")
 output_dir.mkdir(parents=True, exist_ok=True)
-
-with h5py.File(dataset_path, "r") as f:
-    traj_keys = sorted(
-        [k for k in f.keys() if k.startswith("traj_")],
-        key=lambda k: int(k.split("_")[1]),
-    )
-    if not traj_keys:
-        raise ValueError(f"No traj_* groups found in {dataset_path}")
-    first_traj = f[traj_keys[0]]
-    state_paths = parse_state_paths(os.environ["STATE_PATHS"]) or infer_state_paths(first_traj)
-    camera_names = parse_camera_names(os.environ["CAMERA_NAMES"]) or infer_camera_names(first_traj)
-    all_states = [read_state(f[k], state_paths) for k in traj_keys]
-
-states = np.concatenate(all_states, axis=0).astype(np.float32)
-state_dim = int(states.shape[1])
 state_norm_path = output_dir / "state_norm.json"
-state_norm_path.write_text(json.dumps({
-    "norm_stats": {
-        "state": {
-            "mean": states.mean(axis=0).tolist(),
-            "std": states.std(axis=0).clip(min=1e-2).tolist(),
-            "q01": np.quantile(states, 0.01, axis=0).tolist(),
-            "q99": np.quantile(states, 0.99, axis=0).tolist(),
-        }
-    }
-}, indent=2))
+state_paths = parse_state_paths(os.environ["STATE_PATHS"]) or []
+camera_names = parse_camera_names(os.environ["CAMERA_NAMES"])
 
 base_cfg_path = Path("STPM/config/rewind_maniskill.yaml")
 cfg = OmegaConf.load(base_cfg_path)
@@ -239,7 +135,7 @@ cfg.general.task_description = task_description
 cfg.general.repo_id = str(dataset_path)
 cfg.general.state_norm_path = str(state_norm_path)
 cfg.general.state_paths = state_paths
-cfg.general.camera_names = camera_names
+cfg.general.camera_names = camera_names if camera_names is not None else "auto"
 if os.environ["CAMERA_POSES_JSON"].strip():
     cfg.general.camera_poses = json.loads(os.environ["CAMERA_POSES_JSON"])
 cfg.general.seed = int(os.environ["SEED"])
@@ -259,7 +155,7 @@ cfg.model.n_heads = int(os.environ["N_HEADS"])
 cfg.model.dropout = float(os.environ["DROPOUT"])
 cfg.model.n_obs_steps = int(os.environ["N_OBS_STEPS"])
 cfg.model.frame_gap = int(os.environ["FRAME_GAP"])
-cfg.model.state_dim = state_dim
+cfg.model.state_dim = 0
 cfg.model.no_state = env_bool("NO_STATE")
 cfg.model.resume_training = env_bool("RESUME_TRAINING")
 cfg.model.model_path = os.environ["MODEL_PATH"]
@@ -286,6 +182,11 @@ PY
 
 echo "[stpm] config: ${CONFIG_PATH}"
 echo "[stpm] output: $(dirname "$CONFIG_PATH")"
+
+python STPM/utils/generate_state_norm_json.py \
+  --config "$CONFIG_PATH" \
+  --write-config \
+  --overwrite
 
 if [[ "${PREPARE_ONLY:-false}" == "true" ]]; then
   echo "[stpm] PREPARE_ONLY=true, skip training."

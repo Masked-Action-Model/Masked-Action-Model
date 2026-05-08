@@ -1,5 +1,6 @@
 import os
 import argparse
+import json
 from pathlib import Path
 from omegaconf import OmegaConf
 from datetime import datetime
@@ -14,11 +15,15 @@ import wandb
 
 from maniskill_dataset import (
     FrameManiskillDataset,
+    infer_camera_info_from_h5,
     infer_state_dim_from_h5,
+    infer_state_paths_from_h5,
+    infer_state_schema_from_h5,
     resolve_camera_names,
     resolve_state_paths,
 )
 from utils.data_utils import get_valid_episodes, split_train_eval_episodes, adapt_maniskill_batch_rewind
+from utils.generate_state_norm_json import compute_state_stats
 from utils.train_utils import set_seed, save_ckpt, get_normalizer_from_calculated
 from models.rewind_reward_model import RewardTransformer
 from models.clip_encoder import FrozenCLIPEncoder
@@ -33,6 +38,69 @@ def _select_clip_rgb(images: torch.Tensor) -> torch.Tensor:
     return images[:, :, :3, :, :]
 
 
+def _resolve_repo_path(path_str: str) -> Path:
+    path = Path(str(path_str)).expanduser()
+    if path.is_absolute():
+        return path
+    return Path.cwd() / path
+
+
+def _ensure_state_norm_json(cfg) -> None:
+    norm_path = _resolve_repo_path(cfg.general.state_norm_path)
+    expected_dim = int(cfg.model.state_dim)
+    state_paths = list(cfg.general.state_paths)
+
+    if norm_path.exists():
+        with open(norm_path, "r", encoding="utf-8") as f:
+            norm_data = json.load(f)
+        stats = norm_data["norm_stats"]["state"]
+        actual_dim = len(stats["mean"])
+        if actual_dim < expected_dim:
+            raise ValueError(
+                f"STPM state normalizer has {actual_dim} dims, "
+                f"but model.state_dim={expected_dim}: {norm_path}"
+            )
+        meta = norm_data.get("meta", {})
+        meta_state_paths = meta.get("state_paths")
+        if meta_state_paths is not None and list(meta_state_paths) != state_paths:
+            raise ValueError(
+                "STPM state normalizer state_paths do not match config: "
+                f"norm={meta_state_paths}, config={state_paths}"
+            )
+        if meta_state_paths is None:
+            print(
+                "[Init] Warning: state_norm JSON has no meta.state_paths; "
+                "cannot verify semantic state alignment. Regenerate it with "
+                "STPM/utils/generate_state_norm_json.py --config ... --overwrite."
+            )
+        return
+
+    stats, state_dim, num_state_frames = compute_state_stats(
+        Path(cfg.general.repo_id),
+        state_paths=state_paths,
+    )
+    if state_dim != expected_dim:
+        raise ValueError(
+            f"Generated state normalizer dim={state_dim}, expected model.state_dim={expected_dim}"
+        )
+    output = {
+        "norm_stats": {"state": stats},
+        "meta": {
+            "source_h5": str(cfg.general.repo_id),
+            "state_paths": state_paths,
+            "state_schema": OmegaConf.to_container(cfg.general.state_schema, resolve=True),
+            "state_dim": state_dim,
+            "num_state_frames": num_state_frames,
+            "camera_names": list(cfg.general.camera_names),
+            "camera_info": OmegaConf.to_container(cfg.general.camera_info, resolve=True),
+        },
+    }
+    norm_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(norm_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2)
+    print(f"[Init] Generated STPM state_norm JSON: {norm_path}")
+
+
 class ReWiNDWorkspace:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -42,14 +110,22 @@ class ReWiNDWorkspace:
         configured_camera_names = getattr(cfg.general, "camera_names", "auto")
         self.camera_names = resolve_camera_names(cfg.general.repo_id, configured_camera_names)
         cfg.general.camera_names = self.camera_names
+        cfg.general.camera_info = infer_camera_info_from_h5(cfg.general.repo_id)
         camera_poses = getattr(cfg.general, "camera_poses", None)
         self.camera_poses = (
             OmegaConf.to_container(camera_poses, resolve=True)
             if camera_poses is not None
             else {}
         )
-        cfg.general.state_paths = resolve_state_paths(
-            list(getattr(cfg.general, "state_paths", [])) or None
+        configured_state_paths = list(getattr(cfg.general, "state_paths", []) or [])
+        cfg.general.state_paths = (
+            resolve_state_paths(configured_state_paths)
+            if configured_state_paths
+            else infer_state_paths_from_h5(cfg.general.repo_id)
+        )
+        cfg.general.state_schema = infer_state_schema_from_h5(
+            cfg.general.repo_id,
+            state_paths=list(cfg.general.state_paths),
         )
         inferred_state_dim = infer_state_dim_from_h5(
             cfg.general.repo_id,
@@ -66,7 +142,9 @@ class ReWiNDWorkspace:
         if self.camera_poses:
             print(f"[Init] STPM camera_poses: {self.camera_poses}")
         print(f"[Init] STPM state_paths: {list(cfg.general.state_paths)}")
+        print(f"[Init] STPM state_schema: {OmegaConf.to_container(cfg.general.state_schema, resolve=True)}")
         print(f"[Init] STPM state_dim: {cfg.model.state_dim}")
+        _ensure_state_norm_json(cfg)
         self.task_description = str(
             getattr(cfg.general, "task_description", cfg.general.task_name)
         )

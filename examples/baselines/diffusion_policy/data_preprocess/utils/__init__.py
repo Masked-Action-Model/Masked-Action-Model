@@ -16,7 +16,12 @@ from .normalize_utils import (
     load_action_stats_from_path,
     normalize_selected_dims,
 )
-from .obs_utils import build_default_state_obs_extractor, flatten_state_from_obs
+from .obs_utils import (
+    build_default_state_obs_extractor,
+    build_state_schema_from_obs,
+    flatten_state_from_obs,
+    iter_default_state_obs_items,
+)
 from .progress_utils import (
     MAS_ACTION_DIM,
     MAS_STEP_DIM,
@@ -38,10 +43,12 @@ __all__ = [
     "augment_mas_with_progress_np",
     "augment_mas_with_progress_torch",
     "build_default_state_obs_extractor",
+    "build_state_schema_from_obs",
     "build_progress_column_torch",
     "compute_global_min_max",
     "ensure_parent_dir",
     "flatten_state_from_obs",
+    "iter_default_state_obs_items",
     "list_traj_keys",
     "load_action_stats_from_path",
     "normalize_selected_dims",

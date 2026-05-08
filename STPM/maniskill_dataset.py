@@ -9,6 +9,9 @@ import numpy as np
 import torch
 
 
+TRAJ_PATTERN = re.compile(r"traj_(\d+)")
+STATELESS_OBS_KEYS = {"sensor_data", "sensor_param"}
+
 DEFAULT_STATE_PATHS = [
     "obs/agent/qpos",
     "obs/agent/qvel",
@@ -18,6 +21,115 @@ DEFAULT_STATE_PATHS = [
 ]
 
 
+def _list_traj_keys(dataset: h5py.File) -> list[str]:
+    traj_keys = sorted(key for key in dataset.keys() if TRAJ_PATTERN.fullmatch(key))
+    if not traj_keys:
+        raise ValueError(f"No traj_* groups found in ManiSkill dataset")
+    return traj_keys
+
+
+def _state_leaf_dim(dataset: h5py.Dataset) -> int:
+    frame_shape = dataset.shape[1:]
+    return int(np.prod(frame_shape)) if len(frame_shape) > 0 else 1
+
+
+def _walk_state_datasets(group: h5py.Group, prefix: str) -> list[tuple[str, h5py.Dataset]]:
+    out = []
+    for key in group.keys():
+        if prefix == "obs" and key in STATELESS_OBS_KEYS:
+            continue
+        value = group[key]
+        path = f"{prefix}/{key}" if prefix else key
+        if isinstance(value, h5py.Group):
+            out.extend(_walk_state_datasets(value, path))
+        elif isinstance(value, h5py.Dataset):
+            out.append((path, value))
+    return out
+
+
+def infer_state_schema_from_h5(
+    repo_id: str | Path, state_paths: list[str] | None = None
+) -> list[dict[str, Any]]:
+    path = Path(repo_id)
+    if not path.exists():
+        raise FileNotFoundError(f"ManiSkill dataset not found: {path}")
+    if path.suffix != ".h5":
+        raise ValueError(f"Expected an .h5 dataset path, got: {path}")
+
+    with h5py.File(path, "r") as dataset:
+        traj_key = _list_traj_keys(dataset)[0]
+        traj_group = dataset[traj_key]
+        if state_paths is None:
+            state_items = _walk_state_datasets(traj_group["obs"], "obs")
+        else:
+            state_items = []
+            for state_path in state_paths:
+                try:
+                    state_items.append((state_path, traj_group[state_path]))
+                except KeyError:
+                    raise KeyError(
+                        f"Configured STPM state path {state_path!r} is missing from {path}."
+                    ) from None
+        schema = []
+        for state_path, dataset_value in state_items:
+            schema.append(
+                {
+                    "path": state_path,
+                    "shape": [int(v) for v in dataset_value.shape[1:]],
+                    "dtype": str(dataset_value.dtype),
+                    "dim": int(_state_leaf_dim(dataset_value)),
+                }
+            )
+    return schema
+
+
+def infer_state_paths_from_h5(repo_id: str | Path) -> list[str]:
+    return [entry["path"] for entry in infer_state_schema_from_h5(repo_id)]
+
+
+def infer_camera_info_from_h5(repo_id: str | Path) -> dict[str, Any]:
+    path = Path(repo_id)
+    if not path.exists():
+        raise FileNotFoundError(f"ManiSkill dataset not found: {path}")
+    if path.suffix != ".h5":
+        raise ValueError(f"Expected an .h5 dataset path, got: {path}")
+
+    with h5py.File(path, "r") as dataset:
+        traj_key = _list_traj_keys(dataset)[0]
+        obs_group = dataset[f"{traj_key}/obs"]
+        sensor_data_path = "sensor_data"
+        if sensor_data_path not in obs_group:
+            raise ValueError(
+                f"No obs/sensor_data found in {path}. "
+                "STPM visual training requires an rgb/rgbd H5 dataset."
+            )
+        sensor_data = obs_group[sensor_data_path]
+        sensor_param = obs_group.get("sensor_param", {})
+        camera_info = {}
+        for camera_name in sensor_data.keys():
+            camera_group = sensor_data[camera_name]
+            modalities = {}
+            for modality in camera_group.keys():
+                value = camera_group[modality]
+                modalities[modality] = {
+                    "shape": [int(v) for v in value.shape[1:]],
+                    "dtype": str(value.dtype),
+                }
+            params = {}
+            if camera_name in sensor_param:
+                for param_name in sensor_param[camera_name].keys():
+                    value = sensor_param[camera_name][param_name]
+                    params[param_name] = {
+                        "shape": [int(v) for v in value.shape[1:]],
+                        "dtype": str(value.dtype),
+                    }
+            camera_info[camera_name] = {
+                "modalities": modalities,
+                "params": params,
+            }
+    return camera_info
+
+
 def infer_camera_names_from_h5(repo_id: str | Path) -> list[str]:
     path = Path(repo_id)
     if not path.exists():
@@ -25,13 +137,8 @@ def infer_camera_names_from_h5(repo_id: str | Path) -> list[str]:
     if path.suffix != ".h5":
         raise ValueError(f"Expected an .h5 dataset path, got: {path}")
 
-    traj_pattern = re.compile(r"traj_(\d+)")
     with h5py.File(path, "r") as dataset:
-        traj_keys = sorted(
-            key for key in dataset.keys() if traj_pattern.fullmatch(key)
-        )
-        if not traj_keys:
-            raise ValueError(f"No traj_* groups found in ManiSkill dataset: {path}")
+        traj_keys = _list_traj_keys(dataset)
         sensor_data_path = f"{traj_keys[0]}/obs/sensor_data"
         if sensor_data_path not in dataset:
             raise ValueError(
@@ -74,14 +181,11 @@ def infer_state_dim_from_h5(repo_id: str | Path, state_paths: list[str] | None =
     if path.suffix != ".h5":
         raise ValueError(f"Expected an .h5 dataset path, got: {path}")
 
-    resolved_state_paths = resolve_state_paths(state_paths)
-    traj_pattern = re.compile(r"traj_(\d+)")
+    resolved_state_paths = (
+        infer_state_paths_from_h5(path) if state_paths is None else list(state_paths)
+    )
     with h5py.File(path, "r") as dataset:
-        traj_keys = sorted(
-            key for key in dataset.keys() if traj_pattern.fullmatch(key)
-        )
-        if not traj_keys:
-            raise ValueError(f"No traj_* groups found in ManiSkill dataset: {path}")
+        traj_keys = _list_traj_keys(dataset)
         traj_group = dataset[traj_keys[0]]
         state_dim = 0
         for state_path in resolved_state_paths:
@@ -92,9 +196,7 @@ def infer_state_dim_from_h5(repo_id: str | Path, state_paths: list[str] | None =
                     f"Configured STPM state path {state_path!r} is missing from {path}. "
                     f"state_paths={resolved_state_paths!r}"
                 ) from None
-            frame_shape = value.shape[1:]
-            path_dim = int(np.prod(frame_shape)) if len(frame_shape) > 0 else 1
-            state_dim += path_dim
+            state_dim += _state_leaf_dim(value)
     return state_dim
 
 
