@@ -122,8 +122,8 @@ class Args:
         16  # 16->8 leads to worse performance, maybe it is like generate a half image; 16->32, improvement is very marginal
     )
     diffusion_step_embed_dim: int = 64  # not very important
-    noise_model: Literal["Transformer"] = "Transformer"
-    """denoiser backbone. Subgoal condition only supports DiTNoiseNet."""
+    noise_model: Literal["Transformer", "Unet"] = "Transformer"
+    """denoiser backbone. Transformer uses DiTNoiseNet; Unet uses ConditionalUnet1D."""
     dit_hidden_dim: int = 512
     """DiT hidden dimension."""
     dit_num_blocks: int = 6
@@ -590,9 +590,6 @@ class Agent(nn.Module):
         self.noise_model = args.noise_model
         assert (len(env.single_observation_space["state"].shape) == 2)  # (obs_horizon, obs_dim)
         assert len(env.single_action_space.shape) == 1  # (act_dim, )
-        if args.noise_model != "Transformer":
-            raise ValueError("Subgoal condition only supports noise_model='Transformer'")
-
         self.act_dim = env.single_action_space.shape[0]
         if self.act_dim != int(args.action_dim):
             raise ValueError(
@@ -615,16 +612,28 @@ class Agent(nn.Module):
         self.visual_encoder = PlainConv(
             in_channels=total_visual_channels, out_dim=visual_feature_dim, pool_feature_map=True
         )
-        self.noise_pred_net = DiTNoiseNet(
-            ac_dim=self.act_dim,
-            ac_chunk=self.pred_horizon,
-            obs_dim=visual_feature_dim + obs_state_dim + subgoal_dim,
-            time_dim=args.diffusion_step_embed_dim,
-            hidden_dim=args.dit_hidden_dim,
-            num_blocks=args.dit_num_blocks,
-            dim_feedforward=args.dit_dim_feedforward,
-            use_mask=False,
-        )
+        obs_cond_dim = visual_feature_dim + obs_state_dim + subgoal_dim
+        if args.noise_model == "Transformer":
+            self.noise_pred_net = DiTNoiseNet(
+                ac_dim=self.act_dim,
+                ac_chunk=self.pred_horizon,
+                obs_dim=obs_cond_dim,
+                time_dim=args.diffusion_step_embed_dim,
+                hidden_dim=args.dit_hidden_dim,
+                num_blocks=args.dit_num_blocks,
+                dim_feedforward=args.dit_dim_feedforward,
+                use_mask=False,
+            )
+        elif args.noise_model == "Unet":
+            self.noise_pred_net = ConditionalUnet1D(
+                input_dim=self.act_dim,
+                global_cond_dim=self.obs_horizon * obs_cond_dim,
+                diffusion_step_embed_dim=args.diffusion_step_embed_dim,
+                down_dims=args.unet_dims,
+                n_groups=args.n_groups,
+            )
+        else:
+            raise ValueError(f"unsupported noise_model={args.noise_model!r}")
         self.num_diffusion_iters = 100
         self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=self.num_diffusion_iters,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, Optional
@@ -72,6 +72,12 @@ class Args:
     mas_long_encode_mode: Literal["1DConv", "2DConv"] = "2DConv"
     mas_long_conv_output_dim: int = 64
     diffusion_step_embed_dim: int = 64
+    noise_model: Literal["Transformer", "Unet"] = "Transformer"
+    dit_hidden_dim: int = 512
+    dit_num_blocks: int = 6
+    dit_dim_feedforward: int = 2048
+    unet_dims: list[int] = field(default_factory=lambda: [64, 128, 256])
+    n_groups: int = 8
     legacy_short_mask_branch: bool = False
 
     checkpoint_key: Literal["auto", "ema_agent", "agent"] = "auto"
@@ -205,11 +211,6 @@ def _build_legacy_short_mask_feature(
 
 
 def _validate_checkpoint_obs_cond_dim(args: Args, envs, state_dict: dict) -> None:
-    obs_proj_weight = state_dict.get("noise_pred_net.obs_proj.0.weight", None)
-    if obs_proj_weight is None:
-        raise KeyError("checkpoint is missing noise_pred_net.obs_proj.0.weight")
-
-    checkpoint_obs_dim = int(obs_proj_weight.shape[1])
     expected_obs_dim = _compute_expected_obs_cond_dim(
         envs=envs,
         mas_long_conv_output_dim=args.mas_long_conv_output_dim,
@@ -217,6 +218,35 @@ def _validate_checkpoint_obs_cond_dim(args: Args, envs, state_dict: dict) -> Non
         legacy_short_mask_branch=args.legacy_short_mask_branch,
         mas_step_dim=int(args.action_dim) + 1,
     )
+
+    if args.noise_model == "Transformer":
+        obs_proj_weight = state_dict.get("noise_pred_net.obs_proj.0.weight", None)
+        if obs_proj_weight is None:
+            raise KeyError("checkpoint is missing noise_pred_net.obs_proj.0.weight")
+        checkpoint_obs_dim = int(obs_proj_weight.shape[1])
+    elif args.noise_model == "Unet":
+        cond_weight = state_dict.get(
+            "noise_pred_net.down_modules.0.0.cond_encoder.1.weight",
+            None,
+        )
+        if cond_weight is None:
+            raise KeyError(
+                "checkpoint is missing noise_pred_net.down_modules.0.0.cond_encoder.1.weight"
+            )
+        checkpoint_global_cond_dim = int(cond_weight.shape[1]) - int(
+            args.diffusion_step_embed_dim
+        )
+        expected_global_cond_dim = int(args.obs_horizon) * expected_obs_dim
+        if checkpoint_global_cond_dim != expected_global_cond_dim:
+            raise ValueError(
+                "checkpoint 的 UNet global condition 维度与当前 MAM 布局不匹配。"
+                f" checkpoint_global_cond_dim={checkpoint_global_cond_dim}, "
+                f"expected_global_cond_dim={expected_global_cond_dim}."
+            )
+        checkpoint_obs_dim = expected_obs_dim
+    else:
+        raise ValueError(f"unsupported noise_model={args.noise_model!r}")
+
     if checkpoint_obs_dim != expected_obs_dim:
         if args.legacy_short_mask_branch:
             raise ValueError(
@@ -255,6 +285,12 @@ def _build_agent_runtime_args(args: Args):
         loss_mask_area_weight=0.2,
         obs_mode="rgb+depth",
         diffusion_step_embed_dim=int(args.diffusion_step_embed_dim),
+        noise_model=args.noise_model,
+        dit_hidden_dim=int(args.dit_hidden_dim),
+        dit_num_blocks=int(args.dit_num_blocks),
+        dit_dim_feedforward=int(args.dit_dim_feedforward),
+        unet_dims=list(args.unet_dims),
+        n_groups=int(args.n_groups),
         action_dim=int(args.action_dim),
     )
 

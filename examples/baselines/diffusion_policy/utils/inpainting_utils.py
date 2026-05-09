@@ -171,7 +171,8 @@ def forward_jump_j_steps(a_cur: torch.Tensor, t_cur: int, j: int, max_t: int, sc
 def _prepare_obs_for_agent(obs_seq):
     obs_seq = common.to_tensor(obs_seq, obs_seq["state"].device)
     obs_seq["rgb"] = obs_seq["rgb"].permute(0, 1, 4, 2, 3)
-    obs_seq["depth"] = obs_seq["depth"].permute(0, 1, 4, 2, 3)
+    if "depth" in obs_seq:
+        obs_seq["depth"] = obs_seq["depth"].permute(0, 1, 4, 2, 3)
     return obs_seq
 
 
@@ -234,6 +235,8 @@ def dp_repaint_inference(
 
     with torch.no_grad():
         obs_cond = agent.obs_conditioning(obs_seq, eval_mode=True)
+        if hasattr(agent, "prepare_noise_condition"):
+            obs_cond = agent.prepare_noise_condition(obs_cond)
         a_t = torch.randn(
             (batch_size, pred_horizon, action_dim),
             device=obs_seq["state"].device,

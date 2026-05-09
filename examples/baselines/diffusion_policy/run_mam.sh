@@ -169,7 +169,26 @@ STPM_CONFIG_PATH="${STPM_CONFIG_PATH:-STPM_PickCube/pick up the cube and place i
 STPM_CKPT_PATH="${STPM_CKPT_PATH:-STPM_PickCube/pick up the cube and place it at the goal/checkpoints/reward_best.pt}"
 
 # -----------------------------------------------------------------------------
-# 5. Train basic params 
+# 5. Model
+# -----------------------------------------------------------------------------
+
+NOISE_MODEL="${NOISE_MODEL:-Transformer}" # Transformer or Unet
+DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-64}"
+DIT_HIDDEN_DIM="${DIT_HIDDEN_DIM:-512}"
+DIT_NUM_BLOCKS="${DIT_NUM_BLOCKS:-6}"
+DIT_DIM_FEEDFORWARD="${DIT_DIM_FEEDFORWARD:-2048}"
+UNET_DIMS="${UNET_DIMS:-64 128 256}"
+N_GROUPS="${N_GROUPS:-8}"
+case "$NOISE_MODEL" in
+  Transformer|Unet) ;;
+  *)
+    echo "ERROR: NOISE_MODEL must be Transformer or Unet, got: $NOISE_MODEL" >&2
+    exit 1
+    ;;
+esac
+
+# -----------------------------------------------------------------------------
+# 6. Train basic params
 # -----------------------------------------------------------------------------
 
 NUM_DEMOS="${NUM_DEMOS:-100}"
@@ -180,20 +199,16 @@ NUM_DATALOAD_WORKERS="${NUM_DATALOAD_WORKERS:-0}"
 CONTROL_MODE="${CONTROL_MODE:-pd_ee_pose}"
 OBS_MODE="${OBS_MODE:-rgb+depth}"  # rgb or rgb+depth; rgb ignores dataset depth for policy input
 DEMO_TYPE="${DEMO_TYPE:-}"
-
-# -----------------------------------------------------------------------------
-# 6. MAS and diffusion-policy params 
-# -----------------------------------------------------------------------------
-
 OBS_HORIZON="${OBS_HORIZON:-2}"
 ACT_HORIZON="${ACT_HORIZON:-8}"
 PRED_HORIZON="${PRED_HORIZON:-16}"
+
+# -----------------------------------------------------------------------------
+# 7. MAS window and loss params
+# -----------------------------------------------------------------------------
+
 LONG_WINDOW_BACKWARD_LENGTH="${LONG_WINDOW_BACKWARD_LENGTH:-0}"
 LONG_WINDOW_FORWARD_LENGTH="${LONG_WINDOW_FORWARD_LENGTH:-${PRED_HORIZON}}"
-DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-64}"
-DIT_HIDDEN_DIM="${DIT_HIDDEN_DIM:-512}"
-DIT_NUM_BLOCKS="${DIT_NUM_BLOCKS:-6}"
-DIT_DIM_FEEDFORWARD="${DIT_DIM_FEEDFORWARD:-2048}"
 SHORT_WINDOW_HORIZON="${SHORT_WINDOW_HORIZON:-2}"
 MAS_LONG_ENCODE_MODE="${MAS_LONG_ENCODE_MODE:-2DConv}"
 MAS_LONG_CONV_OUTPUT_DIM="${MAS_LONG_CONV_OUTPUT_DIM:-64}"
@@ -201,7 +216,7 @@ LOSS_MODE="${LOSS_MODE:-average}" #average or weighted
 LOSS_MASK_AREA_WEIGHT="${LOSS_MASK_AREA_WEIGHT:-0.2}"
 
 # -----------------------------------------------------------------------------
-# 7. Eval, logging, and checkpoint params
+# 8. Eval, logging, and checkpoint params
 # -----------------------------------------------------------------------------
 
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-100}"
@@ -233,7 +248,7 @@ if [[ "$SINGLE_MASK_COMPAT" == "true" ]]; then
 fi
 
 # -----------------------------------------------------------------------------
-# 8. Derived preprocessed paths 
+# 9. Derived preprocessed paths
 # -----------------------------------------------------------------------------
 
 compute_mixed_file_stem() {
@@ -306,7 +321,7 @@ TRAIN_DEMO_METADATA_PATH="${TRAIN_DEMO_METADATA_PATH:-${PREPROCESSED_DATA_DIR}/$
 ACTION_NORM_PATH="${ACTION_NORM_PATH:-${DEMO_PATH}}"
 
 # -----------------------------------------------------------------------------
-# 9. Preprocess helper 
+# 10. Preprocess helper
 # -----------------------------------------------------------------------------
 
 ensure_preprocessed_dataset() {
@@ -380,7 +395,7 @@ ensure_preprocessed_dataset() {
 ensure_preprocessed_dataset
 
 # -----------------------------------------------------------------------------
-# 10. Build train args 
+# 11. Build train args
 # -----------------------------------------------------------------------------
 
 ARGS=(
@@ -401,10 +416,13 @@ ARGS=(
   --pred-horizon "$PRED_HORIZON"
   --long-window-backward-length "$LONG_WINDOW_BACKWARD_LENGTH"
   --long-window-forward-length "$LONG_WINDOW_FORWARD_LENGTH"
+  --noise-model "$NOISE_MODEL"
   --diffusion-step-embed-dim "$DIFFUSION_STEP_EMBED_DIM"
   --dit-hidden-dim "$DIT_HIDDEN_DIM"
   --dit-num-blocks "$DIT_NUM_BLOCKS"
   --dit-dim-feedforward "$DIT_DIM_FEEDFORWARD"
+  --unet-dims $UNET_DIMS
+  --n-groups "$N_GROUPS"
   --short-window-horizon "$SHORT_WINDOW_HORIZON"
   --mas-long-encode-mode "$MAS_LONG_ENCODE_MODE"
   --mas-long-conv-output-dim "$MAS_LONG_CONV_OUTPUT_DIM"
@@ -465,7 +483,7 @@ if [[ -n "$NUM_DEMOS" ]]; then
 fi
 
 # -----------------------------------------------------------------------------
-# 11. Validate required files
+# 12. Validate required files
 # -----------------------------------------------------------------------------
 
 if [[ ! -f "$DEMO_PATH" ]]; then

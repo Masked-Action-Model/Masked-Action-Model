@@ -138,13 +138,36 @@ case "$ACTION_DIM" in
 esac
 
 # -----------------------------------------------------------------------------
-# 3. Train/eval params
+# 3. Environment
 # -----------------------------------------------------------------------------
 
 CONTROL_MODE="${CONTROL_MODE:-pd_ee_pose}"
 OBS_MODE="${OBS_MODE:-rgb}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-100}"
 SIM_BACKEND="${SIM_BACKEND:-physx_cpu}"
+
+# -----------------------------------------------------------------------------
+# 4. Model
+# -----------------------------------------------------------------------------
+
+NOISE_MODEL="${NOISE_MODEL:-Transformer}" # Transformer or Unet
+DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-64}"
+DIT_HIDDEN_DIM="${DIT_HIDDEN_DIM:-512}"
+DIT_NUM_BLOCKS="${DIT_NUM_BLOCKS:-6}"
+DIT_DIM_FEEDFORWARD="${DIT_DIM_FEEDFORWARD:-2048}"
+UNET_DIMS="${UNET_DIMS:-64 128 256}"
+N_GROUPS="${N_GROUPS:-8}"
+case "$NOISE_MODEL" in
+  Transformer|Unet) ;;
+  *)
+    echo "ERROR: NOISE_MODEL must be Transformer or Unet, got: $NOISE_MODEL" >&2
+    exit 1
+    ;;
+esac
+
+# -----------------------------------------------------------------------------
+# 5. Training
+# -----------------------------------------------------------------------------
 
 NUM_DEMOS="${NUM_DEMOS:-100}"
 TOTAL_ITERS="${TOTAL_ITERS:-100000}"
@@ -153,12 +176,12 @@ LR="${LR:-1e-4}"
 OBS_HORIZON="${OBS_HORIZON:-2}"
 ACT_HORIZON="${ACT_HORIZON:-8}"
 PRED_HORIZON="${PRED_HORIZON:-16}"
-DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-64}"
-DIT_HIDDEN_DIM="${DIT_HIDDEN_DIM:-512}"
-DIT_NUM_BLOCKS="${DIT_NUM_BLOCKS:-6}"
-DIT_DIM_FEEDFORWARD="${DIT_DIM_FEEDFORWARD:-2048}"
 NUM_DATALOAD_WORKERS="${NUM_DATALOAD_WORKERS:-0}"
-DEMO_TYPE="${DEMO_TYPE:-subgoal_condition}"
+DEMO_TYPE="${DEMO_TYPE:-subgoal_condition_${NOISE_MODEL}}"
+
+# -----------------------------------------------------------------------------
+# 6. Eval, logging, and checkpointing
+# -----------------------------------------------------------------------------
 
 LOG_FREQ="${LOG_FREQ:-1000}"
 EVAL_FREQ="${EVAL_FREQ:-5000}"
@@ -168,7 +191,7 @@ NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-${NUM_EVAL_DEMOS}}"
 NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-10}"
 
 # -----------------------------------------------------------------------------
-# 4. Preprocess helper
+# 7. Preprocess helper
 # -----------------------------------------------------------------------------
 
 ensure_preprocessed_dataset() {
@@ -217,7 +240,7 @@ ensure_preprocessed_dataset() {
 ensure_preprocessed_dataset
 
 # -----------------------------------------------------------------------------
-# 5. Validate required files
+# 8. Validate required files
 # -----------------------------------------------------------------------------
 
 for path in "$DEMO_PATH" "$EVAL_DEMO_PATH" "$EVAL_DEMO_METADATA_PATH" "$ACTION_NORM_PATH"; do
@@ -228,7 +251,7 @@ for path in "$DEMO_PATH" "$EVAL_DEMO_PATH" "$EVAL_DEMO_METADATA_PATH" "$ACTION_N
 done
 
 # -----------------------------------------------------------------------------
-# 6. Build train args
+# 9. Build train args
 # -----------------------------------------------------------------------------
 
 ARGS=(
@@ -240,7 +263,7 @@ ARGS=(
   --eval-demo-path "$EVAL_DEMO_PATH"
   --eval-demo-metadata-path "$EVAL_DEMO_METADATA_PATH"
   --action-norm-path "$ACTION_NORM_PATH"
-  --noise-model Transformer
+  --noise-model "$NOISE_MODEL"
   --total-iters "$TOTAL_ITERS"
   --batch-size "$BATCH_SIZE"
   --lr "$LR"
@@ -251,6 +274,8 @@ ARGS=(
   --dit-hidden-dim "$DIT_HIDDEN_DIM"
   --dit-num-blocks "$DIT_NUM_BLOCKS"
   --dit-dim-feedforward "$DIT_DIM_FEEDFORWARD"
+  --unet-dims $UNET_DIMS
+  --n-groups "$N_GROUPS"
   --obs-mode "$OBS_MODE"
   --log-freq "$LOG_FREQ"
   --eval-freq "$EVAL_FREQ"

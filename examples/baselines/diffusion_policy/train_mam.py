@@ -35,6 +35,7 @@ from torch.utils.data.sampler import BatchSampler, RandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
 from evaluate.evaluate_mam import evaluate_mam
+from models.conditional_unet1d import ConditionalUnet1D
 from models.mas_conv1d import MasConv1D
 from models.mas_conv2d import MasConv
 from models.modeling_ditdp import DiTNoiseNet
@@ -143,12 +144,18 @@ class Args:
     long_window_forward_length: Optional[int] = None
     """MAS long window length from t onward, including t; defaults to pred_horizon"""
     diffusion_step_embed_dim: int = 64  # not very important
+    noise_model: Literal["Transformer", "Unet"] = "Transformer"
+    """denoiser backbone. Transformer uses DiTNoiseNet; Unet uses ConditionalUnet1D."""
     dit_hidden_dim: int = 512
-    """DiT hidden dimension."""
+    """DiT hidden dimension, used only when noise_model=Transformer."""
     dit_num_blocks: int = 6
-    """Number of DiT encoder/decoder blocks."""
+    """Number of DiT encoder/decoder blocks, used only when noise_model=Transformer."""
     dit_dim_feedforward: int = 2048
-    """DiT feedforward dimension."""
+    """DiT feedforward dimension, used only when noise_model=Transformer."""
+    unet_dims: List[int] = field(default_factory=lambda: [64, 128, 256])
+    """UNet channel dimensions, used only when noise_model=Unet."""
+    n_groups: int = 8
+    """GroupNorm groups for UNet, used only when noise_model=Unet."""
     short_window_horizon: int = 8
     """future MAS short window length; set to 0 to disable the short-window branch"""
     mas_long_encode_mode: Literal["1DConv", "2DConv"] = "2DConv"
@@ -779,6 +786,7 @@ class Agent(nn.Module):
         self.short_window_horizon = int(args.short_window_horizon)
         self.enable_long_window = int(args.mas_long_conv_output_dim) > 0
         self.enable_short_window = self.short_window_horizon > 0
+        self.noise_model = args.noise_model
         self.loss_mode = args.loss_mode
         self.loss_mask_area_weight = float(args.loss_mask_area_weight)
         self.mas_long_window_dim = self.long_window_horizon * MAS_STEP_DIM
@@ -830,17 +838,34 @@ class Agent(nn.Module):
         else:
             self.mas_long_window_encoder = None
         mas_short_feature_dim = self.mas_short_window_dim if self.enable_short_window else 0
-
-        self.noise_pred_net = DiTNoiseNet(
-            ac_dim=self.act_dim,
-            ac_chunk=self.pred_horizon,
-            obs_dim=visual_feature_dim + obs_state_dim + mas_long_feature_dim + mas_short_feature_dim,
-            time_dim=args.diffusion_step_embed_dim,
-            hidden_dim=args.dit_hidden_dim,
-            num_blocks=args.dit_num_blocks,
-            dim_feedforward=args.dit_dim_feedforward,
-            use_mask=False,
+        obs_cond_dim = (
+            visual_feature_dim
+            + obs_state_dim
+            + mas_long_feature_dim
+            + mas_short_feature_dim
         )
+
+        if args.noise_model == "Transformer":
+            self.noise_pred_net = DiTNoiseNet(
+                ac_dim=self.act_dim,
+                ac_chunk=self.pred_horizon,
+                obs_dim=obs_cond_dim,
+                time_dim=args.diffusion_step_embed_dim,
+                hidden_dim=args.dit_hidden_dim,
+                num_blocks=args.dit_num_blocks,
+                dim_feedforward=args.dit_dim_feedforward,
+                use_mask=False,
+            )
+        elif args.noise_model == "Unet":
+            self.noise_pred_net = ConditionalUnet1D(
+                input_dim=self.act_dim,
+                global_cond_dim=self.obs_horizon * obs_cond_dim,
+                diffusion_step_embed_dim=args.diffusion_step_embed_dim,
+                down_dims=args.unet_dims,
+                n_groups=args.n_groups,
+            )
+        else:
+            raise ValueError(f"unsupported noise_model={args.noise_model!r}")
         
         self.num_diffusion_iters = 100
         self.noise_scheduler = DDPMScheduler(
@@ -1088,11 +1113,17 @@ class Agent(nn.Module):
             self._printed_obs_cond_check = True
         return feature
 
+    def prepare_noise_condition(self, obs_cond):
+        if self.noise_model == "Unet":
+            return obs_cond.flatten(start_dim=1)
+        return obs_cond
+
     def compute_loss(self, obs_seq, action_seq, action_mask=None):
         B = obs_seq["state"].shape[0]
 
         # observation as FiLM conditioning
         obs_cond = self.obs_conditioning(obs_seq, eval_mode=False)  # (B, obs_horizon, obs_dim)
+        obs_cond = self.prepare_noise_condition(obs_cond)
 
         # sample noise to add to actions
         noise = torch.randn((B, self.pred_horizon, self.act_dim), device=device)
@@ -1131,6 +1162,7 @@ class Agent(nn.Module):
                 obs_seq["depth"] = obs_seq["depth"].permute(0, 1, 4, 2, 3)
 
             obs_cond = self.obs_conditioning(obs_seq, eval_mode=True)  # (B, obs_horizon, obs_dim)
+            obs_cond = self.prepare_noise_condition(obs_cond)
 
             # initialize action from Guassian noise
             noisy_action_seq = torch.randn(
