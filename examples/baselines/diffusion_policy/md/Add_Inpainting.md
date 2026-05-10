@@ -798,4 +798,4 @@ bash examples/baselines/diffusion_policy/run_train_mas_window.sh
 
 - `python -m py_compile train_mas_window.py train_mas_window_mixed.py` 通过。
 - `bash -n run_train_mas_window.sh run_train_window_mixed.sh` 通过。
-- 完整 smoke test 当前被 STPM normalizer 文件缺失阻断：`STPM/pickcube_state_norm_train.json` 当前不在磁盘上；这与 `EVAL_PROGRESS_BAR` 改动无关。
+- 完整 smoke test 当前被 STPM normalizer 文件缺失阻断：PickCube 的 normalizer 已整理到 `STPM_PickCube/state_norm.json`；这与 `EVAL_PROGRESS_BAR` 改动无关。

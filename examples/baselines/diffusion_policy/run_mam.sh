@@ -11,7 +11,7 @@ export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
 
 ENV_ID="${ENV_ID:-PickCube-v1}"
 ACTION_DIM="${ACTION_DIM:-7}" # 7=有夹爪，6=无夹爪/panda_stick
-EXP_NAME="${EXP_NAME:-PickCube_mam}"
+EXP_NAME="${EXP_NAME:-PickCube_mam_unet}"
 SEED="${SEED:-1}"
 TORCH_DETERMINISTIC="${TORCH_DETERMINISTIC:-true}"
 CUDA="${CUDA:-true}"
@@ -51,8 +51,8 @@ esac
 #   MASK_COMPOSITION_LIST='[0.5,0.5]'       # optional; composition mode defaults to uniform
 #   PREPROCESS_MASK_ASSIGN_MODE=composition # or one_demo_multi_mask
 # If MASK_TYPE_LIST has one item, the script automatically uses single-mask preprocess.
-MASK_TYPE_LIST="${MASK_TYPE_LIST:-["random_mask","points"]}"
-MASK_RATIO_LIST="${MASK_RATIO_LIST:-[0.2,0.2]}"
+MASK_TYPE_LIST="${MASK_TYPE_LIST:-['3D_points']}"
+MASK_RATIO_LIST="${MASK_RATIO_LIST:-[0.2]}"
 MASK_COMPOSITION_LIST="${MASK_COMPOSITION_LIST:-}"
 
 eval "$(
@@ -165,19 +165,19 @@ esac
 # 4. STPM params 
 # -----------------------------------------------------------------------------
 
-STPM_CONFIG_PATH="${STPM_CONFIG_PATH:-STPM_PickCube/pick up the cube and place it at the goal/config.yaml}"
-STPM_CKPT_PATH="${STPM_CKPT_PATH:-STPM_PickCube/pick up the cube and place it at the goal/checkpoints/reward_best.pt}"
+STPM_CONFIG_PATH="${STPM_CONFIG_PATH:-STPM_PickCube/config.yaml}"
+STPM_CKPT_PATH="${STPM_CKPT_PATH:-STPM_PickCube/checkpoints/reward_best.pt}"
 
 # -----------------------------------------------------------------------------
 # 5. Model
 # -----------------------------------------------------------------------------
 
-NOISE_MODEL="${NOISE_MODEL:-Transformer}" # Transformer or Unet
+NOISE_MODEL="${NOISE_MODEL:-Unet}" # Transformer or Unet
 DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-64}"
 DIT_HIDDEN_DIM="${DIT_HIDDEN_DIM:-512}"
 DIT_NUM_BLOCKS="${DIT_NUM_BLOCKS:-6}"
 DIT_DIM_FEEDFORWARD="${DIT_DIM_FEEDFORWARD:-2048}"
-UNET_DIMS="${UNET_DIMS:-64 128 256}"
+UNET_DIMS="${UNET_DIMS:-256 512 1024}"
 N_GROUPS="${N_GROUPS:-8}"
 case "$NOISE_MODEL" in
   Transformer|Unet) ;;
@@ -191,13 +191,13 @@ esac
 # 6. Train basic params
 # -----------------------------------------------------------------------------
 
-NUM_DEMOS="${NUM_DEMOS:-100}"
-TOTAL_ITERS="${TOTAL_ITERS:-200}"
-BATCH_SIZE="${BATCH_SIZE:-32}"
+NUM_DEMOS="${NUM_DEMOS:-50}"
+TOTAL_ITERS="${TOTAL_ITERS:-100000}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
 LR="${LR:-1e-4}"
 NUM_DATALOAD_WORKERS="${NUM_DATALOAD_WORKERS:-0}"
 CONTROL_MODE="${CONTROL_MODE:-pd_ee_pose}"
-OBS_MODE="${OBS_MODE:-rgb+depth}"  # rgb or rgb+depth; rgb ignores dataset depth for policy input
+OBS_MODE="${OBS_MODE:-rgb}"  # rgb or rgb+depth; rgb ignores dataset depth for policy input
 DEMO_TYPE="${DEMO_TYPE:-}"
 OBS_HORIZON="${OBS_HORIZON:-2}"
 ACT_HORIZON="${ACT_HORIZON:-8}"
@@ -208,28 +208,28 @@ PRED_HORIZON="${PRED_HORIZON:-16}"
 # -----------------------------------------------------------------------------
 
 LONG_WINDOW_BACKWARD_LENGTH="${LONG_WINDOW_BACKWARD_LENGTH:-0}"
-LONG_WINDOW_FORWARD_LENGTH="${LONG_WINDOW_FORWARD_LENGTH:-${PRED_HORIZON}}"
-SHORT_WINDOW_HORIZON="${SHORT_WINDOW_HORIZON:-2}"
+LONG_WINDOW_FORWARD_LENGTH="${LONG_WINDOW_FORWARD_LENGTH:-32}"
+SHORT_WINDOW_HORIZON="${SHORT_WINDOW_HORIZON:-0}"
 MAS_LONG_ENCODE_MODE="${MAS_LONG_ENCODE_MODE:-2DConv}"
-MAS_LONG_CONV_OUTPUT_DIM="${MAS_LONG_CONV_OUTPUT_DIM:-64}"
+MAS_LONG_CONV_OUTPUT_DIM="${MAS_LONG_CONV_OUTPUT_DIM:-128}"
 LOSS_MODE="${LOSS_MODE:-average}" #average or weighted
-LOSS_MASK_AREA_WEIGHT="${LOSS_MASK_AREA_WEIGHT:-0.2}"
+LOSS_MASK_AREA_WEIGHT="${LOSS_MASK_AREA_WEIGHT:-0}"
 
 # -----------------------------------------------------------------------------
 # 8. Eval, logging, and checkpoint params
 # -----------------------------------------------------------------------------
 
-MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-100}"
-LOG_FREQ="${LOG_FREQ:-100}"
-EVAL_FREQ="${EVAL_FREQ:-100}"
-SAVE_FREQ="${SAVE_FREQ:-100}"
+MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-160}"
+LOG_FREQ="${LOG_FREQ:-1000}"
+EVAL_FREQ="${EVAL_FREQ:-5000}"
+SAVE_FREQ="${SAVE_FREQ:-5000}"
 NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-100}"
 NUM_EVAL_DEMOS="${NUM_EVAL_DEMOS:-100}"
 NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-10}"
 INPAINTING="${INPAINTING:-false}"
 EVAL_PROGRESS_BAR="${EVAL_PROGRESS_BAR:-false}"
-CAPTURE_VIDEO_FREQ="${CAPTURE_VIDEO_FREQ:-5}"
-SIM_BACKEND="${SIM_BACKEND:-gpu}"
+CAPTURE_VIDEO_FREQ="${CAPTURE_VIDEO_FREQ:-20}"
+SIM_BACKEND="${SIM_BACKEND:-physx_cpu}"
 
 PREPROCESS_MODE="mixed"
 if [[ "$SINGLE_MASK_COMPAT" == "true" ]]; then

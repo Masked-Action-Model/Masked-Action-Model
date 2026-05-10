@@ -32,29 +32,76 @@ PREPROCESSED_DATA_PREFIX="${PREPROCESSED_DATA_PREFIX:-data_1}"
 PREPROCESSED_DATA_DIR="${PREPROCESSED_DATA_DIR:-}"
 PREPROCESS_MASK_VALUE="${PREPROCESS_MASK_VALUE:-0}"
 PREPROCESS_NUM_TRAJ="${PREPROCESS_NUM_TRAJ:-}"
+PREPROCESS_MASK_ASSIGN_MODE="${PREPROCESS_MASK_ASSIGN_MODE:-composition}" # composition 或 one_demo_multi_mask
+case "$PREPROCESS_MASK_ASSIGN_MODE" in
+  composition|one_demo_multi_mask) ;;
+  *)
+    echo "ERROR: PREPROCESS_MASK_ASSIGN_MODE must be composition or one_demo_multi_mask, got: $PREPROCESS_MASK_ASSIGN_MODE" >&2
+    exit 1
+    ;;
+esac
 
-# Subgoal condition only supports one mask. Keep the same list interface as MAM:
-#   MASK_TYPE_LIST='["3D_points"]'
-#   MASK_RATIO_LIST='[0.5]'      # retain_ratio, or seq_len for seq masks
+# Same list interface as MAM:
+#   MASK_TYPE_LIST='["random_mask","3D_points"]'
+#   MASK_RATIO_LIST='[0.2,0.5]'             # retain_ratio, or seq_len for seq masks
+#   MASK_COMPOSITION_LIST='[0.5,0.5]'       # optional; composition mode defaults to uniform
+#   PREPROCESS_MASK_ASSIGN_MODE=composition # or one_demo_multi_mask
+# If MASK_TYPE_LIST has one item, the script keeps the original single-mask preprocess.
 MASK_TYPE_LIST="${MASK_TYPE_LIST:-[\"3D_points\"]}"
 MASK_RATIO_LIST="${MASK_RATIO_LIST:-[0.5]}"
+MASK_COMPOSITION_LIST="${MASK_COMPOSITION_LIST:-}"
 
-MASK_ASSIGNMENTS="$(
+eval "$(
 MASK_TYPE_LIST="$MASK_TYPE_LIST" \
 MASK_RATIO_LIST="$MASK_RATIO_LIST" \
+MASK_COMPOSITION_LIST="$MASK_COMPOSITION_LIST" \
 python - <<'PY'
 import ast
+import json
 import os
 import shlex
 
+
 def parse_list(value):
-    try:
-        parsed = ast.literal_eval(value)
-    except Exception:
-        parsed = [value]
-    if isinstance(parsed, (str, bytes)):
+    text = "" if value is None else str(value).strip()
+    if len(text) == 0:
+        return []
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        inner = text[1:-1].strip()
+        if len(inner) > 0:
+            text = inner
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            parsed = parser(text)
+        except Exception:
+            continue
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, (str, bytes)):
+            inner = parsed.decode("utf-8") if isinstance(parsed, bytes) else parsed
+            inner = inner.strip()
+            if inner and inner != text:
+                return parse_list(inner)
+            return [parsed]
         parsed = [parsed]
-    return list(parsed)
+        return list(parsed)
+    if "," in text:
+        return [item.strip() for item in text.split(",")]
+    return [text]
+
+
+def normalize(values, count, default):
+    values = list(values)
+    if count <= 0:
+        return []
+    if not values:
+        return [default for _ in range(count)]
+    if len(values) >= count:
+        return values[:count]
+    if len(values) == 1:
+        return values * count
+    return values + [values[-1] for _ in range(count - len(values))]
+
 
 def parse_mask_param(value):
     if value is None:
@@ -63,66 +110,150 @@ def parse_mask_param(value):
         return None
     return float(value)
 
-mask_types = [str(v) for v in parse_list(os.environ["MASK_TYPE_LIST"])]
-mask_params = [parse_mask_param(v) for v in parse_list(os.environ["MASK_RATIO_LIST"])]
-if len(mask_types) != 1:
-    raise ValueError(
-        "run_subgoal_condition.sh only supports one mask. "
-        f"Got MASK_TYPE_LIST={mask_types!r}"
-    )
-if len(mask_params) == 0:
-    mask_params = [0.2]
-if len(mask_params) > 1:
-    raise ValueError(
-        "run_subgoal_condition.sh expects exactly one MASK_RATIO_LIST value. "
-        f"Got MASK_RATIO_LIST={mask_params!r}"
-    )
 
-mask_param = mask_params[0]
+def normalize_composition(raw_value, count):
+    values = parse_list(raw_value) if str(raw_value or "").strip() else []
+    if count <= 0:
+        return []
+    if not values:
+        return [1.0 / count for _ in range(count)]
+    values = [float(v) for v in normalize(values, count, 1.0 / count)]
+    total = sum(values)
+    if total <= 0:
+        raise ValueError(f"mask composition must have positive sum, got {values}")
+    return [v / total for v in values]
+
+
+mask_types_raw = parse_list(os.environ["MASK_TYPE_LIST"])
+num_mask_type = len(mask_types_raw)
+mask_types = [str(v) for v in normalize(mask_types_raw, num_mask_type, "random_mask")]
+mask_params = [
+    parse_mask_param(v)
+    for v in normalize(parse_list(os.environ["MASK_RATIO_LIST"]), num_mask_type, 0.2)
+]
+mask_composition = normalize_composition(
+    os.environ.get("MASK_COMPOSITION_LIST"),
+    num_mask_type,
+)
+
+single = num_mask_type == 1
 assignments = {
-    "MASK_TYPE_LIST": f"[{mask_types[0]!r}]",
-    "MASK_RATIO_LIST": f"[{0 if mask_param is None else mask_param}]",
-    "SINGLE_MASK_TYPE": mask_types[0],
-    "SINGLE_MASK_PARAM": "0" if mask_param is None else format(float(mask_param), "g"),
+    "MASK_TYPE_LIST": json.dumps(mask_types),
+    "MASK_RATIO_LIST": json.dumps(mask_params),
+    "MASK_COMPOSITION_LIST": json.dumps(mask_composition),
+    "TRAIN_MASK_TYPE_LIST": json.dumps(mask_types),
+    "EVAL_MASK_TYPE_LIST": json.dumps(mask_types),
+    "TRAIN_MASK_COMPOSITION_LIST": json.dumps(mask_composition),
+    "EVAL_MASK_COMPOSITION_LIST": json.dumps(mask_composition),
+    "TRAIN_MASK_RATIO_LIST": json.dumps(mask_params),
+    "EVAL_MASK_RATIO_LIST": json.dumps(mask_params),
+    "TRAIN_NUM_MASK_TYPE": str(num_mask_type),
+    "EVAL_NUM_MASK_TYPE": str(num_mask_type),
 }
+if single:
+    mask_param = mask_params[0] if mask_params else 0.2
+    mask_param_for_single_preprocess = 1.0 if mask_param is None else float(mask_param)
+    assignments["SINGLE_MASK_COMPAT"] = "true"
+    assignments["SINGLE_MASK_TYPE"] = mask_types[0]
+    assignments["SINGLE_MASK_PARAM"] = format(mask_param_for_single_preprocess, "g")
+else:
+    assignments["SINGLE_MASK_COMPAT"] = "false"
+
 for key, value in assignments.items():
     print(f"{key}={shlex.quote(value)}")
 PY
 )"
-eval "$MASK_ASSIGNMENTS"
 
 export \
-  MASK_TYPE_LIST MASK_RATIO_LIST PREPROCESSED_DATA_PREFIX
+  MASK_TYPE_LIST MASK_COMPOSITION_LIST MASK_RATIO_LIST \
+  TRAIN_NUM_MASK_TYPE TRAIN_MASK_TYPE_LIST TRAIN_MASK_COMPOSITION_LIST TRAIN_MASK_RATIO_LIST \
+  EVAL_NUM_MASK_TYPE EVAL_MASK_TYPE_LIST EVAL_MASK_COMPOSITION_LIST EVAL_MASK_RATIO_LIST \
+  PREPROCESSED_DATA_PREFIX PREPROCESS_MASK_ASSIGN_MODE
 
-SINGLE_MASK_RETAIN_RATIO="1.0"
-SINGLE_MASK_SEQ_LEN="1"
-case "$SINGLE_MASK_TYPE" in
-  2D_partial_trajectory|local_planner)
-    SINGLE_MASK_SEQ_LEN="${SINGLE_MASK_PARAM}"
-    ;;
-  *)
-    SINGLE_MASK_RETAIN_RATIO="${SINGLE_MASK_PARAM}"
-    ;;
-esac
-echo "[subgoal-mask] type=${SINGLE_MASK_TYPE}"
-echo "[subgoal-mask] ratio=${SINGLE_MASK_PARAM}"
+echo "[subgoal-mask] assign_mode=${PREPROCESS_MASK_ASSIGN_MODE}"
+echo "[subgoal-mask] types=${MASK_TYPE_LIST}"
+echo "[subgoal-mask] ratios=${MASK_RATIO_LIST}"
+echo "[subgoal-mask] composition=${MASK_COMPOSITION_LIST}"
 
-case "$SINGLE_MASK_TYPE" in
-  pose_AnyGrasp|pose_motion_planning|points|3D_points|random_mask)
-    PREPROCESS_DIR_SUFFIX="${SINGLE_MASK_TYPE}_${SINGLE_MASK_RETAIN_RATIO}"
-    ;;
-  2D_partial_trajectory|local_planner)
-    PREPROCESS_DIR_SUFFIX="${SINGLE_MASK_TYPE}_seq${SINGLE_MASK_SEQ_LEN}"
-    ;;
-  2D_video_trajectory|2D_image_trajectory)
-    PREPROCESS_DIR_SUFFIX="${SINGLE_MASK_TYPE}"
-    ;;
-  *)
-    PREPROCESS_DIR_SUFFIX="${SINGLE_MASK_TYPE}"
-    ;;
-esac
-PREPROCESSED_DATA_DIR="${PREPROCESSED_DATA_DIR:-${PREPROCESSED_ROOT_DIR}/${PREPROCESS_DIR_SUFFIX}}"
-PREPROCESSED_FILE_STEM="${PREPROCESSED_FILE_STEM:-${PREPROCESSED_DATA_PREFIX}_${PREPROCESS_DIR_SUFFIX}}"
+PREPROCESS_MODE="mixed"
+if [[ "$SINGLE_MASK_COMPAT" == "true" ]]; then
+  PREPROCESS_MODE="single"
+  SINGLE_MASK_RETAIN_RATIO="1.0"
+  SINGLE_MASK_SEQ_LEN="1"
+  case "$SINGLE_MASK_TYPE" in
+    2D_partial_trajectory|local_planner)
+      SINGLE_MASK_SEQ_LEN="${SINGLE_MASK_PARAM}"
+      ;;
+    *)
+      SINGLE_MASK_RETAIN_RATIO="${SINGLE_MASK_PARAM}"
+      ;;
+  esac
+  echo "[subgoal] single mask type detected: ${SINGLE_MASK_TYPE}; using single-mask preprocess"
+fi
+
+compute_mixed_file_stem() {
+  python - <<'PY'
+import os
+from types import SimpleNamespace
+
+from examples.baselines.diffusion_policy.data_preprocess.data_preprocess_mixed import (
+    build_output_stem,
+    normalize_split_mask_config,
+)
+
+args = SimpleNamespace(
+    train_num_mask_type=int(os.environ["TRAIN_NUM_MASK_TYPE"]),
+    train_mask_type_list=os.environ["TRAIN_MASK_TYPE_LIST"],
+    train_mask_composition_list=os.environ["TRAIN_MASK_COMPOSITION_LIST"],
+    train_mask_ratio_list=os.environ["TRAIN_MASK_RATIO_LIST"],
+    eval_num_mask_type=int(os.environ["EVAL_NUM_MASK_TYPE"]),
+    eval_mask_type_list=os.environ["EVAL_MASK_TYPE_LIST"],
+    eval_mask_composition_list=os.environ["EVAL_MASK_COMPOSITION_LIST"],
+    eval_mask_ratio_list=os.environ["EVAL_MASK_RATIO_LIST"],
+    mask_assign_mode=os.environ["PREPROCESS_MASK_ASSIGN_MODE"],
+)
+train_mask_specs = normalize_split_mask_config(
+    args,
+    "train",
+    mask_assign_mode=args.mask_assign_mode,
+)
+eval_mask_specs = normalize_split_mask_config(
+    args,
+    "eval",
+    mask_assign_mode=args.mask_assign_mode,
+)
+print(
+    build_output_stem(
+        os.environ["PREPROCESSED_DATA_PREFIX"],
+        train_mask_specs,
+        eval_mask_specs,
+        mask_assign_mode=args.mask_assign_mode,
+    )
+)
+PY
+}
+
+if [[ "$PREPROCESS_MODE" == "single" ]]; then
+  case "$SINGLE_MASK_TYPE" in
+    pose_AnyGrasp|pose_motion_planning|points|3D_points|random_mask)
+      PREPROCESS_DIR_SUFFIX="${SINGLE_MASK_TYPE}_${SINGLE_MASK_RETAIN_RATIO}"
+      ;;
+    2D_partial_trajectory|local_planner)
+      PREPROCESS_DIR_SUFFIX="${SINGLE_MASK_TYPE}_seq${SINGLE_MASK_SEQ_LEN}"
+      ;;
+    2D_video_trajectory|2D_image_trajectory)
+      PREPROCESS_DIR_SUFFIX="${SINGLE_MASK_TYPE}"
+      ;;
+    *)
+      PREPROCESS_DIR_SUFFIX="${SINGLE_MASK_TYPE}"
+      ;;
+  esac
+  PREPROCESSED_DATA_DIR="${PREPROCESSED_DATA_DIR:-${PREPROCESSED_ROOT_DIR}/${PREPROCESS_DIR_SUFFIX}}"
+  PREPROCESSED_FILE_STEM="${PREPROCESSED_FILE_STEM:-${PREPROCESSED_DATA_PREFIX}_${PREPROCESS_DIR_SUFFIX}}"
+else
+  PREPROCESSED_DATA_DIR="${PREPROCESSED_DATA_DIR:-${PREPROCESSED_ROOT_DIR}/mixed}"
+  PREPROCESSED_FILE_STEM="${PREPROCESSED_FILE_STEM:-$(compute_mixed_file_stem)}"
+fi
 DEMO_PATH="${DEMO_PATH:-${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_train.h5}"
 EVAL_DEMO_PATH="${EVAL_DEMO_PATH:-${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_eval.h5}"
 EVAL_DEMO_METADATA_PATH="${EVAL_DEMO_METADATA_PATH:-${PREPROCESSED_DATA_DIR}/${PREPROCESSED_FILE_STEM}_eval.json}"
@@ -204,7 +335,7 @@ ensure_preprocessed_dataset() {
   done
 
   if [[ "$missing" -eq 0 ]]; then
-    echo "[subgoal-preprocess] reuse existing dataset: ${PREPROCESSED_DATA_DIR}"
+    echo "[subgoal-preprocess] reuse existing ${PREPROCESS_MODE} dataset: ${PREPROCESSED_DATA_DIR}"
     return
   fi
 
@@ -218,23 +349,48 @@ ensure_preprocessed_dataset() {
   fi
 
   mkdir -p "$PREPROCESSED_DATA_DIR"
-  echo "[subgoal-preprocess] generating dataset into ${PREPROCESSED_DATA_DIR}"
-  PREPROCESS_ARGS=(
-    --input-h5 "$RAW_DEMO_H5"
-    --input-json "$RAW_DEMO_JSON"
-    --output-dir "$PREPROCESSED_DATA_DIR"
-    --output-prefix "$PREPROCESSED_DATA_PREFIX"
-    --env-id "$ENV_ID"
-    --action-dim "$ACTION_DIM"
-    --mask-type "$SINGLE_MASK_TYPE"
-    --retain-ratio "$SINGLE_MASK_RETAIN_RATIO"
-    --mask-seq-len "$SINGLE_MASK_SEQ_LEN"
-    --mask-value "$PREPROCESS_MASK_VALUE"
-  )
-  if [[ -n "$PREPROCESS_NUM_TRAJ" ]]; then
-    PREPROCESS_ARGS+=(--num-traj "$PREPROCESS_NUM_TRAJ")
+  echo "[subgoal-preprocess] generating ${PREPROCESS_MODE} dataset into ${PREPROCESSED_DATA_DIR}"
+  if [[ "$PREPROCESS_MODE" == "single" ]]; then
+    PREPROCESS_ARGS=(
+      --input-h5 "$RAW_DEMO_H5"
+      --input-json "$RAW_DEMO_JSON"
+      --output-dir "$PREPROCESSED_DATA_DIR"
+      --output-prefix "$PREPROCESSED_DATA_PREFIX"
+      --env-id "$ENV_ID"
+      --action-dim "$ACTION_DIM"
+      --mask-type "$SINGLE_MASK_TYPE"
+      --retain-ratio "$SINGLE_MASK_RETAIN_RATIO"
+      --mask-seq-len "$SINGLE_MASK_SEQ_LEN"
+      --mask-value "$PREPROCESS_MASK_VALUE"
+    )
+    if [[ -n "$PREPROCESS_NUM_TRAJ" ]]; then
+      PREPROCESS_ARGS+=(--num-traj "$PREPROCESS_NUM_TRAJ")
+    fi
+    python examples/baselines/diffusion_policy/data_preprocess/data_preprocess.py "${PREPROCESS_ARGS[@]}"
+  else
+    PREPROCESS_ARGS=(
+      --input-h5 "$RAW_DEMO_H5"
+      --input-json "$RAW_DEMO_JSON"
+      --output-dir "$PREPROCESSED_DATA_DIR"
+      --output-prefix "$PREPROCESSED_DATA_PREFIX"
+      --env-id "$ENV_ID"
+      --action-dim "$ACTION_DIM"
+      --mask-assign-mode "$PREPROCESS_MASK_ASSIGN_MODE"
+      --train-num-mask-type "$TRAIN_NUM_MASK_TYPE"
+      --train-mask-type-list "$TRAIN_MASK_TYPE_LIST"
+      --train-mask-composition-list "$TRAIN_MASK_COMPOSITION_LIST"
+      --train-mask-ratio-list "$TRAIN_MASK_RATIO_LIST"
+      --eval-num-mask-type "$EVAL_NUM_MASK_TYPE"
+      --eval-mask-type-list "$EVAL_MASK_TYPE_LIST"
+      --eval-mask-composition-list "$EVAL_MASK_COMPOSITION_LIST"
+      --eval-mask-ratio-list "$EVAL_MASK_RATIO_LIST"
+      --mask-value "$PREPROCESS_MASK_VALUE"
+    )
+    if [[ -n "$PREPROCESS_NUM_TRAJ" ]]; then
+      PREPROCESS_ARGS+=(--num-traj "$PREPROCESS_NUM_TRAJ")
+    fi
+    python examples/baselines/diffusion_policy/data_preprocess/data_preprocess_mixed.py "${PREPROCESS_ARGS[@]}"
   fi
-  python examples/baselines/diffusion_policy/data_preprocess/data_preprocess.py "${PREPROCESS_ARGS[@]}"
 }
 
 ensure_preprocessed_dataset

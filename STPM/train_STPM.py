@@ -68,9 +68,9 @@ def _ensure_state_norm_json(cfg) -> None:
                 f"norm={meta_state_paths}, config={state_paths}"
             )
         if meta_state_paths is None:
-            print(
-                "[Init] Warning: state_norm JSON has no meta.state_paths; "
-                "cannot verify semantic state alignment. Regenerate it with "
+            raise ValueError(
+                "STPM state normalizer has no meta.state_paths, so semantic state "
+                "alignment cannot be verified. Regenerate it with "
                 "STPM/utils/generate_state_norm_json.py --config ... --overwrite."
             )
         return

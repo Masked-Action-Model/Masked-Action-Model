@@ -157,6 +157,8 @@ PICKCUBE_STATE_PATH_DIMS = {
 
 
 def _state_dim_for_paths(state_paths: list[str]) -> int | None:
+    if not state_paths:
+        return None
     dims = [PICKCUBE_STATE_PATH_DIMS.get(path) for path in state_paths]
     if any(dim is None for dim in dims):
         return None
@@ -314,13 +316,6 @@ def _prepare_rollout_state_for_stpm(rollout_state: torch.Tensor, stpm_encoder):
             )
         return mapped
 
-    target_dim = _state_dim_for_paths(state_paths)
-    if target_dim is not None and target_dim != expected_state_dim:
-        raise ValueError(
-            "STPM checkpoint state_dim does not match its state_paths dimensions: "
-            f"checkpoint={expected_state_dim}, state_paths_dim={target_dim}, state_paths={state_paths!r}"
-        )
-
     if state_paths in ([], ROLLOUT_DEFAULT_STATE_PATHS):
         if rollout_state.numel() != expected_state_dim:
             raise ValueError(
@@ -332,6 +327,13 @@ def _prepare_rollout_state_for_stpm(rollout_state: torch.Tensor, stpm_encoder):
             f"[check5] STPM state uses rollout order directly: dim={rollout_state.numel()}",
         )
         return rollout_state
+
+    target_dim = _state_dim_for_paths(state_paths)
+    if target_dim is not None and target_dim != expected_state_dim:
+        raise ValueError(
+            "STPM checkpoint state_dim does not match its state_paths dimensions: "
+            f"checkpoint={expected_state_dim}, state_paths_dim={target_dim}, state_paths={state_paths!r}"
+        )
 
     if rollout_state.numel() == PICKCUBE_ROLLOUT_STATE_DIM:
         reordered = _slice_state_by_paths(
