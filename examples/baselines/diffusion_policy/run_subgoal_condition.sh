@@ -11,7 +11,7 @@ export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-maniskill}"
 # -----------------------------------------------------------------------------
 
 ENV_ID="${ENV_ID:-PickCube-v1}"
-ACTION_DIM="${ACTION_DIM:-7}" # 7=有夹爪，6=无夹爪/panda_stick
+ACTION_DIM="${ACTION_DIM:-${action_dim:-auto}}" # auto infers from RAW_DEMO_H5; 7=有夹爪，6=无夹爪/panda_stick
 EXP_NAME="${EXP_NAME:-PickCube_subgoal_condition}"
 SEED="${SEED:-1}"
 TORCH_DETERMINISTIC="${TORCH_DETERMINISTIC:-true}"
@@ -27,6 +27,21 @@ CAPTURE_VIDEO="${CAPTURE_VIDEO:-false}"
 
 RAW_DEMO_H5="${RAW_DEMO_H5:-demos/data_1/data_1.h5}"
 RAW_DEMO_JSON="${RAW_DEMO_JSON:-demos/data_1/data_1.json}"
+if [[ "$ACTION_DIM" == "auto" ]]; then
+  if [[ ! -f "$RAW_DEMO_H5" ]]; then
+    echo "ERROR: cannot infer ACTION_DIM because raw demo h5 not found: $RAW_DEMO_H5" >&2
+    exit 1
+  fi
+  ACTION_DIM="$(
+    python - "$RAW_DEMO_H5" <<'PY'
+import sys
+from examples.baselines.diffusion_policy.utils.split_eval_utils import infer_h5_action_dim
+
+print(infer_h5_action_dim(sys.argv[1]))
+PY
+  )"
+  echo "[action-dim] inferred ACTION_DIM=${ACTION_DIM} from ${RAW_DEMO_H5}"
+fi
 PREPROCESSED_ROOT_DIR="${PREPROCESSED_ROOT_DIR:-demos/data_1_preprocessed}"
 PREPROCESSED_DATA_PREFIX="${PREPROCESSED_DATA_PREFIX:-data_1}"
 PREPROCESSED_DATA_DIR="${PREPROCESSED_DATA_DIR:-}"

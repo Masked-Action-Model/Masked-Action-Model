@@ -40,7 +40,7 @@ OVERWRITE_SPLIT="${OVERWRITE_SPLIT:-false}"
 # -----------------------------------------------------------------------------
 
 ENV_ID="${ENV_ID:-PickCube-v1}"
-ACTION_DIM="${ACTION_DIM:-7}" # 7=有夹爪，6=无夹爪/panda_stick
+ACTION_DIM="${ACTION_DIM:-${action_dim:-auto}}" # auto infers from RAW_DEMO_H5; 7=有夹爪，6=无夹爪/panda_stick
 CONTROL_MODE="${CONTROL_MODE:-pd_ee_pose}"
 OBS_MODE="${OBS_MODE:-rgb}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-100}"
@@ -103,6 +103,17 @@ case "$NOISE_MODEL" in
     exit 1
     ;;
 esac
+if [[ "$ACTION_DIM" == "auto" ]]; then
+  ACTION_DIM="$(
+    python - "$RAW_DEMO_H5" <<'PY'
+import sys
+from examples.baselines.diffusion_policy.utils.split_eval_utils import infer_h5_action_dim
+
+print(infer_h5_action_dim(sys.argv[1]))
+PY
+  )"
+  echo "[action-dim] inferred ACTION_DIM=${ACTION_DIM} from ${RAW_DEMO_H5}"
+fi
 case "$ACTION_DIM" in
   6|7) ;;
   *)

@@ -2,7 +2,7 @@ general:
   project_name: "STPM_PickCube"  
   task_name: "pick up the cube and place it at the goal"  # language prompt
   repo_id: demos/data_1/data_1_train.h5                   # dataset .h5 path
-  state_norm_path: STPM_PickCube/state_norm.json
+  state_norm_path: STPM_PickCube/state_norm.json  
   camera_names: "auto"
   camera_poses: {}
   state_paths: ["obs/agent/qpos", "obs/agent/qvel", "obs/extra/goal_pos", "obs/extra/tcp_pose", "obs/extra/is_grasped"]

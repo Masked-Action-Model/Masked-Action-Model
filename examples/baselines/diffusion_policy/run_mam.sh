@@ -10,7 +10,7 @@ export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
 # -----------------------------------------------------------------------------
 
 ENV_ID="${ENV_ID:-PickCube-v1}"
-ACTION_DIM="${ACTION_DIM:-7}" # 7=有夹爪，6=无夹爪/panda_stick
+ACTION_DIM="${ACTION_DIM:-${action_dim:-auto}}" # auto infers from RAW_DEMO_H5; 7=有夹爪，6=无夹爪/panda_stick
 EXP_NAME="${EXP_NAME:-PickCube_mam_unet}"
 SEED="${SEED:-1}"
 TORCH_DETERMINISTIC="${TORCH_DETERMINISTIC:-true}"
@@ -26,6 +26,21 @@ CAPTURE_VIDEO="${CAPTURE_VIDEO:-false}"
 
 RAW_DEMO_H5="${RAW_DEMO_H5:-demos/data_1/data_1.h5}"
 RAW_DEMO_JSON="${RAW_DEMO_JSON:-demos/data_1/data_1.json}"
+if [[ "$ACTION_DIM" == "auto" ]]; then
+  if [[ ! -f "$RAW_DEMO_H5" ]]; then
+    echo "ERROR: cannot infer ACTION_DIM because raw demo h5 not found: $RAW_DEMO_H5" >&2
+    exit 1
+  fi
+  ACTION_DIM="$(
+    python - "$RAW_DEMO_H5" <<'PY'
+import sys
+from examples.baselines.diffusion_policy.utils.split_eval_utils import infer_h5_action_dim
+
+print(infer_h5_action_dim(sys.argv[1]))
+PY
+  )"
+  echo "[action-dim] inferred ACTION_DIM=${ACTION_DIM} from ${RAW_DEMO_H5}"
+fi
 
 # -----------------------------------------------------------------------------
 # 3. Preprocess params (mask config)
@@ -188,7 +203,7 @@ case "$NOISE_MODEL" in
 esac
 
 # -----------------------------------------------------------------------------
-# 6. Train basic params
+# 6. Train basic params 
 # -----------------------------------------------------------------------------
 
 NUM_DEMOS="${NUM_DEMOS:-50}"
@@ -204,7 +219,7 @@ ACT_HORIZON="${ACT_HORIZON:-8}"
 PRED_HORIZON="${PRED_HORIZON:-16}"
 
 # -----------------------------------------------------------------------------
-# 7. MAS window and loss params
+# 7. MAS window and loss params 
 # -----------------------------------------------------------------------------
 
 LONG_WINDOW_BACKWARD_LENGTH="${LONG_WINDOW_BACKWARD_LENGTH:-0}"
@@ -248,7 +263,7 @@ if [[ "$SINGLE_MASK_COMPAT" == "true" ]]; then
 fi
 
 # -----------------------------------------------------------------------------
-# 9. Derived preprocessed paths
+# 9. Derived preprocessed paths 
 # -----------------------------------------------------------------------------
 
 compute_mixed_file_stem() {
@@ -321,7 +336,7 @@ TRAIN_DEMO_METADATA_PATH="${TRAIN_DEMO_METADATA_PATH:-${PREPROCESSED_DATA_DIR}/$
 ACTION_NORM_PATH="${ACTION_NORM_PATH:-${DEMO_PATH}}"
 
 # -----------------------------------------------------------------------------
-# 10. Preprocess helper
+# 10. Preprocess helper 
 # -----------------------------------------------------------------------------
 
 ensure_preprocessed_dataset() {
@@ -395,7 +410,7 @@ ensure_preprocessed_dataset() {
 ensure_preprocessed_dataset
 
 # -----------------------------------------------------------------------------
-# 11. Build train args
+# 11. Build train args 
 # -----------------------------------------------------------------------------
 
 ARGS=(

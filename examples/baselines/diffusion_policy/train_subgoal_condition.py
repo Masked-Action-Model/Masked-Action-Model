@@ -54,9 +54,23 @@ from utils.split_eval_utils import (
     ensure_raw_train_eval_split,
     load_action_denorm_stats,
     load_eval_reset_kwargs_list,
+    resolve_action_dim,
+    validate_demo_action_dim,
 )
 from utils.utils import (IterationBasedBatchSampler, build_state_obs_extractor,
                          convert_obs, worker_init_fn)
+
+
+def move_batch_to_device(batch, device):
+    out = {}
+    for k, v in batch.items():
+        if isinstance(v, dict):
+            out[k] = move_batch_to_device(v, device)
+        elif torch.is_tensor(v):
+            out[k] = v.to(device, non_blocking=True)
+        else:
+            out[k] = v
+    return out
 
 
 @dataclass
@@ -80,8 +94,8 @@ class Args:
 
     env_id: str = "PegInsertionSide-v1"
     """the id of the environment"""
-    action_dim: int = 7
-    """action dimension: 6 for panda_stick/no-gripper tasks, 7 for gripper tasks."""
+    action_dim: Optional[int] = None
+    """action dimension: 6 for panda_stick/no-gripper tasks, 7 for gripper tasks. If omitted, infer from the train h5."""
     demo_path: str = (
         "demos/PegInsertionSide-v1/trajectory.state.pd_ee_delta_pose.physx_cpu.h5"
     )
@@ -444,10 +458,14 @@ class SmallDemoDataset_SubgoalCondition(Dataset):  # Load everything into memory
             _obs_traj_dict = reorder_keys(obs_traj_dict, obs_space)  # key order in demo is different from key order in env obs
             _obs_traj_dict = obs_process_fn(_obs_traj_dict)
             if self.include_depth:
-                _obs_traj_dict["depth"] = torch.Tensor(_obs_traj_dict["depth"].astype(np.float32)).to(device=device, dtype=torch.float16)
+                _obs_traj_dict["depth"] = torch.Tensor(
+                    _obs_traj_dict["depth"].astype(np.float32)
+                ).to(dtype=torch.float16)
             if self.include_rgb:
-                _obs_traj_dict["rgb"] = torch.from_numpy(_obs_traj_dict["rgb"]).to(device)  # still uint8
-            _obs_traj_dict["state"] = torch.from_numpy(_obs_traj_dict["state"]).to(device)
+                _obs_traj_dict["rgb"] = torch.from_numpy(_obs_traj_dict["rgb"])  # still uint8
+            _obs_traj_dict["state"] = torch.from_numpy(_obs_traj_dict["state"]).to(
+                dtype=torch.float32
+            )
             obs_traj_dict_list.append(_obs_traj_dict)
         trajectories["observations"] = obs_traj_dict_list
         self.obs_keys = list(_obs_traj_dict.keys())
@@ -459,13 +477,12 @@ class SmallDemoDataset_SubgoalCondition(Dataset):  # Load everything into memory
                 )
             trajectories["actions"][i] = torch.from_numpy(
                 action_np
-            ).to(device=device)
+            ).to(dtype=torch.float32)
         trajectories["subgoal_flat"] = [
             build_subgoal_flat(
                 mas,
                 target_len=self.mas_max_length,
                 action_dim=self.action_dim,
-                device=device,
             )
             for mas in trajectories["mas"]
         ]
@@ -768,13 +785,26 @@ def save_ckpt(run_name, tag):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    if int(args.action_dim) not in (6, 7):
-        raise ValueError(f"action_dim must be 6 or 7, got {args.action_dim}")
     if args.raw_demo_h5 is not None and len(args.raw_demo_h5.strip()) > 0:
         raise ValueError(
             "Subgoal condition expects preprocessed single-mask datasets. "
             "Use run_subgoal_condition.sh to generate demo/eval h5 files."
         )
+    args.action_dim = resolve_action_dim(
+        args.action_dim,
+        args.demo_path,
+        label="train demo",
+    )
+    if args.eval_demo_path is None or len(args.eval_demo_path.strip()) == 0:
+        raise ValueError(
+            "eval_demo_path is required for split train/eval. "
+            "Pass --eval-demo-path to select eval reset seeds from an eval h5/json."
+        )
+    validate_demo_action_dim(
+        args.eval_demo_path,
+        args.action_dim,
+        label="eval demo",
+    )
 
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
@@ -789,11 +819,6 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
-    if args.eval_demo_path is None or len(args.eval_demo_path.strip()) == 0:
-        raise ValueError(
-            "eval_demo_path is required for split train/eval. "
-            "Pass --eval-demo-path to select eval reset seeds from an eval h5/json."
-        )
     eval_mask_types_all = load_traj_mask_types(args.eval_demo_path, num_traj=None)
     eval_mask_type_slots_all = load_traj_mask_type_slots(args.eval_demo_path, num_traj=None)
     eval_source_episode_ids_all = load_source_episode_ids(args.eval_demo_path, num_traj=None)
@@ -843,6 +868,11 @@ if __name__ == "__main__":
     args.subgoal_dim = mas_max_length * int(args.action_dim)
     action_norm_path = args.action_norm_path or args.demo_path
     denorm_mins, denorm_maxs = load_action_denorm_stats(action_norm_path)
+    if int(denorm_mins.shape[0]) != int(args.action_dim):
+        raise ValueError(
+            f"action norm dim ({denorm_mins.shape[0]}) does not match action_dim={args.action_dim}: "
+            f"{action_norm_path}"
+        )
     eval_subgoal_data = load_eval_subgoal_data(
         data_path=args.eval_demo_path,
         device=device,
@@ -1059,6 +1089,9 @@ if __name__ == "__main__":
     last_tick = time.time()
     for iteration, data_batch in enumerate(train_dataloader):
         timings["data_loading"] += time.time() - last_tick
+
+        # move batch to target device
+        data_batch = move_batch_to_device(data_batch, device)
 
         # forward and compute loss
         last_tick = time.time()

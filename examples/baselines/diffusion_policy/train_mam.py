@@ -67,6 +67,7 @@ from utils.load_eval_data_utils import (infer_eval_reset_seeds_from_demo,
                                   load_traj_mask_types,
                                   subset_eval_data)
 from utils.load_train_data_utils import load_dataset_meta, load_demo_dataset
+from utils.split_eval_utils import resolve_action_dim, validate_demo_action_dim
 from utils.loss_utils import (
     compute_mask_weighted_noise_mse,
     slice_action_mask_sequence,
@@ -110,8 +111,8 @@ class Args:
 
     env_id: str = "PegInsertionSide-v1"
     """the id of the environment"""
-    action_dim: int = 7
-    """action dimension: 6 for panda_stick/no-gripper tasks, 7 for gripper tasks."""
+    action_dim: Optional[int] = None
+    """action dimension: 6 for panda_stick/no-gripper tasks, 7 for gripper tasks. If omitted, infer from the train h5."""
     demo_path: str = (
         "demos/PegInsertionSide-v1/trajectory.state.pd_ee_delta_pose.physx_cpu.h5"
     )
@@ -1448,6 +1449,21 @@ def stratified_select_demo_indices(
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    args.action_dim = resolve_action_dim(
+        args.action_dim,
+        args.demo_path,
+        label="train demo",
+    )
+    if args.test_demo_path is None:
+        raise ValueError(
+            "train_mam.py requires --test-demo-path. "
+            "Evaluation must use an explicit eval demo dataset and cannot reuse demo_path."
+        )
+    validate_demo_action_dim(
+        args.test_demo_path,
+        args.action_dim,
+        label="eval demo",
+    )
     configure_mas_dimensions(args.action_dim)
 
     # ------------------------------------------------------------------------ #
@@ -1513,11 +1529,6 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------------ #
     # 2. Evaluation demo alignment: demo path, reset seeds, traj ids, subsets
     # ------------------------------------------------------------------------ #
-    if args.test_demo_path is None:
-        raise ValueError(
-            "train_mam.py requires --test-demo-path. "
-            "Evaluation must use an explicit eval demo dataset and cannot reuse demo_path."
-        )
     eval_demo_path = args.test_demo_path
     eval_reset_seeds = infer_eval_reset_seeds_from_demo(
         eval_demo_path,
@@ -1605,6 +1616,11 @@ if __name__ == "__main__":
     # 3. Evaluation-only runtime requirements: action denormalization and STPM
     # ------------------------------------------------------------------------ #
     denorm_mins, denorm_maxs = load_action_denorm_stats(args.action_norm_path)
+    if int(denorm_mins.shape[0]) != int(args.action_dim):
+        raise ValueError(
+            f"action norm dim ({denorm_mins.shape[0]}) does not match action_dim={args.action_dim}: "
+            f"{args.action_norm_path}"
+        )
     print("[denorm] eval actions will be denormalized before env.step().")
 
     stpm_encoder, stpm_n_obs_steps, stpm_frame_gap = build_eval_stpm_encoder(

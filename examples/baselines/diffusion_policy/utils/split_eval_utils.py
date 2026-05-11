@@ -27,6 +27,71 @@ def _list_traj_keys(h5_file: h5py.File, num_traj: Optional[int] = None) -> list[
     return keys
 
 
+def validate_action_dim(action_dim: int) -> int:
+    action_dim = int(action_dim)
+    if action_dim not in (6, 7):
+        raise ValueError(f"action_dim must be 6 or 7, got {action_dim}")
+    return action_dim
+
+
+def infer_h5_action_dim(h5_path: str, num_traj: Optional[int] = None) -> int:
+    if h5_path is None or len(str(h5_path).strip()) == 0:
+        raise ValueError("h5_path is required to infer action_dim")
+    if not os.path.exists(h5_path):
+        raise FileNotFoundError(f"h5 path not found: {h5_path}")
+    dims = []
+    with h5py.File(h5_path, "r") as f:
+        for traj_key in _list_traj_keys(f, num_traj=num_traj):
+            if "actions" not in f[traj_key]:
+                raise KeyError(f"missing actions in {h5_path}:{traj_key}")
+            actions = f[traj_key]["actions"]
+            if len(actions.shape) != 2:
+                raise ValueError(
+                    f"{h5_path}:{traj_key}/actions must be 2D, got shape {actions.shape}"
+                )
+            dims.append(int(actions.shape[1]))
+    unique_dims = sorted(set(dims))
+    if len(unique_dims) != 1:
+        raise ValueError(f"inconsistent action dims in {h5_path}: {unique_dims}")
+    return validate_action_dim(unique_dims[0])
+
+
+def resolve_action_dim(
+    action_dim: Optional[int],
+    demo_path: str,
+    *,
+    label: str = "demo",
+    num_traj: Optional[int] = None,
+) -> int:
+    inferred = infer_h5_action_dim(demo_path, num_traj=num_traj)
+    if action_dim is None:
+        print(f"[action_dim] inferred {inferred} from {label}: {demo_path}")
+        return inferred
+    action_dim = validate_action_dim(action_dim)
+    if action_dim != inferred:
+        raise ValueError(
+            f"{label} action dim is {inferred}, but configured action_dim={action_dim}. "
+            f"Use --action-dim {inferred} or regenerate/select a matching dataset."
+        )
+    print(f"[action_dim] using configured {action_dim}; {label} matches: {demo_path}")
+    return action_dim
+
+
+def validate_demo_action_dim(
+    demo_path: str,
+    action_dim: int,
+    *,
+    label: str = "demo",
+    num_traj: Optional[int] = None,
+) -> None:
+    resolve_action_dim(
+        action_dim,
+        demo_path,
+        label=label,
+        num_traj=num_traj,
+    )
+
+
 def _split_source_episode_ids(source_episode_ids: list[int], split_seed: int):
     if len(source_episode_ids) == 1:
         return source_episode_ids[:], []

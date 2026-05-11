@@ -51,10 +51,24 @@ from utils.split_eval_utils import (
     ensure_raw_train_eval_split,
     load_action_denorm_stats,
     load_eval_reset_kwargs_list,
+    resolve_action_dim,
     save_action_norm_stats,
+    validate_demo_action_dim,
 )
 from utils.utils import (IterationBasedBatchSampler, build_state_obs_extractor,
                          convert_obs, worker_init_fn)
+
+
+def move_batch_to_device(batch, device):
+    out = {}
+    for k, v in batch.items():
+        if isinstance(v, dict):
+            out[k] = move_batch_to_device(v, device)
+        elif torch.is_tensor(v):
+            out[k] = v.to(device, non_blocking=True)
+        else:
+            out[k] = v
+    return out
 
 
 @dataclass
@@ -78,8 +92,8 @@ class Args:
 
     env_id: str = "PegInsertionSide-v1"
     """the id of the environment"""
-    action_dim: int = 7
-    """action dimension: 6 for panda_stick/no-gripper tasks, 7 for gripper tasks."""
+    action_dim: Optional[int] = None
+    """action dimension: 6 for panda_stick/no-gripper tasks, 7 for gripper tasks. If omitted, infer from the train h5."""
     demo_path: str = (
         "demos/PegInsertionSide-v1/trajectory.state.pd_ee_delta_pose.physx_cpu.h5"
     )
@@ -208,10 +222,14 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             _obs_traj_dict = reorder_keys(obs_traj_dict, obs_space)  # key order in demo is different from key order in env obs
             _obs_traj_dict = obs_process_fn(_obs_traj_dict)
             if self.include_depth:
-                _obs_traj_dict["depth"] = torch.Tensor(_obs_traj_dict["depth"].astype(np.float32)).to(device=device, dtype=torch.float16)
+                _obs_traj_dict["depth"] = torch.Tensor(
+                    _obs_traj_dict["depth"].astype(np.float32)
+                ).to(dtype=torch.float16)
             if self.include_rgb:
-                _obs_traj_dict["rgb"] = torch.from_numpy(_obs_traj_dict["rgb"]).to(device)  # still uint8
-            _obs_traj_dict["state"] = torch.from_numpy(_obs_traj_dict["state"]).to(device)
+                _obs_traj_dict["rgb"] = torch.from_numpy(_obs_traj_dict["rgb"])  # still uint8
+            _obs_traj_dict["state"] = torch.from_numpy(_obs_traj_dict["state"]).to(
+                dtype=torch.float32
+            )
             obs_traj_dict_list.append(_obs_traj_dict)
         trajectories["observations"] = obs_traj_dict_list
         self.obs_keys = list(_obs_traj_dict.keys())
@@ -234,6 +252,11 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             )
         self.action_min = np.asarray(action_min, dtype=np.float32)
         self.action_max = np.asarray(action_max, dtype=np.float32)
+        if self.action_min.shape[0] != self.action_dim:
+            raise ValueError(
+                f"action norm dim ({self.action_min.shape[0]}) does not match action_dim={self.action_dim}: "
+                f"{self.action_norm_path}"
+            )
         print(f"[action_norm] min={self.action_min}")
         print(f"[action_norm] max={self.action_max}")
 
@@ -244,7 +267,9 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
                 mins=self.action_min,
                 maxs=self.action_max,
             )
-            trajectories["actions"][i] = torch.from_numpy(normalized_action).to(device=device)
+            trajectories["actions"][i] = torch.from_numpy(normalized_action).to(
+                dtype=torch.float32
+            )
         print("Obs/action pre-processing is done, start to pre-compute the slice indices...")
 
          # Fixed to pd_ee_pose: pad with final action to keep target unchanged.
@@ -532,9 +557,12 @@ def save_ckpt(run_name, tag):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    if int(args.action_dim) not in (6, 7):
-        raise ValueError(f"action_dim must be 6 or 7, got {args.action_dim}")
     ensure_raw_train_eval_split(args)
+    args.action_dim = resolve_action_dim(
+        args.action_dim,
+        args.demo_path,
+        label="train demo",
+    )
 
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
@@ -554,6 +582,11 @@ if __name__ == "__main__":
             "eval_demo_path is required for split train/eval. "
             "Pass --eval-demo-path to select eval reset seeds from an eval h5/json."
         )
+    validate_demo_action_dim(
+        args.eval_demo_path,
+        args.action_dim,
+        label="eval demo",
+    )
     eval_reset_kwargs_list = load_eval_reset_kwargs_list(
         eval_demo_path=args.eval_demo_path,
         eval_demo_metadata_path=args.eval_demo_metadata_path,
@@ -730,6 +763,9 @@ if __name__ == "__main__":
     last_tick = time.time()
     for iteration, data_batch in enumerate(train_dataloader):
         timings["data_loading"] += time.time() - last_tick
+
+        # move batch to target device
+        data_batch = move_batch_to_device(data_batch, device)
 
         # forward and compute loss
         last_tick = time.time()
