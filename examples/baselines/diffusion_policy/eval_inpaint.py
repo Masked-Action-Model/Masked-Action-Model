@@ -20,6 +20,7 @@ try:
         Args as BaseArgs,
         _build_agent,
         _build_eval_envs,
+        _build_eval_env_kwargs,
         _build_legacy_short_mask_feature,
         _compute_control_error_results,
         _extract_final_episode_records,
@@ -34,6 +35,7 @@ except ModuleNotFoundError:
         Args as BaseArgs,
         _build_agent,
         _build_eval_envs,
+        _build_eval_env_kwargs,
         _build_legacy_short_mask_feature,
         _compute_control_error_results,
         _extract_final_episode_records,
@@ -338,10 +340,11 @@ def main():
         args.stpm_config_path,
         device,
     )
-    envs = _build_eval_envs(args)
+    env_kwargs = _build_eval_env_kwargs(args, stpm_encoder)
+    envs = _build_eval_envs(args, stpm_encoder, env_kwargs=env_kwargs)
 
     try:
-        validate_only_mas_eval_layout(envs, stpm_encoder)
+        validate_only_mas_eval_layout(envs, stpm_encoder, args.env_id, env_kwargs)
         agent, action_min, action_max, dataset_meta = _build_agent(
             args=args,
             envs=envs,

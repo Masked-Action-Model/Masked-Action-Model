@@ -16,9 +16,11 @@ from train_mam import (
     MAS_STEP_DIM,
     Agent,
     _load_state_norm_stats_from_meta,
+    build_eval_sensor_configs,
     build_eval_batch_indices,
     build_eval_stpm_encoder,
     configure_mas_dimensions,
+    stpm_eval_env_obs_mode,
     validate_only_mas_eval_layout,
 )
 from utils.control_error_utils import (
@@ -63,6 +65,7 @@ class Args:
     num_eval_envs: int = 1
     sim_backend: str = "physx_cpu"
     render_backend: str = "gpu"
+    obs_mode: Literal["rgb", "rgb+depth"] = "rgb"
 
     obs_horizon: int = 2
     act_horizon: int = 8
@@ -88,6 +91,12 @@ class Args:
     output_dir: Optional[str] = None
     output_json_path: Optional[str] = None
     save_per_traj: bool = True
+
+    base_camera_eye: Optional[list[float]] = None
+    base_camera_target: Optional[list[float]] = None
+    base_camera_width: Optional[int] = None
+    base_camera_height: Optional[int] = None
+    base_camera_fov: Optional[float] = None
 
 
 def _to_numpy(value):
@@ -283,7 +292,7 @@ def _build_agent_runtime_args(args: Args):
         mas_long_conv_output_dim=mas_long_conv_output_dim,
         loss_mode="average",
         loss_mask_area_weight=0.2,
-        obs_mode="rgb+depth",
+        obs_mode=args.obs_mode,
         diffusion_step_embed_dim=int(args.diffusion_step_embed_dim),
         noise_model=args.noise_model,
         dit_hidden_dim=int(args.dit_hidden_dim),
@@ -336,16 +345,26 @@ def _build_agent(
     return agent, action_min, action_max, dataset_meta
 
 
-def _build_eval_envs(args: Args):
+def _build_eval_env_kwargs(args: Args, stpm_encoder=None) -> dict:
     env_kwargs = dict(
         control_mode=args.control_mode,
         reward_mode="sparse",
-        obs_mode="rgb+depth",
+        obs_mode=stpm_eval_env_obs_mode(args.obs_mode),
         render_mode="rgb_array",
         render_backend=args.render_backend,
         human_render_camera_configs=dict(shader_pack="default"),
         max_episode_steps=int(args.max_episode_steps),
     )
+    sensor_configs = build_eval_sensor_configs(args, stpm_encoder)
+    if sensor_configs:
+        env_kwargs["sensor_configs"] = sensor_configs
+        print(f"[stpm] eval sensor_configs from STPM config/CLI: {sensor_configs}")
+    return env_kwargs
+
+
+def _build_eval_envs(args: Args, stpm_encoder=None, env_kwargs: dict | None = None):
+    if env_kwargs is None:
+        env_kwargs = _build_eval_env_kwargs(args, stpm_encoder)
     return make_eval_envs(
         args.env_id,
         args.num_eval_envs,
@@ -699,11 +718,12 @@ def main():
         args.stpm_config_path,
         device,
     )
-    envs = _build_eval_envs(args)
+    env_kwargs = _build_eval_env_kwargs(args, stpm_encoder)
+    envs = _build_eval_envs(args, stpm_encoder, env_kwargs=env_kwargs)
 
     try:
         # 6. 构建 agent，并校验 checkpoint 与当前固定 short-window 布局一致。
-        validate_only_mas_eval_layout(envs, stpm_encoder)
+        validate_only_mas_eval_layout(envs, stpm_encoder, args.env_id, env_kwargs)
         agent, action_min, action_max, dataset_meta = _build_agent(
             args=args,
             envs=envs,

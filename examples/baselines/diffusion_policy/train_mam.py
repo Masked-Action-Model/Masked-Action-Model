@@ -194,7 +194,7 @@ class Args:
     """the number of workers to use for loading the training data in the torch dataloader"""
     control_mode: str = "pd_ee_pose"
     """the control mode to use for the evaluation environments. Must match the control mode of the demonstration dataset."""
-    obs_mode: Literal["rgb", "rgb+depth"] = "rgb+depth"
+    obs_mode: Literal["rgb", "rgb+depth"] = "rgb"
     """visual modality consumed by the policy. rgb ignores depth even when the dataset/eval env provide it."""
     base_camera_eye: Optional[List[float]] = None
     """Optional eval base_camera eye position [x, y, z]. Must be paired with base_camera_target."""
@@ -1885,16 +1885,17 @@ if __name__ == "__main__":
                 metric_value = float(np.mean(v)) if isinstance(v, np.ndarray) else float(v)
                 writer.add_scalar(f"eval/{k}", metric_value, iteration)
                 print(f"{k}: {metric_value:.6f}")
+            print_mask_type_summary = len(per_mask_type_summary) > 1
             for mask_type, one_summary in per_mask_type_summary.items():
                 for key, value in one_summary.items():
                     metric_value = float(value)
                     writer.add_scalar(f"eval_by_mask_type/{mask_type}/{key}", metric_value, iteration)
-                    print(f"[{mask_type}] {key}: {metric_value:.6f}")
+                    if print_mask_type_summary:
+                        print(f"[{mask_type}] {key}: {metric_value:.6f}")
             for mask_slot, one_summary in per_mask_slot_summary.items():
                 for key, value in one_summary.items():
                     metric_value = float(value)
                     writer.add_scalar(f"eval_by_mask_slot/{mask_slot}/{key}", metric_value, iteration)
-                    print(f"[{mask_slot}] {key}: {metric_value:.6f}")
             if ce_summary is not None:
                 for k in ["ce_all", "ce_success", "ce_failed"]:
                     metric_value = float(ce_summary[k])

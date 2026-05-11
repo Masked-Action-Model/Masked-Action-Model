@@ -168,10 +168,17 @@ def forward_jump_j_steps(a_cur: torch.Tensor, t_cur: int, j: int, max_t: int, sc
     return a_jump, cur_t
 
 
-def _prepare_obs_for_agent(obs_seq):
+def _prepare_obs_for_agent(agent, obs_seq):
     obs_seq = common.to_tensor(obs_seq, obs_seq["state"].device)
     obs_seq["rgb"] = obs_seq["rgb"].permute(0, 1, 4, 2, 3)
-    if "depth" in obs_seq:
+    include_depth = bool(getattr(agent, "include_depth", "depth" in obs_seq))
+    if include_depth:
+        if "depth" not in obs_seq:
+            raise ValueError(
+                "inpainting policy was configured with depth input, but rollout obs "
+                "does not contain a depth key. Use --obs-mode rgb for RGB-only "
+                "checkpoints, or provide rgb+depth observations."
+            )
         obs_seq["depth"] = obs_seq["depth"].permute(0, 1, 4, 2, 3)
     return obs_seq
 
@@ -215,7 +222,7 @@ def dp_repaint_inference(
     if jump_length == 0 and num_resample != 0:
         raise ValueError("num_resample must be 0 when jump_length is 0")
 
-    obs_seq = _prepare_obs_for_agent(obs_seq)
+    obs_seq = _prepare_obs_for_agent(agent, obs_seq)
     batch_size = obs_seq["state"].shape[0]
     pred_horizon = int(agent.pred_horizon)
     action_dim = int(agent.act_dim)
