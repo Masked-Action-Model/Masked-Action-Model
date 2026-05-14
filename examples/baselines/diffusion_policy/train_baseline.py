@@ -39,7 +39,10 @@ if str(BASELINE_ROOT) not in sys.path:
 
 from data_preprocess.utils.normalize_utils import (
     compute_global_min_max,
+    compute_robust_min_max,
+    normalize_clip_selected_dims,
     normalize_selected_dims,
+    validate_robust_margin,
 )
 from evaluate.evaluate_baseline import evaluate
 from models.conditional_unet1d import ConditionalUnet1D
@@ -166,6 +169,10 @@ class Args:
     """the number of parallel environments to evaluate the agent on"""
     action_norm_path: Optional[str] = None
     """Optional action normalization stats. If omitted, stats are computed from the train split and saved beside it."""
+    action_robust_margin: float = 0.0
+    """If >0, compute action stats with robust percentile margin and clip actions before normalization. 0.01 means 1%/99%."""
+    margin_robust: Optional[float] = None
+    """Alias for action_robust_margin."""
     sim_backend: str = "physx_cpu"
     """the simulation backend to use for evaluation environments. can be "cpu" or "gpu"""
     num_dataload_workers: int = 0
@@ -201,10 +208,15 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         num_traj,
         action_dim,
         action_norm_path=None,
+        action_robust_margin=0.0,
     ):
         self.action_dim = int(action_dim)
         if self.action_dim not in (6, 7):
             raise ValueError(f"action_dim must be 6 or 7, got {self.action_dim}")
+        self.action_robust_margin = validate_robust_margin(
+            action_robust_margin,
+            name="action_robust_margin",
+        )
         self.include_rgb = include_rgb
         self.include_depth = include_depth
         self.action_min = None
@@ -244,11 +256,27 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             self.action_norm_path = action_norm_path
             print(f"[action_norm] using provided stats: {action_norm_path}")
         else:
-            action_min, action_max = compute_global_min_max(raw_actions)
+            if self.action_robust_margin > 0.0:
+                action_min, action_max = compute_robust_min_max(
+                    raw_actions,
+                    margin=self.action_robust_margin,
+                )
+                action_norm_method = "robust_min_max_clip"
+            else:
+                action_min, action_max = compute_global_min_max(raw_actions)
+                action_norm_method = "min_max"
             self.action_norm_path = os.path.splitext(data_path)[0] + ".action_norm.json"
-            save_action_norm_stats(self.action_norm_path, action_min, action_max)
+            save_action_norm_stats(
+                self.action_norm_path,
+                action_min,
+                action_max,
+                normalization_method=action_norm_method,
+                action_robust_margin=self.action_robust_margin,
+                actions_clipped_to_norm_range=self.action_robust_margin > 0.0,
+            )
             print(
-                f"[action_norm] computed stats from dataset and saved to {self.action_norm_path}"
+                f"[action_norm] computed {action_norm_method} stats from dataset "
+                f"and saved to {self.action_norm_path}"
             )
         self.action_min = np.asarray(action_min, dtype=np.float32)
         self.action_max = np.asarray(action_max, dtype=np.float32)
@@ -259,10 +287,19 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             )
         print(f"[action_norm] min={self.action_min}")
         print(f"[action_norm] max={self.action_max}")
+        print(
+            f"[action_norm] robust_margin={self.action_robust_margin:g}, "
+            f"clip_before_normalize={self.action_robust_margin > 0.0}"
+        )
 
         # Pre-process the actions into normalized space for training.
+        normalizer = (
+            normalize_clip_selected_dims
+            if self.action_robust_margin > 0.0
+            else normalize_selected_dims
+        )
         for i, action in enumerate(raw_actions):
-            normalized_action = normalize_selected_dims(
+            normalized_action = normalizer(
                 action,
                 mins=self.action_min,
                 maxs=self.action_max,
@@ -557,6 +594,12 @@ def save_ckpt(run_name, tag):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    if args.margin_robust is not None:
+        args.action_robust_margin = args.margin_robust
+    args.action_robust_margin = validate_robust_margin(
+        args.action_robust_margin,
+        name="action_robust_margin",
+    )
     ensure_raw_train_eval_split(args)
     args.action_dim = resolve_action_dim(
         args.action_dim,
@@ -671,6 +714,7 @@ if __name__ == "__main__":
         num_traj=args.num_demos,
         action_dim=args.action_dim,
         action_norm_path=args.action_norm_path,
+        action_robust_margin=args.action_robust_margin,
     )
     denorm_mins = dataset.action_min
     denorm_maxs = dataset.action_max

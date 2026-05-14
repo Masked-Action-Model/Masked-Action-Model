@@ -9,7 +9,7 @@
 - 评估入口：`evaluate/evaluate_baseline.py`
 - 数据输入：原始 ManiSkill demo，或由 `--raw-demo-h5/--raw-demo-json` 自动切成 train/eval。
 - 模型：RGB/RGBD observation encoder + `DiTNoiseNet` 或 `ConditionalUnet1D`，直接预测 action chunk。
-- 关键设计：只对动作前 6 维做 min/max 归一化，第 7 维 gripper 保持原值；eval 会从 demo metadata 读取 reset seed，保证评估 episode 对齐。
+- 关键设计：只对动作前 6 维做 min/max 归一化，第 7 维 gripper 保持原值；可设 `ACTION_ROBUST_MARGIN=0.01` 改为 1%/99% robust min-max 并 clip 后归一化；eval 会从 demo metadata 读取 reset seed，保证评估 episode 对齐。
 
 ## 2. Subgoal Condition DP
 
@@ -76,6 +76,8 @@ mask 设计支持三类实验：
 
 - HDF5 轨迹 key 使用 `traj_0 ... traj_N`。
 - 预处理 HDF5 的 `meta` 里保存 `action_min/max`、`state_min/max`、`source_episode_ids`、mask 配置和归一化标记。
+- 三条 pipeline 都支持 `ACTION_ROBUST_MARGIN`，默认 `0` 保持普通 min-max；设为 `0.01` 时，action 前 6 维用 1%/99% 分位数统计 min/max，写入/训练前先 clip 到该范围再映射到 `[-1, 1]`。
+- MAM / Subgoal 支持渐变 mask：`multi_random`、`multi_points`、`multi_3D_points`、`multi_pose`。它们的 `MASK_RATIO_LIST` 用 `[start,end]` 区间；若某个 mask slot 分到 n 条 demo，则按 `np.linspace(start,end,n)` 给每条 demo 递增 retain ratio。
 - `actions` 是训练目标，`mas` 是 masked action sequence + progress，`mask` 表示哪些动作维度为已知控制点。
 - eval JSON metadata 保存 reset 信息；训练脚本会用它还原评估 seed。
 

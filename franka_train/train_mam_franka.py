@@ -33,11 +33,20 @@ class Args:
     seed: int = 1
     torch_deterministic: bool = True
     cuda: bool = True
+    track: bool = False
+    wandb_project_name: str = "ManiSkill"
+    wandb_entity: Optional[str] = None
+    capture_video: bool = False
 
     env_id: str = "FrankaReal-v1"
     demo_path: str = "franka_train/data/franka_real_random_mask_0.2_train.h5"
+    test_demo_path: Optional[str] = None
+    eval_demo_metadata_path: Optional[str] = None
+    action_norm_path: Optional[str] = None
     num_demos: Optional[int] = None
     action_dim: Optional[int] = 7
+    stpm_ckpt_path: str = ""
+    stpm_config_path: str = "STPM/config/rewind_maniskill.yaml"
 
     total_iters: int = 100_000
     batch_size: int = 256
@@ -61,7 +70,16 @@ class Args:
     loss_mask_area_weight: float = 0.2
 
     obs_mode: Literal["rgb", "rgb+depth"] = "rgb"
+    max_episode_steps: Optional[int] = None
+    sim_backend: str = "physx_cpu"
     log_freq: int = 1000
+    eval_freq: int = 0
+    num_eval_episodes: int = 0
+    num_eval_envs: int = 0
+    num_eval_demos: Optional[int] = None
+    capture_video_freq: int = 20
+    inpainting: bool = False
+    eval_progress_bar: bool = False
     save_start_iter: int = 0
     save_freq: Optional[int] = 5000
     num_dataload_workers: int = 0
@@ -140,7 +158,9 @@ def main() -> None:
     )
     dataset.debug_print_sample(0)
 
-    denorm_mins, denorm_maxs = load_action_stats_from_h5(args.demo_path)
+    denorm_mins, denorm_maxs = load_action_stats_from_h5(
+        args.action_norm_path or args.demo_path
+    )
     agent = mam_mod.Agent(env, args).to(device)
     ema_agent = mam_mod.Agent(env, args).to(device)
     agent.set_action_denormalizer(denorm_mins, denorm_maxs, device)

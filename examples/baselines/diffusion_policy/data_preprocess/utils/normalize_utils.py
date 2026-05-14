@@ -12,6 +12,13 @@ import numpy as np
 EPS = 1e-8
 
 
+def validate_robust_margin(margin: float, name: str = "robust_margin") -> float:
+    margin = float(margin)
+    if margin < 0.0 or margin >= 0.5:
+        raise ValueError(f"{name} must be in [0, 0.5), got {margin}")
+    return margin
+
+
 def compute_global_min_max(array_iterable: Iterable[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
     global_min = None
     global_max = None
@@ -30,6 +37,40 @@ def compute_global_min_max(array_iterable: Iterable[np.ndarray]) -> tuple[np.nda
     if global_min is None or global_max is None:
         raise ValueError("cannot compute min/max from empty iterable")
     return global_min.astype(np.float32), global_max.astype(np.float32)
+
+
+def compute_robust_min_max(
+    array_iterable: Iterable[np.ndarray],
+    margin: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    margin = validate_robust_margin(margin)
+    if margin <= 0.0:
+        return compute_global_min_max(array_iterable)
+
+    arrays = []
+    dim = None
+    for array in array_iterable:
+        array = np.asarray(array, dtype=np.float32)
+        if array.ndim != 2:
+            raise ValueError(
+                f"expected 2D array when computing robust min/max, got shape {array.shape}"
+            )
+        if dim is None:
+            dim = int(array.shape[1])
+        elif int(array.shape[1]) != dim:
+            raise ValueError(
+                f"inconsistent dims when computing robust min/max: {array.shape[1]} vs {dim}"
+            )
+        arrays.append(array)
+    if not arrays:
+        raise ValueError("cannot compute robust min/max from empty iterable")
+
+    stacked = np.concatenate(arrays, axis=0)
+    low = 100.0 * margin
+    high = 100.0 * (1.0 - margin)
+    mins = np.percentile(stacked, low, axis=0)
+    maxs = np.percentile(stacked, high, axis=0)
+    return mins.astype(np.float32), maxs.astype(np.float32)
 
 
 def normalize_selected_dims(
@@ -52,6 +93,30 @@ def normalize_selected_dims(
             normalized[..., dim] = 0.0
         else:
             normalized[..., dim] = 2.0 * (data[..., dim] - mins[dim]) / denom - 1.0
+    return normalized.astype(np.float32)
+
+
+def normalize_clip_selected_dims(
+    data: np.ndarray,
+    mins: np.ndarray,
+    maxs: np.ndarray,
+    dims: Sequence[int] | None = None,
+) -> np.ndarray:
+    data = np.asarray(data, dtype=np.float32)
+    mins = np.asarray(mins, dtype=np.float32)
+    maxs = np.asarray(maxs, dtype=np.float32)
+    if mins.shape != maxs.shape or mins.ndim != 1:
+        raise ValueError(f"mins/maxs must be 1D and shape-matched, got {mins.shape} and {maxs.shape}")
+
+    normalized = data.copy()
+    dims = list(range(mins.shape[0])) if dims is None else [int(dim) for dim in dims]
+    for dim in dims:
+        denom = float(maxs[dim] - mins[dim])
+        clipped = np.clip(data[..., dim], mins[dim], maxs[dim])
+        if abs(denom) < EPS:
+            normalized[..., dim] = 0.0
+        else:
+            normalized[..., dim] = 2.0 * (clipped - mins[dim]) / denom - 1.0
     return normalized.astype(np.float32)
 
 

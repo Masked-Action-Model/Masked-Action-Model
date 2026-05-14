@@ -13,7 +13,7 @@ export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-maniskill}"
 # 1. Experiment
 # -----------------------------------------------------------------------------
 
-EXP_NAME="${EXP_NAME:-benchmark-baseline-transformer-rgb-split}"
+EXP_NAME="${EXP_NAME:-placesphere_baseline_5demo}"
 SEED="${SEED:-1}"
 TORCH_DETERMINISTIC="${TORCH_DETERMINISTIC:-true}"
 CUDA="${CUDA:-true}"
@@ -26,7 +26,7 @@ CAPTURE_VIDEO="${CAPTURE_VIDEO:-false}"
 # 2. Raw dataset and split
 # -----------------------------------------------------------------------------
 
-RAW_DEMO_H5="${RAW_DEMO_H5:-demos/exp_4/PickCube-v1/motionplanning/experiment_4.rgb.pd_ee_pose.physx_cpu.h5}"
+RAW_DEMO_H5="${RAW_DEMO_H5:-demos/PlaceSphere-v1/PlaceSphere-v1.rgb.pd_ee_pose.physx_cpu.h5}"
 RAW_DEMO_JSON="${RAW_DEMO_JSON:-${RAW_DEMO_H5%.h5}.json}"
 SPLIT_OUTPUT_ROOT="${SPLIT_OUTPUT_ROOT:-demos/baseline_splits}"
 SPLIT_OUTPUT_PREFIX="${SPLIT_OUTPUT_PREFIX:-$(basename "${RAW_DEMO_H5%.h5}")}"
@@ -34,16 +34,20 @@ SPLIT_SEED="${SPLIT_SEED:-0}"
 SPLIT_OUTPUT_DIR="${SPLIT_OUTPUT_DIR:-${SPLIT_OUTPUT_ROOT}/${SPLIT_OUTPUT_PREFIX}_s${SPLIT_SEED}}"
 SPLIT_NUM_TRAJ="${SPLIT_NUM_TRAJ:-}"
 OVERWRITE_SPLIT="${OVERWRITE_SPLIT:-false}"
+USE_PREPARED_SPLIT="${USE_PREPARED_SPLIT:-true}"
+DEMO_PATH="${DEMO_PATH:-demos/PlaceSphere-v1/PlaceSphere-v1.rgb.pd_ee_pose.physx_cpu.h5}"
+EVAL_DEMO_PATH="${EVAL_DEMO_PATH:-demos/PlaceSphere-v1/PlaceSphere-v1.rgb.pd_ee_pose.physx_cpu.h5}"
+EVAL_DEMO_METADATA_PATH="${EVAL_DEMO_METADATA_PATH:-}"
 
 # -----------------------------------------------------------------------------
 # 3. Environment
 # -----------------------------------------------------------------------------
 
-ENV_ID="${ENV_ID:-PickCube-v1}"
-ACTION_DIM="${ACTION_DIM:-${action_dim:-auto}}" # auto infers from RAW_DEMO_H5; 7=有夹爪，6=无夹爪/panda_stick
+ENV_ID="${ENV_ID:-PlaceSphere-v1}"
+ACTION_DIM="${ACTION_DIM:-${action_dim:-7}}" # auto infers from RAW_DEMO_H5; 7=有夹爪，6=无夹爪/panda_stick
 CONTROL_MODE="${CONTROL_MODE:-pd_ee_pose}"
 OBS_MODE="${OBS_MODE:-rgb}"
-MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-100}"
+MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-150}"
 SIM_BACKEND="${SIM_BACKEND:-physx_cpu}"
 
 # -----------------------------------------------------------------------------
@@ -62,8 +66,8 @@ N_GROUPS="${N_GROUPS:-8}"
 # 5. Training
 # -----------------------------------------------------------------------------
 
-NUM_DEMOS="${NUM_DEMOS:-100}"
-TOTAL_ITERS="${TOTAL_ITERS:-100000}"
+NUM_DEMOS="${NUM_DEMOS:-5}"
+TOTAL_ITERS="${TOTAL_ITERS:-20000}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 LR="${LR:-1e-4}"
 OBS_HORIZON="${OBS_HORIZON:-2}"
@@ -71,6 +75,7 @@ ACT_HORIZON="${ACT_HORIZON:-8}"
 PRED_HORIZON="${PRED_HORIZON:-16}"
 NUM_DATALOAD_WORKERS="${NUM_DATALOAD_WORKERS:-0}"
 ACTION_NORM_PATH="${ACTION_NORM_PATH:-}"
+ACTION_ROBUST_MARGIN="${ACTION_ROBUST_MARGIN:-${MARGIN_ROBUST:-0}}"
 DEMO_TYPE="${DEMO_TYPE:-baseline_${NOISE_MODEL}}"
 
 # -----------------------------------------------------------------------------
@@ -78,23 +83,38 @@ DEMO_TYPE="${DEMO_TYPE:-baseline_${NOISE_MODEL}}"
 # -----------------------------------------------------------------------------
 
 LOG_FREQ="${LOG_FREQ:-1000}"
-EVAL_FREQ="${EVAL_FREQ:-5000}"
-SAVE_FREQ="${SAVE_FREQ:-50000}"
-NUM_EVAL_DEMOS="${NUM_EVAL_DEMOS:-100}"
+EVAL_FREQ="${EVAL_FREQ:-2000}"
+SAVE_FREQ="${SAVE_FREQ:-20000}"
+NUM_EVAL_DEMOS="${NUM_EVAL_DEMOS:-5}"
 NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-${NUM_EVAL_DEMOS}}"
-NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-10}"
+NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-1}"
 
 # -----------------------------------------------------------------------------
 # 7. Validate required inputs
 # -----------------------------------------------------------------------------
 
-if [[ ! -f "$RAW_DEMO_H5" ]]; then
-  echo "ERROR: raw demo h5 not found: $RAW_DEMO_H5" >&2
-  exit 1
-fi
-if [[ ! -f "$RAW_DEMO_JSON" ]]; then
-  echo "ERROR: raw demo json not found: $RAW_DEMO_JSON" >&2
-  exit 1
+if [[ "$USE_PREPARED_SPLIT" == "true" ]]; then
+  if [[ ! -f "$DEMO_PATH" ]]; then
+    echo "ERROR: prepared train demo h5 not found: $DEMO_PATH" >&2
+    exit 1
+  fi
+  if [[ ! -f "$EVAL_DEMO_PATH" ]]; then
+    echo "ERROR: prepared eval demo h5 not found: $EVAL_DEMO_PATH" >&2
+    exit 1
+  fi
+  if [[ -n "$EVAL_DEMO_METADATA_PATH" && ! -f "$EVAL_DEMO_METADATA_PATH" ]]; then
+    echo "ERROR: prepared eval demo json not found: $EVAL_DEMO_METADATA_PATH" >&2
+    exit 1
+  fi
+else
+  if [[ ! -f "$RAW_DEMO_H5" ]]; then
+    echo "ERROR: raw demo h5 not found: $RAW_DEMO_H5" >&2
+    exit 1
+  fi
+  if [[ ! -f "$RAW_DEMO_JSON" ]]; then
+    echo "ERROR: raw demo json not found: $RAW_DEMO_JSON" >&2
+    exit 1
+  fi
 fi
 case "$NOISE_MODEL" in
   Transformer|Unet) ;;
@@ -104,15 +124,19 @@ case "$NOISE_MODEL" in
     ;;
 esac
 if [[ "$ACTION_DIM" == "auto" ]]; then
+  ACTION_DIM_SOURCE="$RAW_DEMO_H5"
+  if [[ "$USE_PREPARED_SPLIT" == "true" ]]; then
+    ACTION_DIM_SOURCE="$DEMO_PATH"
+  fi
   ACTION_DIM="$(
-    python - "$RAW_DEMO_H5" <<'PY'
+    python - "$ACTION_DIM_SOURCE" <<'PY'
 import sys
 from examples.baselines.diffusion_policy.utils.split_eval_utils import infer_h5_action_dim
 
 print(infer_h5_action_dim(sys.argv[1]))
 PY
   )"
-  echo "[action-dim] inferred ACTION_DIM=${ACTION_DIM} from ${RAW_DEMO_H5}"
+  echo "[action-dim] inferred ACTION_DIM=${ACTION_DIM} from ${ACTION_DIM_SOURCE}"
 fi
 case "$ACTION_DIM" in
   6|7) ;;
@@ -131,11 +155,6 @@ ARGS=(
   --wandb-project-name "$WANDB_PROJECT_NAME"
   --env-id "$ENV_ID"
   --action-dim "$ACTION_DIM"
-  --raw-demo-h5 "$RAW_DEMO_H5"
-  --raw-demo-json "$RAW_DEMO_JSON"
-  --split-output-dir "$SPLIT_OUTPUT_DIR"
-  --split-output-prefix "$SPLIT_OUTPUT_PREFIX"
-  --split-seed "$SPLIT_SEED"
   --noise-model "$NOISE_MODEL"
   --total-iters "$TOTAL_ITERS"
   --batch-size "$BATCH_SIZE"
@@ -155,9 +174,28 @@ ARGS=(
   --num-eval-episodes "$NUM_EVAL_EPISODES"
   --num-eval-envs "$NUM_EVAL_ENVS"
   --num-dataload-workers "$NUM_DATALOAD_WORKERS"
+  --action-robust-margin "$ACTION_ROBUST_MARGIN"
   --control-mode "$CONTROL_MODE"
   --sim-backend "$SIM_BACKEND"
 )
+
+if [[ "$USE_PREPARED_SPLIT" == "true" ]]; then
+  ARGS+=(
+    --demo-path "$DEMO_PATH"
+    --eval-demo-path "$EVAL_DEMO_PATH"
+  )
+  if [[ -n "$EVAL_DEMO_METADATA_PATH" ]]; then
+    ARGS+=(--eval-demo-metadata-path "$EVAL_DEMO_METADATA_PATH")
+  fi
+else
+  ARGS+=(
+    --raw-demo-h5 "$RAW_DEMO_H5"
+    --raw-demo-json "$RAW_DEMO_JSON"
+    --split-output-dir "$SPLIT_OUTPUT_DIR"
+    --split-output-prefix "$SPLIT_OUTPUT_PREFIX"
+    --split-seed "$SPLIT_SEED"
+  )
+fi
 
 if [[ -n "$EXP_NAME" ]]; then
   ARGS+=(--exp-name "$EXP_NAME")

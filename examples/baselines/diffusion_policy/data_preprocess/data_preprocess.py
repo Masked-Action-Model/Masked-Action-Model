@@ -23,13 +23,20 @@ try:
     )
     from examples.baselines.diffusion_policy.data_preprocess.utils.mask_utils import (
         MASK_TYPES_REQUIRING_RATIO,
+        MASK_TYPES_REQUIRING_RATIO_RANGE,
         MASK_TYPES_REQUIRING_SEQ_LEN,
         apply_mask_to_actions,
+        is_multi_ratio_mask_type,
+        parse_retain_ratio_range,
+        resolve_base_mask_type,
         validate_mask_config,
     )
     from examples.baselines.diffusion_policy.data_preprocess.utils.normalize_utils import (
         compute_global_min_max,
+        compute_robust_min_max,
+        normalize_clip_selected_dims,
         normalize_selected_dims,
+        validate_robust_margin,
     )
     from examples.baselines.diffusion_policy.data_preprocess.utils.obs_utils import (
         build_default_state_obs_extractor,
@@ -53,13 +60,20 @@ except ModuleNotFoundError:
     )
     from data_preprocess.utils.mask_utils import (
         MASK_TYPES_REQUIRING_RATIO,
+        MASK_TYPES_REQUIRING_RATIO_RANGE,
         MASK_TYPES_REQUIRING_SEQ_LEN,
         apply_mask_to_actions,
+        is_multi_ratio_mask_type,
+        parse_retain_ratio_range,
+        resolve_base_mask_type,
         validate_mask_config,
     )
     from data_preprocess.utils.normalize_utils import (
         compute_global_min_max,
+        compute_robust_min_max,
+        normalize_clip_selected_dims,
         normalize_selected_dims,
+        validate_robust_margin,
     )
     from data_preprocess.utils.obs_utils import (
         build_default_state_obs_extractor,
@@ -134,6 +148,12 @@ def parse_args() -> argparse.Namespace:
         help="points / 3D_points / pose_motion_planning / random_mask 等类型使用的保留比例",
     )
     parser.add_argument(
+        "--retain-ratio-range",
+        type=str,
+        default=None,
+        help="multi_* mask 使用的 retain_ratio 线性范围，例如 '[0.2,0.4]'",
+    )
+    parser.add_argument(
         "--mask-seq-len",
         type=int,
         default=20,
@@ -144,6 +164,14 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="mask 后填充值",
+    )
+    parser.add_argument(
+        "--action-robust-margin",
+        "--margin-robust",
+        dest="action_robust_margin",
+        type=float,
+        default=0.0,
+        help="action robust min-max 百分比边距；0.01 表示用 1%%/99%% 分位数并 clip 后归一化，0 表示普通 min-max",
     )
     parser.add_argument(
         "--num-traj",
@@ -182,12 +210,22 @@ def format_float_suffix(value: float) -> str:
     return format(float(value), "g")
 
 
+def format_ratio_range_suffix(retain_ratio_range: tuple[float, float] | list[float]) -> str:
+    start, end = float(retain_ratio_range[0]), float(retain_ratio_range[1])
+    return f"{format_float_suffix(start)}to{format_float_suffix(end)}"
+
+
 def build_output_stem(
     output_prefix: str,
     mask_type: str,
     retain_ratio: float | None,
     mask_seq_len: int | None,
+    retain_ratio_range: tuple[float, float] | list[float] | None = None,
 ) -> str:
+    if mask_type in MASK_TYPES_REQUIRING_RATIO_RANGE:
+        if retain_ratio_range is None:
+            raise ValueError(f"mask_type={mask_type!r} requires retain_ratio_range")
+        return f"{output_prefix}_{mask_type}_{format_ratio_range_suffix(retain_ratio_range)}"
     if mask_type in MASK_TYPES_REQUIRING_RATIO:
         return f"{output_prefix}_{mask_type}_{format_float_suffix(retain_ratio)}"
     if mask_type in MASK_TYPES_REQUIRING_SEQ_LEN:
@@ -263,6 +301,90 @@ def iter_selected_state_arrays(
         yield load_state_matrix_from_obs_group(h5_file[traj_key]["obs"])
 
 
+def action_normalization_method(action_robust_margin: float) -> str:
+    action_robust_margin = validate_robust_margin(
+        action_robust_margin,
+        name="action_robust_margin",
+    )
+    return "robust_min_max_clip" if action_robust_margin > 0.0 else "min_max"
+
+
+def compute_action_min_max(
+    h5_file: h5py.File,
+    traj_keys: Iterable[str],
+    action_dim: int,
+    action_robust_margin: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    action_robust_margin = validate_robust_margin(
+        action_robust_margin,
+        name="action_robust_margin",
+    )
+    arrays = iter_selected_action_arrays(h5_file, traj_keys, action_dim=action_dim)
+    if action_robust_margin > 0.0:
+        return compute_robust_min_max(arrays, margin=action_robust_margin)
+    return compute_global_min_max(arrays)
+
+
+def normalize_actions_array(
+    actions: np.ndarray,
+    action_min: np.ndarray,
+    action_max: np.ndarray,
+    normalized_action_dims: Iterable[int],
+    action_robust_margin: float,
+) -> np.ndarray:
+    action_robust_margin = validate_robust_margin(
+        action_robust_margin,
+        name="action_robust_margin",
+    )
+    normalizer = normalize_clip_selected_dims if action_robust_margin > 0.0 else normalize_selected_dims
+    return normalizer(
+        actions,
+        mins=action_min,
+        maxs=action_max,
+        dims=normalized_action_dims,
+    )
+
+
+def write_action_normalization_meta(
+    meta_group: h5py.Group,
+    action_robust_margin: float,
+) -> None:
+    action_robust_margin = validate_robust_margin(
+        action_robust_margin,
+        name="action_robust_margin",
+    )
+    meta_group.create_dataset(
+        "action_robust_margin",
+        data=np.float32(action_robust_margin),
+    )
+    meta_group.create_dataset(
+        "actions_clipped_to_norm_range",
+        data=np.bool_(action_robust_margin > 0.0),
+    )
+    write_string_dataset(
+        meta_group,
+        "action_normalization_method",
+        action_normalization_method(action_robust_margin),
+    )
+
+
+def linear_retain_ratios(
+    count: int,
+    retain_ratio: float | None,
+    retain_ratio_range: tuple[float, float] | list[float] | None,
+) -> list[float | None]:
+    if count < 0:
+        raise ValueError(f"count must be non-negative, got {count}")
+    if retain_ratio_range is None:
+        return [None if retain_ratio is None else float(retain_ratio) for _ in range(count)]
+    start, end = float(retain_ratio_range[0]), float(retain_ratio_range[1])
+    if count == 0:
+        return []
+    if count == 1:
+        return [start]
+    return [float(v) for v in np.linspace(start, end, count, dtype=np.float32).tolist()]
+
+
 def validate_dataset_alignment(h5_file: h5py.File, metadata: dict, traj_keys: list[str]) -> None:
     episodes = metadata.get("episodes", [])
     all_traj_keys = list_traj_keys(h5_file)
@@ -308,12 +430,18 @@ def build_split_metadata_json(
     env_id: str,
     mask_type: str,
     retain_ratio: float | None,
+    retain_ratio_range: tuple[float, float] | list[float] | None,
     mask_seq_len: int | None,
     split_seed: int,
     mask_seed: int,
     action_dim: int,
+    action_robust_margin: float,
 ) -> dict:
     action_dim = validate_action_dim(action_dim)
+    action_robust_margin = validate_robust_margin(
+        action_robust_margin,
+        name="action_robust_margin",
+    )
     mas_step_dim = mas_step_dim_for_action_dim(action_dim)
     output_metadata = {
         "env_info": copy.deepcopy(source_metadata.get("env_info", {})),
@@ -326,15 +454,30 @@ def build_split_metadata_json(
             "source_json": str(input_json),
             "source_episode_ids": [int(x) for x in source_episode_ids],
             "mask_type": mask_type,
+            "base_mask_type": resolve_base_mask_type(mask_type),
+            "multi_ratio_enabled": bool(is_multi_ratio_mask_type(mask_type)),
             "retain_ratio": retain_ratio,
+            "retain_ratio_range": (
+                [float(retain_ratio_range[0]), float(retain_ratio_range[1])]
+                if retain_ratio_range is not None
+                else None
+            ),
             "mask_seq_len": mask_seq_len,
             "split_seed": int(split_seed),
             "mask_seed": int(mask_seed),
             "mas_action_dim": action_dim,
             "mas_dim": mas_step_dim,
+            "action_normalization_method": action_normalization_method(action_robust_margin),
+            "action_robust_margin": float(action_robust_margin),
+            "actions_clipped_to_norm_range": bool(action_robust_margin > 0.0),
         },
     }
     episodes = source_metadata.get("episodes", [])
+    per_episode_retain_ratios = linear_retain_ratios(
+        len(source_episode_ids),
+        retain_ratio=retain_ratio,
+        retain_ratio_range=retain_ratio_range,
+    )
     for local_episode_id, source_episode_id in enumerate(source_episode_ids):
         if source_episode_id >= len(episodes):
             raise IndexError(
@@ -343,6 +486,8 @@ def build_split_metadata_json(
         episode = copy.deepcopy(episodes[source_episode_id])
         episode["episode_id"] = int(local_episode_id)
         episode["source_episode_id"] = int(source_episode_id)
+        if per_episode_retain_ratios[local_episode_id] is not None:
+            episode["retain_ratio"] = float(per_episode_retain_ratios[local_episode_id])
         output_metadata["episodes"].append(episode)
     return output_metadata
 
@@ -359,6 +504,7 @@ def write_split_h5(
     env_id: str,
     mask_type: str,
     retain_ratio: float | None,
+    retain_ratio_range: tuple[float, float] | list[float] | None,
     mask_seq_len: int | None,
     mask_value: float,
     split_seed: int,
@@ -366,11 +512,22 @@ def write_split_h5(
     input_json: Path,
     action_dim: int,
     state_schema: list[dict],
+    action_robust_margin: float,
 ) -> None:
     action_dim = validate_action_dim(action_dim)
+    action_robust_margin = validate_robust_margin(
+        action_robust_margin,
+        name="action_robust_margin",
+    )
     mas_step_dim = mas_step_dim_for_action_dim(action_dim)
     normalized_action_dims = np.arange(min(6, action_dim), dtype=np.int32)
     ensure_parent_dir(output_h5)
+    base_mask_type = resolve_base_mask_type(mask_type)
+    per_episode_retain_ratios = linear_retain_ratios(
+        len(source_episode_ids),
+        retain_ratio=retain_ratio,
+        retain_ratio_range=retain_ratio_range,
+    )
     with h5py.File(input_h5, "r") as src_file, h5py.File(output_h5, "w") as dst_file:
         meta = dst_file.create_group("meta")
         meta.create_dataset("action_min", data=np.asarray(action_min, dtype=np.float32))
@@ -391,6 +548,7 @@ def write_split_h5(
         meta.create_dataset("actions_normalized", data=np.bool_(True))
         meta.create_dataset("states_normalized", data=np.bool_(True))
         meta.create_dataset("mas_has_progress", data=np.bool_(True))
+        write_action_normalization_meta(meta, action_robust_margin)
         meta.create_dataset("state_path", data=np.asarray("obs/state", dtype=h5py.string_dtype("utf-8")))
         write_string_dataset(meta, "state_paths", state_schema_paths(state_schema))
         write_string_dataset(meta, "state_schema_json", json.dumps(state_schema, sort_keys=True))
@@ -402,10 +560,17 @@ def write_split_h5(
         write_string_dataset(meta, "split", split_name)
         write_string_dataset(meta, "env_id", env_id)
         write_string_dataset(meta, "mask_type", mask_type)
+        write_string_dataset(meta, "base_mask_type", base_mask_type)
         write_string_dataset(meta, "source_h5", str(input_h5))
         write_string_dataset(meta, "source_json", str(input_json))
+        meta.create_dataset("multi_ratio_enabled", data=np.bool_(retain_ratio_range is not None))
         if retain_ratio is not None:
             meta.create_dataset("retain_ratio", data=np.float32(retain_ratio))
+        if retain_ratio_range is not None:
+            meta.create_dataset(
+                "retain_ratio_range",
+                data=np.asarray(retain_ratio_range, dtype=np.float32),
+            )
         if mask_seq_len is not None:
             meta.create_dataset("mask_seq_len", data=np.int32(mask_seq_len))
 
@@ -418,11 +583,12 @@ def write_split_h5(
                 raise ValueError(
                     f"traj_{source_episode_id}/actions must have shape (T, {action_dim}), got {actions.shape}"
                 )
-            normalized_actions = normalize_selected_dims(
+            normalized_actions = normalize_actions_array(
                 actions,
-                mins=action_min,
-                maxs=action_max,
-                dims=range(len(normalized_action_dims)),
+                action_min=action_min,
+                action_max=action_max,
+                normalized_action_dims=range(len(normalized_action_dims)),
+                action_robust_margin=action_robust_margin,
             )
             state = load_state_matrix_from_obs_group(src_traj["obs"])
             normalized_state = normalize_selected_dims(
@@ -438,11 +604,12 @@ def write_split_h5(
                 )
 
             traj_rng = np.random.default_rng(mask_seed + int(source_episode_id))
+            effective_retain_ratio = per_episode_retain_ratios[local_episode_id]
             masked_actions, keep_mask = apply_mask_to_actions(
                 normalized_actions,
-                mask_type=mask_type,
+                mask_type=base_mask_type,
                 rng=traj_rng,
-                retain_ratio=retain_ratio,
+                retain_ratio=effective_retain_ratio,
                 mask_seq_len=mask_seq_len,
                 masked_value=mask_value,
                 action_dim=action_dim,
@@ -467,6 +634,11 @@ def write_split_h5(
             dst_traj.create_dataset("actions", data=normalized_actions)
             dst_traj.create_dataset("mas", data=mas)
             dst_traj.create_dataset("mask", data=keep_mask)
+            if effective_retain_ratio is not None:
+                dst_traj.create_dataset(
+                    "retain_ratio",
+                    data=np.float32(effective_retain_ratio),
+                )
             dst_traj.create_dataset(
                 "source_episode_id",
                 data=np.int32(source_episode_id),
@@ -476,10 +648,24 @@ def write_split_h5(
 def main() -> None:
     args = parse_args()
     args.action_dim = validate_action_dim(args.action_dim)
+    args.action_robust_margin = validate_robust_margin(
+        args.action_robust_margin,
+        name="action_robust_margin",
+    )
     validate_mask_config(
         mask_type=args.mask_type,
         retain_ratio=args.retain_ratio if args.mask_type in MASK_TYPES_REQUIRING_RATIO else None,
+        retain_ratio_range=(
+            parse_retain_ratio_range(args.retain_ratio_range, args.mask_type)
+            if args.mask_type in MASK_TYPES_REQUIRING_RATIO_RANGE
+            else None
+        ),
         mask_seq_len=args.mask_seq_len if args.mask_type in MASK_TYPES_REQUIRING_SEQ_LEN else None,
+    )
+    retain_ratio_range = (
+        parse_retain_ratio_range(args.retain_ratio_range, args.mask_type)
+        if args.mask_type in MASK_TYPES_REQUIRING_RATIO_RANGE
+        else None
     )
 
     input_h5 = args.input_h5.resolve()
@@ -505,6 +691,7 @@ def main() -> None:
         output_prefix=output_prefix,
         mask_type=args.mask_type,
         retain_ratio=args.retain_ratio if args.mask_type in MASK_TYPES_REQUIRING_RATIO else None,
+        retain_ratio_range=retain_ratio_range,
         mask_seq_len=args.mask_seq_len if args.mask_type in MASK_TYPES_REQUIRING_SEQ_LEN else None,
     )
 
@@ -513,8 +700,11 @@ def main() -> None:
         metadata = read_json(input_json)
         validate_dataset_alignment(src_file, metadata, traj_keys)
         source_episode_ids = [int(traj_key.split("_")[-1]) for traj_key in traj_keys]
-        action_min, action_max = compute_global_min_max(
-            iter_selected_action_arrays(src_file, traj_keys, action_dim=args.action_dim)
+        action_min, action_max = compute_action_min_max(
+            src_file,
+            traj_keys,
+            action_dim=args.action_dim,
+            action_robust_margin=args.action_robust_margin,
         )
         state_min, state_max = compute_global_min_max(
             iter_selected_state_arrays(src_file, traj_keys)
@@ -555,6 +745,7 @@ def main() -> None:
         env_id=args.env_id,
         mask_type=args.mask_type,
         retain_ratio=args.retain_ratio if args.mask_type in MASK_TYPES_REQUIRING_RATIO else None,
+        retain_ratio_range=retain_ratio_range,
         mask_seq_len=args.mask_seq_len if args.mask_type in MASK_TYPES_REQUIRING_SEQ_LEN else None,
         mask_value=args.mask_value,
         split_seed=args.split_seed,
@@ -562,6 +753,7 @@ def main() -> None:
         input_json=input_json,
         action_dim=args.action_dim,
         state_schema=state_schema,
+        action_robust_margin=args.action_robust_margin,
     )
     write_json(
         train_json,
@@ -574,10 +766,12 @@ def main() -> None:
             env_id=args.env_id,
             mask_type=args.mask_type,
             retain_ratio=args.retain_ratio if args.mask_type in MASK_TYPES_REQUIRING_RATIO else None,
+            retain_ratio_range=retain_ratio_range,
             mask_seq_len=args.mask_seq_len if args.mask_type in MASK_TYPES_REQUIRING_SEQ_LEN else None,
             split_seed=args.split_seed,
             mask_seed=args.mask_seed,
             action_dim=args.action_dim,
+            action_robust_margin=args.action_robust_margin,
         ),
     )
 
@@ -594,6 +788,7 @@ def main() -> None:
             env_id=args.env_id,
             mask_type=args.mask_type,
             retain_ratio=args.retain_ratio if args.mask_type in MASK_TYPES_REQUIRING_RATIO else None,
+            retain_ratio_range=retain_ratio_range,
             mask_seq_len=args.mask_seq_len if args.mask_type in MASK_TYPES_REQUIRING_SEQ_LEN else None,
             mask_value=args.mask_value,
             split_seed=args.split_seed,
@@ -601,6 +796,7 @@ def main() -> None:
             input_json=input_json,
             action_dim=args.action_dim,
             state_schema=state_schema,
+            action_robust_margin=args.action_robust_margin,
         )
         write_json(
             eval_json,
@@ -613,10 +809,12 @@ def main() -> None:
                 env_id=args.env_id,
                 mask_type=args.mask_type,
                 retain_ratio=args.retain_ratio if args.mask_type in MASK_TYPES_REQUIRING_RATIO else None,
+                retain_ratio_range=retain_ratio_range,
                 mask_seq_len=args.mask_seq_len if args.mask_type in MASK_TYPES_REQUIRING_SEQ_LEN else None,
                 split_seed=args.split_seed,
                 mask_seed=args.mask_seed,
                 action_dim=args.action_dim,
+                action_robust_margin=args.action_robust_margin,
             ),
         )
 
@@ -628,7 +826,9 @@ def main() -> None:
     print(
         "[data_preprocess] stats: "
         f"action_dim={args.action_dim}, state_dim={state_min.shape[0]}, "
-        f"mas_dim={mas_step_dim_for_action_dim(args.action_dim)}"
+        f"mas_dim={mas_step_dim_for_action_dim(args.action_dim)}, "
+        f"action_norm={action_normalization_method(args.action_robust_margin)}, "
+        f"action_robust_margin={args.action_robust_margin:g}"
     )
 
 

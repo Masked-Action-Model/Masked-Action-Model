@@ -240,13 +240,23 @@ def load_action_denorm_stats(action_norm_path: str):
     return mins, maxs
 
 
-def save_action_norm_stats(action_norm_path: str, mins: np.ndarray, maxs: np.ndarray):
+def save_action_norm_stats(
+    action_norm_path: str,
+    mins: np.ndarray,
+    maxs: np.ndarray,
+    normalization_method: str = "min_max",
+    action_robust_margin: float = 0.0,
+    actions_clipped_to_norm_range: bool = False,
+):
     os.makedirs(os.path.dirname(action_norm_path), exist_ok=True)
     with open(action_norm_path, "w", encoding="utf-8") as f:
         json.dump(
             {
                 "min": np.asarray(mins, dtype=np.float32).tolist(),
                 "max": np.asarray(maxs, dtype=np.float32).tolist(),
+                "normalization_method": str(normalization_method),
+                "action_robust_margin": float(action_robust_margin),
+                "actions_clipped_to_norm_range": bool(actions_clipped_to_norm_range),
             },
             f,
             indent=2,

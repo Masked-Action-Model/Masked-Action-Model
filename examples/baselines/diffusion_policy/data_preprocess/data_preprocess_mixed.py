@@ -17,15 +17,20 @@ if __package__ in (None, ""):
 
 try:
     from examples.baselines.diffusion_policy.data_preprocess.data_preprocess import (
+        action_normalization_method,
+        compute_action_min_max,
         default_output_dir,
+        format_ratio_range_suffix,
         build_state_schema_from_obs_group,
-        iter_selected_action_arrays,
         iter_selected_state_arrays,
+        linear_retain_ratios,
         load_state_matrix_from_obs_group,
+        normalize_actions_array,
         state_schema_paths,
         split_source_episode_ids,
         validate_dataset_alignment,
         validate_inputs,
+        write_action_normalization_meta,
     )
     from examples.baselines.diffusion_policy.data_preprocess.utils.io_utils import (
         ensure_parent_dir,
@@ -36,14 +41,17 @@ try:
     )
     from examples.baselines.diffusion_policy.data_preprocess.utils.mask_utils import (
         MASK_TYPES_REQUIRING_RATIO,
+        MASK_TYPES_REQUIRING_RATIO_RANGE,
         MASK_TYPES_REQUIRING_SEQ_LEN,
         apply_mask_to_actions,
         build_mask_spec,
+        resolve_base_mask_type,
         validate_mixed_mask_config,
     )
     from examples.baselines.diffusion_policy.data_preprocess.utils.normalize_utils import (
         compute_global_min_max,
         normalize_selected_dims,
+        validate_robust_margin,
     )
     from examples.baselines.diffusion_policy.data_preprocess.utils.progress_utils import (
         MAS_ACTION_DIM,
@@ -54,15 +62,20 @@ try:
     )
 except ModuleNotFoundError:
     from data_preprocess.data_preprocess import (
+        action_normalization_method,
+        compute_action_min_max,
         default_output_dir,
+        format_ratio_range_suffix,
         build_state_schema_from_obs_group,
-        iter_selected_action_arrays,
         iter_selected_state_arrays,
+        linear_retain_ratios,
         load_state_matrix_from_obs_group,
+        normalize_actions_array,
         state_schema_paths,
         split_source_episode_ids,
         validate_dataset_alignment,
         validate_inputs,
+        write_action_normalization_meta,
     )
     from data_preprocess.utils.io_utils import (
         ensure_parent_dir,
@@ -73,14 +86,17 @@ except ModuleNotFoundError:
     )
     from data_preprocess.utils.mask_utils import (
         MASK_TYPES_REQUIRING_RATIO,
+        MASK_TYPES_REQUIRING_RATIO_RANGE,
         MASK_TYPES_REQUIRING_SEQ_LEN,
         apply_mask_to_actions,
         build_mask_spec,
+        resolve_base_mask_type,
         validate_mixed_mask_config,
     )
     from data_preprocess.utils.normalize_utils import (
         compute_global_min_max,
         normalize_selected_dims,
+        validate_robust_margin,
     )
     from data_preprocess.utils.progress_utils import (
         MAS_ACTION_DIM,
@@ -227,6 +243,14 @@ def parse_args() -> argparse.Namespace:
         help="mask 后填充值",
     )
     parser.add_argument(
+        "--action-robust-margin",
+        "--margin-robust",
+        dest="action_robust_margin",
+        type=float,
+        default=0.0,
+        help="action robust min-max 百分比边距；0.01 表示用 1%%/99%% 分位数并 clip 后归一化，0 表示普通 min-max",
+    )
+    parser.add_argument(
         "--num-traj",
         type=int,
         default=None,
@@ -284,6 +308,8 @@ def format_float_suffix(value: float) -> str:
 
 
 def _spec_param_token(mask_spec: dict[str, Any]) -> str:
+    if mask_spec["mask_type"] in MASK_TYPES_REQUIRING_RATIO_RANGE:
+        return f"r{format_ratio_range_suffix(mask_spec['retain_ratio_range'])}"
     if mask_spec["mask_type"] in MASK_TYPES_REQUIRING_RATIO:
         return f"r{format_float_suffix(mask_spec['retain_ratio'])}"
     if mask_spec["mask_type"] in MASK_TYPES_REQUIRING_SEQ_LEN:
@@ -424,6 +450,14 @@ def normalize_split_mask_config(
         str(v) for v in _parse_list_arg(mask_type_list_raw, f"{split}_mask_type_list")
     ]
     mask_ratio_list = _parse_list_arg(mask_ratio_list_raw, f"{split}_mask_ratio_list")
+    if (
+        int(num_mask_type) == 1
+        and len(mask_type_list) == 1
+        and mask_type_list[0] in MASK_TYPES_REQUIRING_RATIO_RANGE
+        and len(mask_ratio_list) == 2
+        and not any(isinstance(v, (list, tuple)) for v in mask_ratio_list)
+    ):
+        mask_ratio_list = [mask_ratio_list]
     if mask_assign_mode == "composition":
         mask_composition_list = [
             float(v)
@@ -528,7 +562,7 @@ def build_mask_jobs(
             mask_specs=mask_specs,
             seed=seed,
         )
-        return [
+        jobs = [
             dict(
                 source_episode_id=int(source_episode_id),
                 mask_spec=copy.deepcopy(assigned_mask_specs[int(source_episode_id)]),
@@ -540,6 +574,7 @@ def build_mask_jobs(
             )
             for source_episode_id in source_episode_ids
         ]
+        return assign_linear_multi_ratios_to_jobs(jobs)
 
     jobs = []
     for source_episode_id in source_episode_ids:
@@ -557,6 +592,7 @@ def build_mask_jobs(
                     ),
                 )
             )
+    jobs = assign_linear_multi_ratios_to_jobs(jobs)
     rng = np.random.default_rng(seed)
     if len(jobs) > 1:
         order = rng.permutation(len(jobs)).tolist()
@@ -564,7 +600,37 @@ def build_mask_jobs(
     return jobs
 
 
+def assign_linear_multi_ratios_to_jobs(
+    jobs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    jobs = copy.deepcopy(jobs)
+    groups: dict[int, list[int]] = {}
+    for idx, job in enumerate(jobs):
+        mask_spec = job["mask_spec"]
+        if mask_spec.get("is_multi_ratio", False):
+            groups.setdefault(int(mask_spec["mask_spec_index"]), []).append(idx)
+
+    for group_indices in groups.values():
+        spec = jobs[group_indices[0]]["mask_spec"]
+        ratios = linear_retain_ratios(
+            len(group_indices),
+            retain_ratio=None,
+            retain_ratio_range=spec["retain_ratio_range"],
+        )
+        for local_idx, (job_idx, retain_ratio) in enumerate(zip(group_indices, ratios)):
+            job_spec = jobs[job_idx]["mask_spec"]
+            job_spec["retain_ratio"] = float(retain_ratio)
+            job_spec["multi_ratio_index"] = int(local_idx)
+            job_spec["multi_ratio_count"] = int(len(group_indices))
+    return jobs
+
+
 def _mask_param_repr(mask_spec: dict[str, Any]) -> Any:
+    if mask_spec["mask_type"] in MASK_TYPES_REQUIRING_RATIO_RANGE:
+        return [
+            float(mask_spec["retain_ratio_range"][0]),
+            float(mask_spec["retain_ratio_range"][1]),
+        ]
     if mask_spec["mask_type"] in MASK_TYPES_REQUIRING_RATIO:
         return float(mask_spec["retain_ratio"])
     if mask_spec["mask_type"] in MASK_TYPES_REQUIRING_SEQ_LEN:
@@ -587,8 +653,13 @@ def build_split_metadata_json(
     split_seed: int,
     mask_seed: int,
     action_dim: int,
+    action_robust_margin: float,
 ) -> dict:
     action_dim = validate_action_dim(action_dim)
+    action_robust_margin = validate_robust_margin(
+        action_robust_margin,
+        name="action_robust_margin",
+    )
     mas_step_dim = mas_step_dim_for_action_dim(action_dim)
     mask_composition_list = [float(spec["ratio"]) for spec in mask_specs]
     mask_ratio_list = [_mask_param_repr(spec) for spec in mask_specs]
@@ -625,6 +696,9 @@ def build_split_metadata_json(
             "mask_seed": int(mask_seed),
             "mas_action_dim": action_dim,
             "mas_dim": mas_step_dim,
+            "action_normalization_method": action_normalization_method(action_robust_margin),
+            "action_robust_margin": float(action_robust_margin),
+            "actions_clipped_to_norm_range": bool(action_robust_margin > 0.0),
         },
     }
     episodes = source_metadata.get("episodes", [])
@@ -720,10 +794,29 @@ def _write_mask_spec_meta(
 
 def _write_traj_mask_spec(traj_group: h5py.Group, mask_spec: dict[str, Any]) -> None:
     write_string_dataset(traj_group, "mask_type", str(mask_spec["mask_type"]))
+    write_string_dataset(
+        traj_group,
+        "base_mask_type",
+        str(resolve_base_mask_type(mask_spec["mask_type"])),
+    )
     write_string_dataset(traj_group, "mask_type_slot", str(mask_spec["mask_type_slot"]))
     traj_group.create_dataset("mask_slot_index", data=np.int32(mask_spec["mask_slot_index"]))
     if mask_spec["retain_ratio"] is not None:
         traj_group.create_dataset("retain_ratio", data=np.float32(mask_spec["retain_ratio"]))
+    if mask_spec.get("retain_ratio_range") is not None:
+        traj_group.create_dataset(
+            "retain_ratio_range",
+            data=np.asarray(mask_spec["retain_ratio_range"], dtype=np.float32),
+        )
+    if mask_spec.get("multi_ratio_index") is not None:
+        traj_group.create_dataset(
+            "multi_ratio_index",
+            data=np.int32(mask_spec["multi_ratio_index"]),
+        )
+        traj_group.create_dataset(
+            "multi_ratio_count",
+            data=np.int32(mask_spec["multi_ratio_count"]),
+        )
     if mask_spec["mask_seq_len"] is not None:
         traj_group.create_dataset("mask_seq_len", data=np.int32(mask_spec["mask_seq_len"]))
 
@@ -749,8 +842,13 @@ def write_split_h5(
     input_json: Path,
     action_dim: int,
     state_schema: list[dict[str, Any]],
+    action_robust_margin: float,
 ) -> None:
     action_dim = validate_action_dim(action_dim)
+    action_robust_margin = validate_robust_margin(
+        action_robust_margin,
+        name="action_robust_margin",
+    )
     mas_step_dim = mas_step_dim_for_action_dim(action_dim)
     normalized_action_dims = np.arange(min(6, action_dim), dtype=np.int32)
     ensure_parent_dir(output_h5)
@@ -774,6 +872,7 @@ def write_split_h5(
         meta.create_dataset("actions_normalized", data=np.bool_(True))
         meta.create_dataset("states_normalized", data=np.bool_(True))
         meta.create_dataset("mas_has_progress", data=np.bool_(True))
+        write_action_normalization_meta(meta, action_robust_margin)
         meta.create_dataset(
             "state_path",
             data=np.asarray("obs/state", dtype=h5py.string_dtype("utf-8")),
@@ -820,11 +919,12 @@ def write_split_h5(
                 raise ValueError(
                     f"traj_{source_episode_id}/actions must have shape (T, {action_dim}), got {actions.shape}"
                 )
-            normalized_actions = normalize_selected_dims(
+            normalized_actions = normalize_actions_array(
                 actions,
-                mins=action_min,
-                maxs=action_max,
-                dims=range(len(normalized_action_dims)),
+                action_min=action_min,
+                action_max=action_max,
+                normalized_action_dims=range(len(normalized_action_dims)),
+                action_robust_margin=action_robust_margin,
             )
             state = load_state_matrix_from_obs_group(src_traj["obs"])
             normalized_state = normalize_selected_dims(
@@ -842,7 +942,7 @@ def write_split_h5(
             traj_rng = np.random.default_rng(int(job["rng_seed"]))
             masked_actions, keep_mask = apply_mask_to_actions(
                 normalized_actions,
-                mask_type=mask_spec["mask_type"],
+                mask_type=resolve_base_mask_type(mask_spec["mask_type"]),
                 rng=traj_rng,
                 retain_ratio=mask_spec["retain_ratio"],
                 mask_seq_len=mask_spec["mask_seq_len"],
@@ -920,6 +1020,10 @@ def _summarize_assignments(
 def main() -> None:
     args = parse_args()
     args.action_dim = validate_action_dim(args.action_dim)
+    args.action_robust_margin = validate_robust_margin(
+        args.action_robust_margin,
+        name="action_robust_margin",
+    )
     train_mask_specs = normalize_split_mask_config(
         args,
         split="train",
@@ -962,8 +1066,11 @@ def main() -> None:
         metadata = read_json(input_json)
         validate_dataset_alignment(src_file, metadata, traj_keys)
         source_episode_ids = [int(traj_key.split("_")[-1]) for traj_key in traj_keys]
-        action_min, action_max = compute_global_min_max(
-            iter_selected_action_arrays(src_file, traj_keys, action_dim=args.action_dim)
+        action_min, action_max = compute_action_min_max(
+            src_file,
+            traj_keys,
+            action_dim=args.action_dim,
+            action_robust_margin=args.action_robust_margin,
         )
         state_min, state_max = compute_global_min_max(
             iter_selected_state_arrays(src_file, traj_keys)
@@ -1025,6 +1132,7 @@ def main() -> None:
         input_json=input_json,
         action_dim=args.action_dim,
         state_schema=state_schema,
+        action_robust_margin=args.action_robust_margin,
     )
     write_json(
         train_json,
@@ -1043,6 +1151,7 @@ def main() -> None:
             split_seed=args.split_seed,
             mask_seed=args.mask_seed,
             action_dim=args.action_dim,
+            action_robust_margin=args.action_robust_margin,
         ),
     )
 
@@ -1068,6 +1177,7 @@ def main() -> None:
             input_json=input_json,
             action_dim=args.action_dim,
             state_schema=state_schema,
+            action_robust_margin=args.action_robust_margin,
         )
         write_json(
             eval_json,
@@ -1086,6 +1196,7 @@ def main() -> None:
                 split_seed=args.split_seed,
                 mask_seed=args.mask_seed + 1_000_003,
                 action_dim=args.action_dim,
+                action_robust_margin=args.action_robust_margin,
             ),
         )
 
@@ -1102,7 +1213,9 @@ def main() -> None:
     print(
         "[data_preprocess_mixed] stats: "
         f"action_dim={args.action_dim}, state_dim={state_min.shape[0]}, "
-        f"mas_dim={mas_step_dim_for_action_dim(args.action_dim)}"
+        f"mas_dim={mas_step_dim_for_action_dim(args.action_dim)}, "
+        f"action_norm={action_normalization_method(args.action_robust_margin)}, "
+        f"action_robust_margin={args.action_robust_margin:g}"
     )
 
 

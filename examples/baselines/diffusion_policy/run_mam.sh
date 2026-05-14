@@ -9,9 +9,9 @@ export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
 # 1. Basic info 
 # -----------------------------------------------------------------------------
 
-ENV_ID="${ENV_ID:-PickCube-v1}"
-ACTION_DIM="${ACTION_DIM:-${action_dim:-auto}}" # auto infers from RAW_DEMO_H5; 7=有夹爪，6=无夹爪/panda_stick
-EXP_NAME="${EXP_NAME:-PickCube_mam_unet}"
+ENV_ID="${ENV_ID:-PlaceSphere-v1}"
+ACTION_DIM="${ACTION_DIM:-${action_dim:-7}}" # auto infers from RAW_DEMO_H5; 7=有夹爪，6=无夹爪/panda_stick
+EXP_NAME="${EXP_NAME:-Placesphere-mam-5demo}"
 SEED="${SEED:-1}"
 TORCH_DETERMINISTIC="${TORCH_DETERMINISTIC:-true}"
 CUDA="${CUDA:-true}"
@@ -48,7 +48,18 @@ fi
 
 PREPROCESSED_ROOT_DIR="${PREPROCESSED_ROOT_DIR:-demos/data_1_preprocessed}"
 PREPROCESSED_DATA_DIR="${PREPROCESSED_DATA_DIR:-}"
-PREPROCESSED_DATA_PREFIX="${PREPROCESSED_DATA_PREFIX:-${ENV_ID}}" #预处理输出文件名基础前缀
+ACTION_ROBUST_MARGIN="${ACTION_ROBUST_MARGIN:-${MARGIN_ROBUST:-0}}"
+ACTION_NORM_SUFFIX="$(
+ACTION_ROBUST_MARGIN="$ACTION_ROBUST_MARGIN" python - <<'PY'
+import os
+
+margin = float(os.environ["ACTION_ROBUST_MARGIN"])
+if margin < 0.0 or margin >= 0.5:
+    raise ValueError(f"ACTION_ROBUST_MARGIN must be in [0, 0.5), got {margin}")
+print("" if margin <= 0.0 else "_ar" + format(margin, "g").replace(".", "p"))
+PY
+)"
+PREPROCESSED_DATA_PREFIX="${PREPROCESSED_DATA_PREFIX:-${ENV_ID}${ACTION_NORM_SUFFIX}}" #预处理输出文件名基础前缀
 PREPROCESS_MASK_VALUE="${PREPROCESS_MASK_VALUE:-0}"
 PREPROCESS_NUM_TRAJ="${PREPROCESS_NUM_TRAJ:-}"
 PREPROCESS_MASK_ASSIGN_MODE="${PREPROCESS_MASK_ASSIGN_MODE:-composition}" # composition 或 one_demo_multi_mask
@@ -63,6 +74,8 @@ esac
 # Preferred interface:
 #   MASK_TYPE_LIST='["random_mask","3D_points"]'
 #   MASK_RATIO_LIST='[0.2,0.5]'             # retain_ratio, or seq_len for seq masks
+#   MASK_TYPE_LIST='["multi_random","multi_points"]'
+#   MASK_RATIO_LIST='[[0.2,0.4],[0,0.5]]'   # multi_* uses linear retain_ratio ranges
 #   MASK_COMPOSITION_LIST='[0.5,0.5]'       # optional; composition mode defaults to uniform
 #   PREPROCESS_MASK_ASSIGN_MODE=composition # or one_demo_multi_mask
 # If MASK_TYPE_LIST has one item, the script automatically uses single-mask preprocess.
@@ -117,13 +130,29 @@ def normalize_composition(raw_value, count):
     return [v / total for v in values]
 
 
+def normalize_mask_param(value):
+    if isinstance(value, (list, tuple)):
+        if len(value) != 2:
+            raise ValueError(f"multi_* mask ratio range must be [start, end], got {value}")
+        return [float(value[0]), float(value[1])]
+    return float(value)
+
+
 train_types_raw = parse_list(os.environ["MASK_TYPE_LIST"])
 train_num = len(train_types_raw)
 train_types = [str(v) for v in normalize(train_types_raw, train_num, "random_mask")]
+ratio_values = parse_list(os.environ["MASK_RATIO_LIST"])
+if (
+    train_num == 1
+    and train_types[0] in {"multi_random", "multi_points", "multi_3D_points", "multi_pose"}
+    and len(ratio_values) == 2
+    and not any(isinstance(v, (list, tuple)) for v in ratio_values)
+):
+    ratio_values = [ratio_values]
 train_ratios = [
-    float(v)
+    normalize_mask_param(v)
     for v in normalize(
-        parse_list(os.environ["MASK_RATIO_LIST"]),
+        ratio_values,
         train_num,
         0.2,
     )
@@ -148,7 +177,11 @@ if single:
     ratio = train_ratios[0] if train_ratios else 0.2
     assignments["SINGLE_MASK_COMPAT"] = "true"
     assignments["SINGLE_MASK_TYPE"] = train_types[0]
-    assignments["SINGLE_MASK_PARAM"] = format(float(ratio), "g")
+    assignments["SINGLE_MASK_PARAM"] = (
+        json.dumps(ratio)
+        if isinstance(ratio, list)
+        else format(float(ratio), "g")
+    )
 else:
     assignments["SINGLE_MASK_COMPAT"] = "false"
 
@@ -167,6 +200,7 @@ echo "[mam-mask] assign_mode=${PREPROCESS_MASK_ASSIGN_MODE}"
 echo "[mam-mask] types=${MASK_TYPE_LIST}"
 echo "[mam-mask] ratios=${MASK_RATIO_LIST}"
 echo "[mam-mask] composition=${MASK_COMPOSITION_LIST}"
+echo "[mam-preprocess] action_robust_margin=${ACTION_ROBUST_MARGIN}"
 
 case "$ACTION_DIM" in
   6|7) ;;
@@ -243,15 +277,19 @@ NUM_EVAL_DEMOS="${NUM_EVAL_DEMOS:-100}"
 NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-10}"
 INPAINTING="${INPAINTING:-false}"
 EVAL_PROGRESS_BAR="${EVAL_PROGRESS_BAR:-false}"
-CAPTURE_VIDEO_FREQ="${CAPTURE_VIDEO_FREQ:-20}"
+CAPTURE_VIDEO_FREQ="${CAPTURE_VIDEO_FREQ:-1}"
 SIM_BACKEND="${SIM_BACKEND:-physx_cpu}"
 
 PREPROCESS_MODE="mixed"
 if [[ "$SINGLE_MASK_COMPAT" == "true" ]]; then
   PREPROCESS_MODE="single"
   SINGLE_MASK_RETAIN_RATIO="1.0"
+  SINGLE_MASK_RETAIN_RATIO_RANGE=""
   SINGLE_MASK_SEQ_LEN="1"
   case "$SINGLE_MASK_TYPE" in
+    multi_random|multi_points|multi_3D_points|multi_pose)
+      SINGLE_MASK_RETAIN_RATIO_RANGE="${SINGLE_MASK_PARAM}"
+      ;;
     2D_partial_trajectory|local_planner)
       SINGLE_MASK_SEQ_LEN="${SINGLE_MASK_PARAM}"
       ;;
@@ -310,6 +348,18 @@ PY
 
 if [[ "$PREPROCESS_MODE" == "single" ]]; then
   case "$SINGLE_MASK_TYPE" in
+    multi_random|multi_points|multi_3D_points|multi_pose)
+      PREPROCESS_RANGE_SUFFIX="$(
+SINGLE_MASK_RETAIN_RATIO_RANGE="$SINGLE_MASK_RETAIN_RATIO_RANGE" python - <<'PY'
+import ast
+import os
+
+start, end = ast.literal_eval(os.environ["SINGLE_MASK_RETAIN_RATIO_RANGE"])
+print(f"{float(start):g}to{float(end):g}")
+PY
+)"
+      PREPROCESS_DIR_SUFFIX="${SINGLE_MASK_TYPE}_${PREPROCESS_RANGE_SUFFIX}"
+      ;;
     pose_AnyGrasp|pose_motion_planning|points|3D_points|random_mask)
       PREPROCESS_DIR_SUFFIX="${SINGLE_MASK_TYPE}_${SINGLE_MASK_RETAIN_RATIO}"
       ;;
@@ -373,10 +423,15 @@ ensure_preprocessed_dataset() {
       --env-id "$ENV_ID"
       --action-dim "$ACTION_DIM"
       --mask-type "$SINGLE_MASK_TYPE"
-      --retain-ratio "$SINGLE_MASK_RETAIN_RATIO"
       --mask-seq-len "$SINGLE_MASK_SEQ_LEN"
       --mask-value "$PREPROCESS_MASK_VALUE"
+      --action-robust-margin "$ACTION_ROBUST_MARGIN"
     )
+    if [[ -n "$SINGLE_MASK_RETAIN_RATIO_RANGE" ]]; then
+      PREPROCESS_ARGS+=(--retain-ratio-range "$SINGLE_MASK_RETAIN_RATIO_RANGE")
+    else
+      PREPROCESS_ARGS+=(--retain-ratio "$SINGLE_MASK_RETAIN_RATIO")
+    fi
     if [[ -n "$PREPROCESS_NUM_TRAJ" ]]; then
       PREPROCESS_ARGS+=(--num-traj "$PREPROCESS_NUM_TRAJ")
     fi
@@ -399,6 +454,7 @@ ensure_preprocessed_dataset() {
       --eval-mask-composition-list "$EVAL_MASK_COMPOSITION_LIST"
       --eval-mask-ratio-list "$EVAL_MASK_RATIO_LIST"
       --mask-value "$PREPROCESS_MASK_VALUE"
+      --action-robust-margin "$ACTION_ROBUST_MARGIN"
     )
     if [[ -n "$PREPROCESS_NUM_TRAJ" ]]; then
       PREPROCESS_ARGS+=(--num-traj "$PREPROCESS_NUM_TRAJ")

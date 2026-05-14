@@ -868,10 +868,17 @@ if __name__ == "__main__":
     args.subgoal_dim = mas_max_length * int(args.action_dim)
     action_norm_path = args.action_norm_path or args.demo_path
     denorm_mins, denorm_maxs = load_action_denorm_stats(action_norm_path)
-    if int(denorm_mins.shape[0]) != int(args.action_dim):
+    denorm_dim = int(denorm_mins.shape[0])
+    min_denorm_dim = min(6, int(args.action_dim))
+    if denorm_dim < min_denorm_dim or denorm_dim > int(args.action_dim):
         raise ValueError(
-            f"action norm dim ({denorm_mins.shape[0]}) does not match action_dim={args.action_dim}: "
+            f"action norm dim ({denorm_mins.shape[0]}) is incompatible with action_dim={args.action_dim}: "
             f"{action_norm_path}"
+        )
+    if denorm_dim != int(args.action_dim):
+        print(
+            f"[denorm] action stats cover first {denorm_dim}/{args.action_dim} dims; "
+            "remaining dims are left in dataset/action space."
         )
     eval_subgoal_data = load_eval_subgoal_data(
         data_path=args.eval_demo_path,
@@ -1119,7 +1126,12 @@ if __name__ == "__main__":
         log_metrics(iteration)
 
         # Checkpoint
-        if args.save_freq is not None and iteration % args.save_freq == 0:
+        if (
+            args.save_freq is not None
+            and args.save_freq > 0
+            and iteration > 0
+            and iteration % args.save_freq == 0
+        ):
             save_ckpt(run_name, str(iteration))
         pbar.update(1)
         pbar.set_postfix({"loss": total_loss.item()})

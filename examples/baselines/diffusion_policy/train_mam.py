@@ -8,6 +8,7 @@ import time
 import sys
 import json
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -1230,6 +1231,24 @@ def summarize_label_counts(labels):
     return dict(sorted(counts.items(), key=lambda item: item[0]))
 
 
+@contextmanager
+def preserve_global_rng_state():
+    python_rng_state = random.getstate()
+    numpy_rng_state = np.random.get_state()
+    torch_rng_state = torch.get_rng_state()
+    cuda_rng_states = None
+    if torch.cuda.is_available():
+        cuda_rng_states = torch.cuda.get_rng_state_all()
+    try:
+        yield
+    finally:
+        random.setstate(python_rng_state)
+        np.random.set_state(numpy_rng_state)
+        torch.set_rng_state(torch_rng_state)
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
+
+
 def _decode_meta_string(value):
     value = np.asarray(value)
     if value.shape == ():
@@ -1616,10 +1635,17 @@ if __name__ == "__main__":
     # 3. Evaluation-only runtime requirements: action denormalization and STPM
     # ------------------------------------------------------------------------ #
     denorm_mins, denorm_maxs = load_action_denorm_stats(args.action_norm_path)
-    if int(denorm_mins.shape[0]) != int(args.action_dim):
+    denorm_dim = int(denorm_mins.shape[0])
+    min_denorm_dim = min(6, int(args.action_dim))
+    if denorm_dim < min_denorm_dim or denorm_dim > int(args.action_dim):
         raise ValueError(
-            f"action norm dim ({denorm_mins.shape[0]}) does not match action_dim={args.action_dim}: "
+            f"action norm dim ({denorm_mins.shape[0]}) is incompatible with action_dim={args.action_dim}: "
             f"{args.action_norm_path}"
+        )
+    if denorm_dim != int(args.action_dim):
+        print(
+            f"[denorm] action stats cover first {denorm_dim}/{args.action_dim} dims; "
+            "remaining dims are left in dataset/action space."
         )
     print("[denorm] eval actions will be denormalized before env.step().")
 
@@ -1839,37 +1865,38 @@ if __name__ == "__main__":
             per_mask_slot_summary = {}
             if args.capture_video:
                 clear_iteration_artifacts(video_dir=video_dir, iteration=iteration)
-            mam_eval_result = evaluate_mam(
-                args.num_eval_episodes,
-                ema_agent,
-                envs,
-                device,
-                args.sim_backend,
-                eval_mas_window_data=eval_mam_data,
-                obs_horizon=args.obs_horizon,
-                long_window_horizon=(
-                    args.long_window_horizon if args.mas_long_conv_output_dim > 0 else 0
-                ),
-                long_window_backward_length=(
-                    args.long_window_backward_length if args.mas_long_conv_output_dim > 0 else 0
-                ),
-                long_window_forward_length=(
-                    args.long_window_forward_length if args.mas_long_conv_output_dim > 0 else 0
-                ),
-                short_window_horizon=args.short_window_horizon,
-                stpm_encoder=stpm_encoder,
-                stpm_n_obs_steps=stpm_n_obs_steps,
-                stpm_frame_gap=stpm_frame_gap,
-                progress_bar=args.eval_progress_bar,
-                reset_seeds=eval_reset_seeds if len(eval_reset_seeds) > 0 else None,
-                return_progress_curves=args.capture_video,
-                return_rollout_records=True,
-                capture_indices=capture_indices if args.capture_video else None,
-                video_dir=video_dir if args.capture_video else None,
-                iteration=iteration,
-                eval_traj_ids=eval_traj_ids if len(eval_traj_ids) > 0 else None,
-                inpainting=args.inpainting,
-            )
+            with preserve_global_rng_state():
+                mam_eval_result = evaluate_mam(
+                    args.num_eval_episodes,
+                    ema_agent,
+                    envs,
+                    device,
+                    args.sim_backend,
+                    eval_mas_window_data=eval_mam_data,
+                    obs_horizon=args.obs_horizon,
+                    long_window_horizon=(
+                        args.long_window_horizon if args.mas_long_conv_output_dim > 0 else 0
+                    ),
+                    long_window_backward_length=(
+                        args.long_window_backward_length if args.mas_long_conv_output_dim > 0 else 0
+                    ),
+                    long_window_forward_length=(
+                        args.long_window_forward_length if args.mas_long_conv_output_dim > 0 else 0
+                    ),
+                    short_window_horizon=args.short_window_horizon,
+                    stpm_encoder=stpm_encoder,
+                    stpm_n_obs_steps=stpm_n_obs_steps,
+                    stpm_frame_gap=stpm_frame_gap,
+                    progress_bar=args.eval_progress_bar,
+                    reset_seeds=eval_reset_seeds if len(eval_reset_seeds) > 0 else None,
+                    return_progress_curves=args.capture_video,
+                    return_rollout_records=True,
+                    capture_indices=capture_indices if args.capture_video else None,
+                    video_dir=video_dir if args.capture_video else None,
+                    iteration=iteration,
+                    eval_traj_ids=eval_traj_ids if len(eval_traj_ids) > 0 else None,
+                    inpainting=args.inpainting,
+                )
             if args.capture_video:
                 (
                     eval_metrics,
@@ -1985,7 +2012,12 @@ if __name__ == "__main__":
         log_metrics(iteration)
 
         # Checkpoint
-        if args.save_freq is not None and iteration % args.save_freq == 0:
+        if (
+            args.save_freq is not None
+            and args.save_freq > 0
+            and iteration > 0
+            and iteration % args.save_freq == 0
+        ):
             save_ckpt(run_name, str(iteration))
         pbar.update(1)
         pbar.set_postfix({"loss": total_loss.item()})

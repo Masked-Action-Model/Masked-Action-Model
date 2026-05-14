@@ -67,7 +67,6 @@ PATH=/home/hebu/miniconda3/envs/maniskill_py311/bin:$PATH python -m mani_skill.t
   --num-envs 8 \
   --sim-backend physx_cpu \
   --allow-failure
-
 ```
 
 ```bash
@@ -85,5 +84,4 @@ NUM_WORKERS=4 \
 VAL_NUM_WORKERS=4 \
 NUM_EPOCHS=2 \
 bash STPM/run_train_stpm.sh
-
 ```

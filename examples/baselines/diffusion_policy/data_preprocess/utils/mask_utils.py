@@ -13,6 +13,13 @@ MASK_TYPES_REQUIRING_RATIO = {
     "pose_AnyGrasp",
     "random_mask",
 }
+MULTI_MASK_TYPE_TO_BASE = {
+    "multi_random": "random_mask",
+    "multi_points": "points",
+    "multi_3D_points": "3D_points",
+    "multi_pose": "pose_motion_planning",
+}
+MASK_TYPES_REQUIRING_RATIO_RANGE = set(MULTI_MASK_TYPE_TO_BASE.keys())
 MASK_TYPES_REQUIRING_SEQ_LEN = {
     "2D_partial_trajectory",
     "local_planner",
@@ -31,6 +38,7 @@ SUPPORTED_MASK_TYPES = {
     "auto_regressive",
     "local_planner",
     "random_mask",
+    *MASK_TYPES_REQUIRING_RATIO_RANGE,
 }
 MIXED_SUPPORTED_MASK_TYPES = {
     "none",
@@ -44,18 +52,67 @@ MIXED_SUPPORTED_MASK_TYPES = {
     "3D_points",
     "local_planner",
     "random_mask",
+    *MASK_TYPES_REQUIRING_RATIO_RANGE,
 }
+
+
+def is_multi_ratio_mask_type(mask_type: str) -> bool:
+    return str(mask_type) in MULTI_MASK_TYPE_TO_BASE
+
+
+def resolve_base_mask_type(mask_type: str) -> str:
+    return MULTI_MASK_TYPE_TO_BASE.get(str(mask_type), str(mask_type))
+
+
+def parse_retain_ratio_range(raw_param: Any, mask_type: str) -> tuple[float, float]:
+    if raw_param is None:
+        raise ValueError(f"mask_type={mask_type!r} requires retain_ratio range [start, end]")
+    if isinstance(raw_param, str):
+        text = raw_param.strip()
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+            text = text[1:-1].strip()
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                import ast
+
+                raw_param = ast.literal_eval(text)
+            except Exception as exc:
+                raise ValueError(
+                    f"failed to parse retain_ratio range for {mask_type!r}: {raw_param!r}"
+                ) from exc
+        elif "," in text:
+            raw_param = [item.strip() for item in text.split(",")]
+        else:
+            raise ValueError(
+                f"retain_ratio range for {mask_type!r} must be [start, end], got {raw_param!r}"
+            )
+    if not isinstance(raw_param, (list, tuple)) or len(raw_param) != 2:
+        raise ValueError(
+            f"retain_ratio range for {mask_type!r} must be [start, end], got {raw_param!r}"
+        )
+    start, end = float(raw_param[0]), float(raw_param[1])
+    if not (0.0 <= start <= end <= 1.0):
+        raise ValueError(
+            f"retain_ratio range for {mask_type!r} must satisfy 0 <= start <= end <= 1, got {raw_param!r}"
+        )
+    return start, end
 
 
 def validate_mask_config(
     mask_type: str,
     retain_ratio: float | None = None,
     mask_seq_len: int | None = None,
+    retain_ratio_range: Any | None = None,
 ) -> None:
     if mask_type not in SUPPORTED_MASK_TYPES:
         raise ValueError(
             f"Unsupported mask_type={mask_type!r}. Supported: {sorted(SUPPORTED_MASK_TYPES)}"
         )
+    if mask_type in MASK_TYPES_REQUIRING_RATIO_RANGE:
+        if retain_ratio_range is not None:
+            parse_retain_ratio_range(retain_ratio_range, mask_type)
+            return
+        mask_type = resolve_base_mask_type(mask_type)
     if mask_type in MASK_TYPES_REQUIRING_RATIO:
         if retain_ratio is None:
             raise ValueError(f"mask_type={mask_type!r} requires retain_ratio")
@@ -87,8 +144,11 @@ def build_mask_spec(
         raise ValueError(f"mask ratio must be in [0, 1], got {ratio} for {mask_type!r}")
 
     retain_ratio = None
+    retain_ratio_range = None
     mask_seq_len = None
-    if mask_type in MASK_TYPES_REQUIRING_RATIO:
+    if mask_type in MASK_TYPES_REQUIRING_RATIO_RANGE:
+        retain_ratio_range = parse_retain_ratio_range(raw_param, mask_type)
+    elif mask_type in MASK_TYPES_REQUIRING_RATIO:
         if raw_param is None:
             raise ValueError(f"mask_type={mask_type!r} requires retain_ratio")
         retain_ratio = float(raw_param)
@@ -114,11 +174,19 @@ def build_mask_spec(
         mask_type=mask_type,
         retain_ratio=retain_ratio,
         mask_seq_len=mask_seq_len,
+        retain_ratio_range=retain_ratio_range,
     )
     return {
         "mask_type": mask_type,
+        "base_mask_type": resolve_base_mask_type(mask_type),
+        "is_multi_ratio": bool(mask_type in MASK_TYPES_REQUIRING_RATIO_RANGE),
         "ratio": ratio,
         "retain_ratio": retain_ratio,
+        "retain_ratio_range": (
+            [float(retain_ratio_range[0]), float(retain_ratio_range[1])]
+            if retain_ratio_range is not None
+            else None
+        ),
         "mask_seq_len": mask_seq_len,
     }
 
@@ -202,6 +270,7 @@ def apply_mask_to_actions(
     masked_value: float = MASKED_VALUE,
     action_dim: int = 7,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    mask_type = resolve_base_mask_type(mask_type)
     validate_mask_config(
         mask_type=mask_type,
         retain_ratio=retain_ratio,
