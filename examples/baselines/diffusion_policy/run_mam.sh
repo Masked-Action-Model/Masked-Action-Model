@@ -71,22 +71,35 @@ case "$PREPROCESS_MASK_ASSIGN_MODE" in
     ;;
 esac
 
-# Preferred interface:
+# Preferred interface. Legacy MASK_* is still accepted as the default for both splits.
 #   MASK_TYPE_LIST='["random_mask","3D_points"]'
 #   MASK_RATIO_LIST='[0.2,0.5]'             # retain_ratio, or seq_len for seq masks
 #   MASK_TYPE_LIST='["multi_random","multi_points"]'
 #   MASK_RATIO_LIST='[[0.2,0.4],[0,0.5]]'   # multi_* uses linear retain_ratio ranges
 #   MASK_COMPOSITION_LIST='[0.5,0.5]'       # optional; composition mode defaults to uniform
+#   TRAIN_MASK_TYPE_LIST='["random_mask"]'
+#   TRAIN_MASK_RATIO_LIST='[0.2]'
+#   EVAL_MASK_TYPE_LIST='["3D_points"]'
+#   EVAL_MASK_RATIO_LIST='[0.5]'
 #   PREPROCESS_MASK_ASSIGN_MODE=composition # or one_demo_multi_mask
-# If MASK_TYPE_LIST has one item, the script automatically uses single-mask preprocess.
+# If train/eval each have one identical mask, the script uses single-mask preprocess.
 MASK_TYPE_LIST="${MASK_TYPE_LIST:-['3D_points']}"
 MASK_RATIO_LIST="${MASK_RATIO_LIST:-[0.2]}"
 MASK_COMPOSITION_LIST="${MASK_COMPOSITION_LIST:-}"
+TRAIN_MASK_TYPE_LIST="${TRAIN_MASK_TYPE_LIST:-$MASK_TYPE_LIST}"
+TRAIN_MASK_RATIO_LIST="${TRAIN_MASK_RATIO_LIST:-$MASK_RATIO_LIST}"
+TRAIN_MASK_COMPOSITION_LIST="${TRAIN_MASK_COMPOSITION_LIST:-$MASK_COMPOSITION_LIST}"
+EVAL_MASK_TYPE_LIST="${EVAL_MASK_TYPE_LIST:-$TRAIN_MASK_TYPE_LIST}"
+EVAL_MASK_RATIO_LIST="${EVAL_MASK_RATIO_LIST:-$TRAIN_MASK_RATIO_LIST}"
+EVAL_MASK_COMPOSITION_LIST="${EVAL_MASK_COMPOSITION_LIST:-$TRAIN_MASK_COMPOSITION_LIST}"
 
 eval "$(
-MASK_TYPE_LIST="$MASK_TYPE_LIST" \
-MASK_RATIO_LIST="$MASK_RATIO_LIST" \
-MASK_COMPOSITION_LIST="$MASK_COMPOSITION_LIST" \
+TRAIN_MASK_TYPE_LIST="$TRAIN_MASK_TYPE_LIST" \
+TRAIN_MASK_RATIO_LIST="$TRAIN_MASK_RATIO_LIST" \
+TRAIN_MASK_COMPOSITION_LIST="$TRAIN_MASK_COMPOSITION_LIST" \
+EVAL_MASK_TYPE_LIST="$EVAL_MASK_TYPE_LIST" \
+EVAL_MASK_RATIO_LIST="$EVAL_MASK_RATIO_LIST" \
+EVAL_MASK_COMPOSITION_LIST="$EVAL_MASK_COMPOSITION_LIST" \
 python - <<'PY'
 import ast
 import json
@@ -138,40 +151,47 @@ def normalize_mask_param(value):
     return float(value)
 
 
-train_types_raw = parse_list(os.environ["MASK_TYPE_LIST"])
-train_num = len(train_types_raw)
-train_types = [str(v) for v in normalize(train_types_raw, train_num, "random_mask")]
-ratio_values = parse_list(os.environ["MASK_RATIO_LIST"])
-if (
-    train_num == 1
-    and train_types[0] in {"multi_random", "multi_points", "multi_3D_points", "multi_pose"}
-    and len(ratio_values) == 2
-    and not any(isinstance(v, (list, tuple)) for v in ratio_values)
-):
-    ratio_values = [ratio_values]
-train_ratios = [
-    normalize_mask_param(v)
-    for v in normalize(
-        ratio_values,
-        train_num,
-        0.2,
-    )
-]
-train_comp = normalize_composition(os.environ.get("MASK_COMPOSITION_LIST"), train_num)
+def normalize_split(prefix):
+    raw_types = parse_list(os.environ[f"{prefix}_MASK_TYPE_LIST"])
+    num = len(raw_types)
+    types = [str(v) for v in normalize(raw_types, num, "random_mask")]
+    ratio_values = parse_list(os.environ[f"{prefix}_MASK_RATIO_LIST"])
+    if (
+        num == 1
+        and types[0] in {"multi_random", "multi_points", "multi_3D_points", "multi_pose"}
+        and len(ratio_values) == 2
+        and not any(isinstance(v, (list, tuple)) for v in ratio_values)
+    ):
+        ratio_values = [ratio_values]
+    ratios = [
+        normalize_mask_param(v)
+        for v in normalize(
+            ratio_values,
+            num,
+            0.2,
+        )
+    ]
+    composition = normalize_composition(os.environ.get(f"{prefix}_MASK_COMPOSITION_LIST"), num)
+    return types, ratios, composition
 
-single = train_num == 1
+
+train_types, train_ratios, train_comp = normalize_split("TRAIN")
+eval_types, eval_ratios, eval_comp = normalize_split("EVAL")
+train_num = len(train_types)
+eval_num = len(eval_types)
+single = train_num == 1 and eval_num == 1 and train_types == eval_types and train_ratios == eval_ratios
 assignments = {
     "MASK_TYPE_LIST": json.dumps(train_types),
     "MASK_RATIO_LIST": json.dumps(train_ratios),
     "MASK_COMPOSITION_LIST": json.dumps(train_comp),
     "TRAIN_MASK_TYPE_LIST": json.dumps(train_types),
-    "EVAL_MASK_TYPE_LIST": json.dumps(train_types),
+    "EVAL_MASK_TYPE_LIST": json.dumps(eval_types),
     "TRAIN_MASK_COMPOSITION_LIST": json.dumps(train_comp),
-    "EVAL_MASK_COMPOSITION_LIST": json.dumps(train_comp),
+    "EVAL_MASK_COMPOSITION_LIST": json.dumps(eval_comp),
     "TRAIN_MASK_RATIO_LIST": json.dumps(train_ratios),
-    "EVAL_MASK_RATIO_LIST": json.dumps(train_ratios),
+    "EVAL_MASK_RATIO_LIST": json.dumps(eval_ratios),
     "TRAIN_NUM_MASK_TYPE": str(train_num),
-    "EVAL_NUM_MASK_TYPE": str(train_num),
+    "EVAL_NUM_MASK_TYPE": str(eval_num),
 }
 if single:
     ratio = train_ratios[0] if train_ratios else 0.2
@@ -197,9 +217,12 @@ export \
   PREPROCESSED_DATA_PREFIX PREPROCESS_MASK_ASSIGN_MODE
 
 echo "[mam-mask] assign_mode=${PREPROCESS_MASK_ASSIGN_MODE}"
-echo "[mam-mask] types=${MASK_TYPE_LIST}"
-echo "[mam-mask] ratios=${MASK_RATIO_LIST}"
-echo "[mam-mask] composition=${MASK_COMPOSITION_LIST}"
+echo "[mam-mask] train_types=${TRAIN_MASK_TYPE_LIST}"
+echo "[mam-mask] train_ratios=${TRAIN_MASK_RATIO_LIST}"
+echo "[mam-mask] train_composition=${TRAIN_MASK_COMPOSITION_LIST}"
+echo "[mam-mask] eval_types=${EVAL_MASK_TYPE_LIST}"
+echo "[mam-mask] eval_ratios=${EVAL_MASK_RATIO_LIST}"
+echo "[mam-mask] eval_composition=${EVAL_MASK_COMPOSITION_LIST}"
 echo "[mam-preprocess] action_robust_margin=${ACTION_ROBUST_MARGIN}"
 
 case "$ACTION_DIM" in
