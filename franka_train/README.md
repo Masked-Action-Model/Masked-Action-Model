@@ -87,6 +87,7 @@ bash franka_train/run_train_stpm_franka.sh
 ## 常用可调参数
 
 - 公共：`EXP_NAME`、`SEED`、`CUDA`、`NUM_DEMOS`、`TOTAL_ITERS`、`BATCH_SIZE`、`LR`、`OBS_HORIZON`、`ACT_HORIZON`、`PRED_HORIZON`、`NUM_DATALOAD_WORKERS`。
+- validation：`--num-validation-set` 从训练 h5 里按 demo 划出验证集；`--valid-freq` 每隔多少 iter 做一次 dataset 开环 chunk rollout，每条 demo 均匀抽最多 10 个时间点。`--num-validation-set 0` 默认关闭。
 - 模型：`NOISE_MODEL=Transformer|Unet`、`DIT_HIDDEN_DIM`、`DIT_NUM_BLOCKS`、`DIT_DIM_FEEDFORWARD`、`UNET_DIMS`、`N_GROUPS`。
 - MAM：`MASK_TYPE_LIST`、`MASK_RATIO_LIST`、`MASK_COMPOSITION_LIST`、`PREPROCESS_MASK_ASSIGN_MODE`、`LONG_WINDOW_BACKWARD_LENGTH`、`LONG_WINDOW_FORWARD_LENGTH`、`SHORT_WINDOW_HORIZON`、`MAS_LONG_ENCODE_MODE`、`MAS_LONG_CONV_OUTPUT_DIM`、`LOSS_MODE`、`LOSS_MASK_AREA_WEIGHT`。
 - checkpoint：`SAVE_START_ITER`、`SAVE_FREQ`；规则为 `step > SAVE_START_ITER && step % SAVE_FREQ == 0`，同时刷新 `latest.pt`。

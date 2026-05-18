@@ -143,12 +143,10 @@ DEMO_TYPE="${DEMO_TYPE:-franka_real_baseline}"
 
 # 6. Logging/checkpointing. Eval args are accepted for script parity but no online eval runs.
 LOG_FREQ="${LOG_FREQ:-1000}"
-EVAL_FREQ="${EVAL_FREQ:-0}"
+VALID_FREQ="${VALID_FREQ:-5000}"
+NUM_VALIDATION_SET="${NUM_VALIDATION_SET:-10}"
 SAVE_START_ITER="${SAVE_START_ITER:-0}"
 SAVE_FREQ="${SAVE_FREQ:-5000}"
-NUM_EVAL_DEMOS="${NUM_EVAL_DEMOS:-0}"
-NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-${NUM_EVAL_DEMOS}}"
-NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-0}"
 
 ARGS=(
   --exp-name "$EXP_NAME"
@@ -173,6 +171,8 @@ ARGS=(
   --obs-mode "$OBS_MODE"
   --log-freq "$LOG_FREQ"
   --eval-freq "$EVAL_FREQ"
+  --valid-freq "$VALID_FREQ"
+  --num-validation-set "$NUM_VALIDATION_SET"
   --num-eval-episodes "$NUM_EVAL_EPISODES"
   --num-eval-envs "$NUM_EVAL_ENVS"
   --save-start-iter "$SAVE_START_ITER"

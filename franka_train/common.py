@@ -12,7 +12,7 @@ import h5py
 import numpy as np
 import torch
 from gymnasium import spaces
-from torch.utils.data.dataloader import DataLoader
+from torch.utils.data.dataloader import DataLoader, default_collate
 from torch.utils.data.sampler import BatchSampler, RandomSampler
 from tqdm import tqdm
 
@@ -128,6 +128,34 @@ def list_traj_keys(h5_file: h5py.File, num_traj: int | None = None) -> list[str]
     if len(keys) == 0:
         raise ValueError("no traj_* groups found")
     return keys
+
+
+def split_train_validation_traj_indices(
+    data_path: str,
+    num_demos: int | None,
+    num_validation_set: int,
+    seed: int,
+) -> tuple[list[int] | None, list[int]]:
+    num_validation_set = int(num_validation_set)
+    if num_validation_set <= 0:
+        return None, []
+    with h5py.File(data_path, "r") as f:
+        total = len(list_traj_keys(f))
+    if num_demos is not None:
+        total = min(total, int(num_demos))
+    if num_validation_set >= total:
+        raise ValueError(
+            f"num_validation_set ({num_validation_set}) must be smaller than selected demos ({total})"
+        )
+    indices = list(range(total))
+    rng = np.random.default_rng(int(seed))
+    rng.shuffle(indices)
+    val_indices = sorted(indices[:num_validation_set])
+    train_indices = sorted(indices[num_validation_set:])
+    print(
+        f"[validation] split from {total} demos: train={train_indices}, val={val_indices}"
+    )
+    return train_indices, val_indices
 
 
 def infer_action_dim(data_path: str, action_dim: int | None = None) -> int:
@@ -359,6 +387,110 @@ def should_save_periodic(step: int, save_start_iter: int, save_freq: int | None)
     )
 
 
+def build_open_loop_validator(
+    *,
+    dataset,
+    device: torch.device,
+    points_per_demo: int = 10,
+):
+    if dataset is None:
+        return None
+    points_per_demo = max(1, int(points_per_demo))
+    sample_indices = _select_validation_sample_indices(dataset, points_per_demo)
+    if len(sample_indices) == 0:
+        raise ValueError("validation dataset produced no samples")
+    print(
+        f"[validation] open-loop samples={len(sample_indices)}, "
+        f"points_per_demo<={points_per_demo}"
+    )
+
+    def validator(model: torch.nn.Module) -> dict[str, float]:
+        was_training = model.training
+        model.eval()
+        mse_sum = 0.0
+        mae_sum = 0.0
+        count = 0
+        with torch.no_grad():
+            for sample_idx in sample_indices:
+                sample = default_collate([dataset[int(sample_idx)]])
+                sample = _move_batch_to_device(sample, device)
+                pred = _predict_open_loop_action_from_dataset_obs(
+                    model,
+                    sample["observations"],
+                )
+                target = sample["actions"][
+                    :,
+                    dataset.obs_horizon - 1 : dataset.obs_horizon - 1 + pred.shape[1],
+                ]
+                diff = pred - target
+                mse_sum += float(torch.sum(diff * diff).item())
+                mae_sum += float(torch.sum(torch.abs(diff)).item())
+                count += int(diff.numel())
+        if was_training:
+            model.train()
+        open_loop_loss = mse_sum / max(1, count)
+        return {
+            "validation/open_loop_loss": open_loop_loss,
+            "validation/open_loop_mse": open_loop_loss,
+            "validation/open_loop_mae": mae_sum / max(1, count),
+            "validation/open_loop_samples": float(len(sample_indices)),
+        }
+
+    return validator
+
+
+def _predict_open_loop_action_from_dataset_obs(
+    model: torch.nn.Module,
+    obs_seq: dict[str, Any],
+) -> torch.Tensor:
+    if hasattr(model, "encode_obs"):
+        obs_cond = model.encode_obs(obs_seq, eval_mode=True)
+    elif hasattr(model, "obs_conditioning"):
+        obs_cond = model.obs_conditioning(obs_seq, eval_mode=True)
+    else:
+        raise AttributeError("model must provide encode_obs() or obs_conditioning()")
+    obs_cond = model.prepare_noise_condition(obs_cond)
+    batch_size = obs_seq["state"].shape[0]
+    device = obs_seq["state"].device
+    noisy_action_seq = torch.randn(
+        (batch_size, model.pred_horizon, model.act_dim),
+        device=device,
+    )
+    for k in model.noise_scheduler.timesteps:
+        timesteps = torch.full(
+            (batch_size,),
+            k,
+            dtype=torch.long,
+            device=device,
+        )
+        noise_pred = model.noise_pred_net(noisy_action_seq, timesteps, obs_cond)
+        noisy_action_seq = model.noise_scheduler.step(
+            model_output=noise_pred,
+            timestep=k,
+            sample=noisy_action_seq,
+        ).prev_sample
+    start = model.obs_horizon - 1
+    end = start + model.act_horizon
+    return noisy_action_seq[:, start:end]
+
+
+def _select_validation_sample_indices(dataset, points_per_demo: int) -> list[int]:
+    by_traj: dict[int, list[int]] = {}
+    for sample_idx, (traj_idx, start, _end) in enumerate(dataset.slices):
+        if start < 0:
+            continue
+        by_traj.setdefault(int(traj_idx), []).append(int(sample_idx))
+    selected = []
+    for traj_idx in sorted(by_traj):
+        candidates = by_traj[traj_idx]
+        if len(candidates) <= points_per_demo:
+            selected.extend(candidates)
+            continue
+        positions = np.linspace(0, len(candidates) - 1, num=points_per_demo)
+        selected.extend(candidates[int(round(pos))] for pos in positions)
+    return selected
+
+
 def load_demo_dataset_with_optional_done(
     path,
     keys=("observations", "actions"),
@@ -437,6 +569,7 @@ def train_no_eval(
     device: torch.device,
     compute_loss,
     after_agent_built=None,
+    validate_fn=None,
 ) -> None:
     from diffusers.optimization import get_scheduler
     from diffusers.training_utils import EMAModel
@@ -495,6 +628,19 @@ def train_no_eval(
             writer.add_scalar("losses/total_loss", last_loss, step)
             for key, value in timings.items():
                 writer.add_scalar(f"time/{key}", value, step)
+
+        valid_freq = int(getattr(args, "valid_freq", 0) or 0)
+        if validate_fn is not None and valid_freq > 0 and step % valid_freq == 0:
+            ema.copy_to(ema_agent.parameters())
+            metrics = validate_fn(ema_agent)
+            for key, value in metrics.items():
+                writer.add_scalar(key, value, step)
+            print(
+                "[validation] "
+                + ", ".join(f"{key}={value:.6g}" for key, value in metrics.items())
+                + f", step={step}"
+            )
+            agent.train()
 
         if should_save_periodic(step, args.save_start_iter, args.save_freq):
             save_checkpoint(run_name, str(step), agent, ema, ema_agent)

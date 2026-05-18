@@ -11,6 +11,7 @@ import tyro
 
 from common import (
     build_policy_env_stub,
+    build_open_loop_validator,
     infer_action_dim,
     install_maniskill_stubs,
     load_action_stats_from_h5,
@@ -18,6 +19,7 @@ from common import (
     make_obs_process_fn,
     make_run_name,
     seed_everything,
+    split_train_validation_traj_indices,
     state_schema_from_raw_obs_space,
     train_no_eval,
 )
@@ -74,6 +76,8 @@ class Args:
     sim_backend: str = "physx_cpu"
     log_freq: int = 1000
     eval_freq: int = 0
+    valid_freq: int = 0
+    num_validation_set: int = 0
     num_eval_episodes: int = 0
     num_eval_envs: int = 0
     num_eval_demos: Optional[int] = None
@@ -147,16 +151,34 @@ def main() -> None:
     )
     patch_mam_module(raw_obs_space)
     obs_process_fn = make_obs_process_fn(include_depth)
+    train_traj_indices, val_traj_indices = split_train_validation_traj_indices(
+        args.demo_path,
+        args.num_demos,
+        args.num_validation_set,
+        args.seed,
+    )
 
     dataset = mam_mod.SmallDemoDataset_MasWindowDiffusionPolicy(
         data_path=args.demo_path,
         obs_process_fn=obs_process_fn,
         obs_space=raw_obs_space,
         device=device,
-        num_traj=args.num_demos,
+        num_traj=args.num_demos if train_traj_indices is None else None,
+        traj_indices=train_traj_indices,
         state_obs_extractor=None,
     )
     dataset.debug_print_sample(0)
+    val_dataset = None
+    if val_traj_indices:
+        val_dataset = mam_mod.SmallDemoDataset_MasWindowDiffusionPolicy(
+            data_path=args.demo_path,
+            obs_process_fn=obs_process_fn,
+            obs_space=raw_obs_space,
+            device=device,
+            num_traj=None,
+            traj_indices=val_traj_indices,
+            state_obs_extractor=None,
+        )
 
     denorm_mins, denorm_maxs = load_action_stats_from_h5(
         args.action_norm_path or args.demo_path
@@ -168,6 +190,12 @@ def main() -> None:
     if dataset.state_min is not None and dataset.state_max is not None:
         agent.set_state_normalizer(dataset.state_min, dataset.state_max, device)
         ema_agent.set_state_normalizer(dataset.state_min, dataset.state_max, device)
+    validate_fn = None
+    if val_dataset is not None:
+        validate_fn = build_open_loop_validator(
+            dataset=val_dataset,
+            device=device,
+        )
 
     def compute_loss(model, batch):
         return model.compute_loss(
@@ -184,6 +212,7 @@ def main() -> None:
         ema_agent=ema_agent,
         device=device,
         compute_loss=compute_loss,
+        validate_fn=validate_fn,
     )
     env.close()
 

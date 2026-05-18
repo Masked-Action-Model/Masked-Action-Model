@@ -10,12 +10,15 @@ import tyro
 
 from common import (
     build_policy_env_stub,
+    build_open_loop_validator,
     infer_action_dim,
     install_maniskill_stubs,
+    load_demo_dataset_with_optional_done,
     load_meta,
     make_obs_process_fn,
     make_run_name,
     seed_everything,
+    split_train_validation_traj_indices,
     train_no_eval,
 )
 
@@ -46,11 +49,17 @@ class FrankaBaselineDataset(baseline_mod.SmallDemoDataset_DiffusionPolicy):
         num_traj,
         action_dim,
         action_norm_path=None,
+        traj_indices=None,
     ):
         meta = load_meta(data_path)
         actions_normalized = _meta_bool(meta, "actions_normalized", False)
         states_normalized = _meta_bool(meta, "states_normalized", False)
         if not actions_normalized:
+            if traj_indices is not None:
+                raise ValueError(
+                    "validation split for raw baseline data is not supported here; "
+                    "use preprocessed normalized Franka data."
+                )
             super().__init__(
                 data_path=data_path,
                 obs_process_fn=obs_process_fn,
@@ -79,7 +88,12 @@ class FrankaBaselineDataset(baseline_mod.SmallDemoDataset_DiffusionPolicy):
                 f"action norm dim ({self.action_min.shape[0]}) exceeds action_dim={self.action_dim}"
             )
 
-        trajectories = baseline_mod.load_demo_dataset(data_path, num_traj=num_traj, concat=False)
+        trajectories = load_demo_dataset_with_optional_done(
+            data_path,
+            num_traj=num_traj if traj_indices is None else None,
+            concat=False,
+            traj_indices=traj_indices,
+        )
         print("Preprocessed Franka trajectory loaded, beginning observation pre-processing...")
 
         obs_traj_dict_list = []
@@ -176,6 +190,8 @@ class Args:
     sim_backend: str = "physx_cpu"
     log_freq: int = 1000
     eval_freq: int = 0
+    valid_freq: int = 0
+    num_validation_set: int = 0
     num_eval_episodes: int = 0
     num_eval_envs: int = 0
     num_eval_demos: Optional[int] = None
@@ -209,6 +225,12 @@ def main() -> None:
         obs_mode=args.obs_mode,
     )
     obs_process_fn = make_obs_process_fn(include_depth)
+    train_traj_indices, val_traj_indices = split_train_validation_traj_indices(
+        args.demo_path,
+        args.num_demos,
+        args.num_validation_set,
+        args.seed,
+    )
 
     dataset = FrankaBaselineDataset(
         data_path=args.demo_path,
@@ -219,16 +241,39 @@ def main() -> None:
         obs_horizon=args.obs_horizon,
         pred_horizon=args.pred_horizon,
         device=device,
-        num_traj=args.num_demos,
+        num_traj=args.num_demos if train_traj_indices is None else None,
         action_dim=args.action_dim,
         action_norm_path=args.action_norm_path,
+        traj_indices=train_traj_indices,
     )
     dataset.debug_print_sample(0)
+    val_dataset = None
+    validate_fn = None
+    if val_traj_indices:
+        val_dataset = FrankaBaselineDataset(
+            data_path=args.demo_path,
+            obs_process_fn=obs_process_fn,
+            obs_space=raw_obs_space,
+            include_rgb=include_rgb,
+            include_depth=include_depth,
+            obs_horizon=args.obs_horizon,
+            pred_horizon=args.pred_horizon,
+            device=device,
+            num_traj=None,
+            action_dim=args.action_dim,
+            action_norm_path=args.action_norm_path,
+            traj_indices=val_traj_indices,
+        )
 
     agent = baseline_mod.Agent(env, args).to(device)
     ema_agent = baseline_mod.Agent(env, args).to(device)
     agent.set_action_denormalizer(dataset.action_min, dataset.action_max, device)
     ema_agent.set_action_denormalizer(dataset.action_min, dataset.action_max, device)
+    if val_dataset is not None:
+        validate_fn = build_open_loop_validator(
+            dataset=val_dataset,
+            device=device,
+        )
 
     def compute_loss(model, batch):
         return model.compute_loss(
@@ -244,6 +289,7 @@ def main() -> None:
         ema_agent=ema_agent,
         device=device,
         compute_loss=compute_loss,
+        validate_fn=validate_fn,
     )
     env.close()
 

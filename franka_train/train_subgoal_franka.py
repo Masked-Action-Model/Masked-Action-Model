@@ -4,22 +4,139 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Literal, Optional
 
+import numpy as np
 import torch
 import tyro
 
 from common import (
     build_policy_env_stub,
+    build_open_loop_validator,
     infer_action_dim,
     install_maniskill_stubs,
     load_action_stats_from_h5,
+    load_meta,
     make_obs_process_fn,
     make_run_name,
     seed_everything,
+    split_train_validation_traj_indices,
     train_no_eval,
 )
 
 install_maniskill_stubs()
 import train_subgoal_condition as subgoal_mod
+
+
+def _meta_bool(meta: dict, key: str, default: bool = False) -> bool:
+    if key not in meta:
+        return bool(default)
+    value = np.asarray(meta[key])
+    if value.shape == ():
+        return bool(value.item())
+    return bool(value.reshape(-1)[0])
+
+
+class FrankaSubgoalDataset(subgoal_mod.SmallDemoDataset_SubgoalCondition):
+    def __init__(
+        self,
+        data_path,
+        obs_process_fn,
+        obs_space,
+        include_rgb,
+        include_depth,
+        obs_horizon,
+        pred_horizon,
+        device,
+        num_traj,
+        mas_max_length,
+        action_dim,
+        traj_indices=None,
+    ):
+        self.action_dim = int(action_dim)
+        if self.action_dim not in (6, 7):
+            raise ValueError(f"action_dim must be 6 or 7, got {self.action_dim}")
+        self.include_rgb = include_rgb
+        self.include_depth = include_depth
+        self.mas_max_length = int(mas_max_length)
+        self.subgoal_dim = self.mas_max_length * self.action_dim
+
+        meta = load_meta(data_path)
+        states_normalized = _meta_bool(meta, "states_normalized", False)
+        trajectories = subgoal_mod.load_demo_dataset(
+            data_path,
+            keys=["observations", "actions", "mas"],
+            num_traj=num_traj,
+            concat=False,
+            traj_indices=traj_indices,
+        )
+        print("Franka subgoal trajectory loaded, beginning observation pre-processing...")
+
+        obs_traj_dict_list = []
+        for obs_traj_dict in trajectories["observations"]:
+            precomputed_state = obs_traj_dict.get("state", None)
+            obs_traj_dict = subgoal_mod.reorder_keys(obs_traj_dict, obs_space)
+            obs_traj_dict = obs_process_fn(obs_traj_dict)
+            if self.include_depth:
+                obs_traj_dict["depth"] = torch.Tensor(
+                    obs_traj_dict["depth"].astype(np.float32)
+                ).to(dtype=torch.float16)
+            if self.include_rgb:
+                obs_traj_dict["rgb"] = torch.from_numpy(obs_traj_dict["rgb"])
+            if states_normalized and precomputed_state is not None:
+                obs_traj_dict["state"] = torch.from_numpy(
+                    np.asarray(precomputed_state, dtype=np.float32)
+                ).to(dtype=torch.float32)
+            else:
+                obs_traj_dict["state"] = torch.from_numpy(obs_traj_dict["state"]).to(
+                    dtype=torch.float32
+                )
+            obs_traj_dict_list.append(obs_traj_dict)
+        trajectories["observations"] = obs_traj_dict_list
+        self.obs_keys = list(obs_traj_dict_list[0].keys())
+
+        for i, action in enumerate(trajectories["actions"]):
+            action_np = np.asarray(action, dtype=np.float32)
+            if action_np.ndim != 2 or action_np.shape[1] != self.action_dim:
+                raise ValueError(
+                    f"traj_{i} actions must have shape (T, {self.action_dim}), got {action_np.shape}"
+                )
+            trajectories["actions"][i] = torch.from_numpy(action_np).to(dtype=torch.float32)
+        trajectories["subgoal_flat"] = [
+            subgoal_mod.build_subgoal_flat(
+                mas,
+                target_len=self.mas_max_length,
+                action_dim=self.action_dim,
+            )
+            for mas in trajectories["mas"]
+        ]
+
+        print(
+            f"[state_norm] subgoal uses "
+            f"{'preprocessed normalized obs/state' if states_normalized else 'flattened raw state'}"
+        )
+        print(
+            "Obs/action/subgoal pre-processing is done, "
+            "start to pre-compute the slice indices..."
+        )
+        print("Using fixed control mode pd_ee_pose, padding with final action.")
+
+        self.obs_horizon, self.pred_horizon = obs_horizon, pred_horizon
+        self.slices = []
+        total_transitions = 0
+        for traj_idx in range(len(trajectories["actions"])):
+            length = trajectories["actions"][traj_idx].shape[0]
+            assert trajectories["observations"][traj_idx]["state"].shape[0] == length + 1
+            total_transitions += length
+            pad_before = obs_horizon - 1
+            pad_after = pred_horizon - obs_horizon
+            self.slices += [
+                (traj_idx, start, start + pred_horizon)
+                for start in range(-pad_before, length - pred_horizon + pad_after)
+            ]
+
+        print(
+            f"Total transitions: {total_transitions}, Total obs sequences: {len(self.slices)}"
+        )
+        self.trajectories = trajectories
 
 
 @dataclass
@@ -61,6 +178,8 @@ class Args:
     sim_backend: str = "physx_cpu"
     log_freq: int = 1000
     eval_freq: int = 0
+    valid_freq: int = 0
+    num_validation_set: int = 0
     num_eval_episodes: int = 0
     num_eval_envs: int = 0
     num_eval_demos: Optional[int] = None
@@ -96,8 +215,14 @@ def main() -> None:
         obs_mode=args.obs_mode,
     )
     obs_process_fn = make_obs_process_fn(include_depth)
+    train_traj_indices, val_traj_indices = split_train_validation_traj_indices(
+        args.demo_path,
+        args.num_demos,
+        args.num_validation_set,
+        args.seed,
+    )
 
-    dataset = subgoal_mod.SmallDemoDataset_SubgoalCondition(
+    dataset = FrankaSubgoalDataset(
         data_path=args.demo_path,
         obs_process_fn=obs_process_fn,
         obs_space=raw_obs_space,
@@ -106,11 +231,28 @@ def main() -> None:
         obs_horizon=args.obs_horizon,
         pred_horizon=args.pred_horizon,
         device=device,
-        num_traj=args.num_demos,
+        num_traj=args.num_demos if train_traj_indices is None else None,
         mas_max_length=mas_max_length,
         action_dim=args.action_dim,
+        traj_indices=train_traj_indices,
     )
     dataset.debug_print_sample(0)
+    val_dataset = None
+    if val_traj_indices:
+        val_dataset = FrankaSubgoalDataset(
+            data_path=args.demo_path,
+            obs_process_fn=obs_process_fn,
+            obs_space=raw_obs_space,
+            include_rgb=include_rgb,
+            include_depth=include_depth,
+            obs_horizon=args.obs_horizon,
+            pred_horizon=args.pred_horizon,
+            device=device,
+            num_traj=None,
+            mas_max_length=mas_max_length,
+            action_dim=args.action_dim,
+            traj_indices=val_traj_indices,
+        )
 
     denorm_mins, denorm_maxs = load_action_stats_from_h5(
         args.action_norm_path or args.demo_path
@@ -119,6 +261,12 @@ def main() -> None:
     ema_agent = subgoal_mod.Agent(env, args).to(device)
     agent.set_action_denormalizer(denorm_mins, denorm_maxs, device)
     ema_agent.set_action_denormalizer(denorm_mins, denorm_maxs, device)
+    validate_fn = None
+    if val_dataset is not None:
+        validate_fn = build_open_loop_validator(
+            dataset=val_dataset,
+            device=device,
+        )
 
     def compute_loss(model, batch):
         return model.compute_loss(
@@ -134,6 +282,7 @@ def main() -> None:
         ema_agent=ema_agent,
         device=device,
         compute_loss=compute_loss,
+        validate_fn=validate_fn,
     )
     env.close()
 
