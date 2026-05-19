@@ -42,7 +42,7 @@ if str(BASELINE_ROOT) not in sys.path:
 from evaluate.evaluate_subgoal_condition import evaluate
 from models.conditional_unet1d import ConditionalUnet1D
 from models.modeling_ditdp import DiTNoiseNet
-from models.plain_conv import PlainConv
+from models.vision_encoder import make_dino_data_aug, make_vision_encoder
 from utils.control_error_utils import load_source_episode_ids
 from utils.load_eval_data_utils import (
     load_traj_mask_type_slots,
@@ -138,6 +138,12 @@ class Args:
     diffusion_step_embed_dim: int = 64  # not very important
     noise_model: Literal["Transformer", "Unet"] = "Transformer"
     """denoiser backbone. Transformer uses DiTNoiseNet; Unet uses ConditionalUnet1D."""
+    vision_encoder: Literal["resnet", "dino2", "dino3"] = "resnet"
+    """visual encoder. resnet keeps the original PlainConv; dino2/dino3 use frozen DINO."""
+    dino_model_path: str = ""
+    """local DINO model directory, required when vision_encoder=dino2 or dino3."""
+    dino_data_aug: bool = False
+    """whether to use light RandomResizedCrop and ColorJitter before DINO normalization."""
     dit_hidden_dim: int = 512
     """DiT hidden dimension."""
     dit_num_blocks: int = 6
@@ -625,10 +631,19 @@ class Agent(nn.Module):
         if self.include_depth:
             total_visual_channels += env.single_observation_space["depth"].shape[-1]
 
+        self.vision_encoder = args.vision_encoder
+        if self.vision_encoder in {"dino2", "dino3"} and self.include_depth:
+            raise ValueError(f"vision_encoder='{self.vision_encoder}' only supports obs_mode='rgb'.")
+
         visual_feature_dim = 256
-        self.visual_encoder = PlainConv(
-            in_channels=total_visual_channels, out_dim=visual_feature_dim, pool_feature_map=True
+        self.visual_encoder = make_vision_encoder(
+            vision_encoder=self.vision_encoder,
+            in_channels=total_visual_channels,
+            out_dim=visual_feature_dim,
+            dino_model_path=args.dino_model_path,
         )
+        if self.vision_encoder in {"dino2", "dino3"} and args.dino_data_aug:
+            self.aug = make_dino_data_aug(self.vision_encoder)
         obs_cond_dim = visual_feature_dim + obs_state_dim + subgoal_dim
         if args.noise_model == "Transformer":
             self.noise_pred_net = DiTNoiseNet(

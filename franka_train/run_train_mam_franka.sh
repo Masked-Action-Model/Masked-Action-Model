@@ -368,6 +368,9 @@ STPM_CKPT_PATH="${STPM_CKPT_PATH:-}"
 # -----------------------------------------------------------------------------
 
 NOISE_MODEL="${NOISE_MODEL:-Unet}" # Transformer or Unet
+VISION_ENCODER="${VISION_ENCODER:-dino2}" # resnet, dino2, or dino3
+DINO_MODEL_PATH="${DINO_MODEL_PATH:-}"
+DINO_DATA_AUG="${DINO_DATA_AUG:-false}"
 DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-64}"
 DIT_HIDDEN_DIM="${DIT_HIDDEN_DIM:-512}"
 DIT_NUM_BLOCKS="${DIT_NUM_BLOCKS:-6}"
@@ -378,6 +381,30 @@ case "$NOISE_MODEL" in
   Transformer|Unet) ;;
   *)
     echo "ERROR: NOISE_MODEL must be Transformer or Unet, got: ${NOISE_MODEL}" >&2
+    exit 1
+    ;;
+esac
+case "$VISION_ENCODER" in
+  resnet|dino2|dino3) ;;
+  *)
+    echo "ERROR: VISION_ENCODER must be resnet, dino2, or dino3, got: ${VISION_ENCODER}" >&2
+    exit 1
+    ;;
+esac
+if [[ -z "$DINO_MODEL_PATH" ]]; then
+  case "$VISION_ENCODER" in
+    dino2) DINO_MODEL_PATH="${ROOT_DIR}/Dino/dinov2-small" ;;
+    dino3) DINO_MODEL_PATH="${ROOT_DIR}/Dino/dinov3-vits16plus-pretrain-lvd1689m" ;;
+  esac
+fi
+if [[ "$VISION_ENCODER" == dino* && ! -f "${DINO_MODEL_PATH}/config.json" ]]; then
+  echo "ERROR: DINO_MODEL_PATH is incomplete; missing ${DINO_MODEL_PATH}/config.json" >&2
+  exit 1
+fi
+case "$DINO_DATA_AUG" in
+  true|false) ;;
+  *)
+    echo "ERROR: DINO_DATA_AUG must be true or false, got: ${DINO_DATA_AUG}" >&2
     exit 1
     ;;
 esac
@@ -450,6 +477,8 @@ ARGS=(
   --long-window-backward-length "$LONG_WINDOW_BACKWARD_LENGTH"
   --long-window-forward-length "$LONG_WINDOW_FORWARD_LENGTH"
   --noise-model "$NOISE_MODEL"
+  --vision-encoder "$VISION_ENCODER"
+  --dino-model-path "$DINO_MODEL_PATH"
   --diffusion-step-embed-dim "$DIFFUSION_STEP_EMBED_DIM"
   --dit-hidden-dim "$DIT_HIDDEN_DIM"
   --dit-num-blocks "$DIT_NUM_BLOCKS"
@@ -495,6 +524,11 @@ if [[ "$CAPTURE_VIDEO" == "true" ]]; then
   ARGS+=(--capture-video)
 else
   ARGS+=(--no-capture-video)
+fi
+if [[ "$DINO_DATA_AUG" == "true" ]]; then
+  ARGS+=(--dino-data-aug)
+else
+  ARGS+=(--no-dino-data-aug)
 fi
 if [[ "$INPAINTING" == "true" ]]; then
   ARGS+=(--inpainting)

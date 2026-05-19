@@ -167,6 +167,9 @@ class Args:
     pred_horizon: int = 16
     diffusion_step_embed_dim: int = 64
     noise_model: Literal["Transformer", "Unet"] = "Transformer"
+    vision_encoder: Literal["resnet", "dino2", "dino3"] = "resnet"
+    dino_model_path: str = ""
+    dino_data_aug: bool = False
     dit_hidden_dim: int = 512
     dit_num_blocks: int = 6
     dit_dim_feedforward: int = 2048

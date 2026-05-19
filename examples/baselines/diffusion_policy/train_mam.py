@@ -40,7 +40,7 @@ from models.conditional_unet1d import ConditionalUnet1D
 from models.mas_conv1d import MasConv1D
 from models.mas_conv2d import MasConv
 from models.modeling_ditdp import DiTNoiseNet
-from models.plain_conv import PlainConv
+from models.vision_encoder import make_dino_data_aug, make_vision_encoder
 from utils.progress_utils import (
     augment_mask_with_progress,
     augment_mas_with_progress,
@@ -148,6 +148,12 @@ class Args:
     diffusion_step_embed_dim: int = 64  # not very important
     noise_model: Literal["Transformer", "Unet"] = "Transformer"
     """denoiser backbone. Transformer uses DiTNoiseNet; Unet uses ConditionalUnet1D."""
+    vision_encoder: Literal["resnet", "dino2", "dino3"] = "resnet"
+    """visual encoder. resnet keeps the original PlainConv; dino2/dino3 use frozen DINO."""
+    dino_model_path: str = ""
+    """local DINO model directory, required when vision_encoder=dino2 or dino3."""
+    dino_data_aug: bool = False
+    """whether to use light RandomResizedCrop and ColorJitter before DINO normalization."""
     dit_hidden_dim: int = 512
     """DiT hidden dimension, used only when noise_model=Transformer."""
     dit_num_blocks: int = 6
@@ -820,8 +826,19 @@ class Agent(nn.Module):
                 )
             total_visual_channels += env.single_observation_space["depth"].shape[-1]
 
+        self.vision_encoder = args.vision_encoder
+        if self.vision_encoder in {"dino2", "dino3"} and self.include_depth:
+            raise ValueError(f"vision_encoder='{self.vision_encoder}' only supports obs_mode='rgb'.")
+
         visual_feature_dim = 256
-        self.visual_encoder = PlainConv(in_channels=total_visual_channels, out_dim=visual_feature_dim, pool_feature_map=True)
+        self.visual_encoder = make_vision_encoder(
+            vision_encoder=self.vision_encoder,
+            in_channels=total_visual_channels,
+            out_dim=visual_feature_dim,
+            dino_model_path=args.dino_model_path,
+        )
+        if self.vision_encoder in {"dino2", "dino3"} and args.dino_data_aug:
+            self.aug = make_dino_data_aug(self.vision_encoder)
 
         mas_long_feature_dim = max(0, int(args.mas_long_conv_output_dim))
         if self.enable_long_window:
