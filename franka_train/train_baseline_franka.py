@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Literal, Optional
@@ -35,6 +36,109 @@ def _meta_bool(meta: dict, key: str, default: bool = False) -> bool:
     return bool(value.reshape(-1)[0])
 
 
+def _decode_meta_value(value):
+    value = np.asarray(value)
+    if value.shape == ():
+        value = value.item()
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if isinstance(value, np.ndarray):
+        decoded = []
+        for item in value.tolist():
+            if isinstance(item, bytes):
+                decoded.append(item.decode("utf-8"))
+            else:
+                decoded.append(str(item))
+        return decoded
+    return value
+
+
+def _load_state_schema(meta: dict) -> list[dict]:
+    if "state_schema_json" in meta:
+        raw_schema = _decode_meta_value(meta["state_schema_json"])
+        schema = json.loads(raw_schema) if isinstance(raw_schema, str) else raw_schema
+        if isinstance(schema, list):
+            return schema
+        raise ValueError("meta/state_schema_json must decode to a list")
+
+    state_paths = _decode_meta_value(meta.get("state_paths", []))
+    if isinstance(state_paths, str):
+        try:
+            parsed = json.loads(state_paths)
+            state_paths = parsed if isinstance(parsed, list) else [state_paths]
+        except json.JSONDecodeError:
+            state_paths = [state_paths]
+    if (
+        isinstance(state_paths, list)
+        and len(state_paths) > 0
+        and state_paths[-1] == "obs/extra/tcp_pose"
+        and "state_dim" in meta
+    ):
+        state_dim = int(np.asarray(meta["state_dim"]).item())
+        return [
+            {
+                "path": "obs/extra/tcp_pose",
+                "dim": 7,
+                "start": state_dim - 7,
+                "end": state_dim,
+            }
+        ]
+    raise ValueError(
+        "relative action_space requires meta/state_schema_json, or state_paths with "
+        "obs/extra/tcp_pose as the final state component"
+    )
+
+
+def _find_tcp_pose_slice(state_schema: list[dict]) -> slice:
+    for entry in state_schema:
+        if str(entry.get("path", "")) == "obs/extra/tcp_pose":
+            start = int(entry["start"])
+            end = int(entry["end"])
+            if end <= start:
+                raise ValueError(f"invalid tcp_pose state schema entry: {entry}")
+            return slice(start, end)
+    raise ValueError("state schema does not contain obs/extra/tcp_pose")
+
+
+def _denormalize_selected_dims(
+    data: np.ndarray,
+    mins: np.ndarray,
+    maxs: np.ndarray,
+) -> np.ndarray:
+    data = np.asarray(data, dtype=np.float32)
+    mins = np.asarray(mins, dtype=np.float32)
+    maxs = np.asarray(maxs, dtype=np.float32)
+    denormalized = data.copy()
+    dim = min(data.shape[-1], mins.shape[0], maxs.shape[0])
+    if dim <= 0:
+        return denormalized
+    denormalized[..., :dim] = mins[:dim] + 0.5 * (
+        data[..., :dim] + 1.0
+    ) * (maxs[:dim] - mins[:dim])
+    return denormalized.astype(np.float32)
+
+
+def _normalize_selected_dims_tensor(
+    data: torch.Tensor,
+    mins: torch.Tensor,
+    maxs: torch.Tensor,
+) -> torch.Tensor:
+    normalized = data.clone()
+    dim = min(data.shape[-1], mins.shape[0], maxs.shape[0])
+    if dim <= 0:
+        return normalized
+    mins = mins[:dim].to(device=data.device, dtype=data.dtype)
+    maxs = maxs[:dim].to(device=data.device, dtype=data.dtype)
+    denom = maxs - mins
+    values = torch.clamp(data[..., :dim], min=mins, max=maxs)
+    scaled = 2.0 * (values - mins) / torch.clamp(denom, min=1e-8) - 1.0
+    zero_dims = torch.abs(denom) < 1e-8
+    if torch.any(zero_dims):
+        scaled[..., zero_dims] = 0.0
+    normalized[..., :dim] = scaled
+    return normalized
+
+
 class FrankaBaselineDataset(baseline_mod.SmallDemoDataset_DiffusionPolicy):
     def __init__(
         self,
@@ -50,11 +154,23 @@ class FrankaBaselineDataset(baseline_mod.SmallDemoDataset_DiffusionPolicy):
         action_dim,
         action_norm_path=None,
         traj_indices=None,
+        action_space: Literal["absolute", "relative"] = "absolute",
+        relative_action_stats: tuple[np.ndarray, np.ndarray] | None = None,
     ):
+        self.action_space = str(action_space)
+        if self.action_space not in {"absolute", "relative"}:
+            raise ValueError(
+                f"action_space must be 'absolute' or 'relative', got {self.action_space!r}"
+            )
+        self.relative_action_stats = None
         meta = load_meta(data_path)
         actions_normalized = _meta_bool(meta, "actions_normalized", False)
         states_normalized = _meta_bool(meta, "states_normalized", False)
         if not actions_normalized:
+            if self.action_space != "absolute":
+                raise ValueError(
+                    "relative action_space requires preprocessed normalized Franka data"
+                )
             if traj_indices is not None:
                 raise ValueError(
                     "validation split for raw baseline data is not supported here; "
@@ -87,6 +203,24 @@ class FrankaBaselineDataset(baseline_mod.SmallDemoDataset_DiffusionPolicy):
             raise ValueError(
                 f"action norm dim ({self.action_min.shape[0]}) exceeds action_dim={self.action_dim}"
             )
+        self.absolute_action_min = self.action_min.copy()
+        self.absolute_action_max = self.action_max.copy()
+        self.relative_norm_dim = min(
+            self.action_dim,
+            self.absolute_action_min.shape[0],
+            6,
+        )
+        if self.action_space == "relative" and self.relative_norm_dim <= 0:
+            raise ValueError("relative action_space requires at least one normalized pose dim")
+        state_min = np.asarray(meta.get("state_min", []), dtype=np.float32)
+        state_max = np.asarray(meta.get("state_max", []), dtype=np.float32)
+        if self.action_space == "relative":
+            self.tcp_pose_slice = _find_tcp_pose_slice(_load_state_schema(meta))
+            if states_normalized and (state_min.size == 0 or state_max.size == 0):
+                raise ValueError(
+                    "relative action_space with normalized state requires meta/state_min "
+                    "and meta/state_max"
+                )
 
         trajectories = load_demo_dataset_with_optional_done(
             data_path,
@@ -97,10 +231,24 @@ class FrankaBaselineDataset(baseline_mod.SmallDemoDataset_DiffusionPolicy):
         print("Preprocessed Franka trajectory loaded, beginning observation pre-processing...")
 
         obs_traj_dict_list = []
+        relative_state_trajs = []
         for obs_traj_dict in trajectories["observations"]:
             precomputed_state = obs_traj_dict.get("state", None)
             obs_traj_dict = baseline_mod.reorder_keys(obs_traj_dict, obs_space)
             obs_traj_dict = obs_process_fn(obs_traj_dict)
+            processed_state = np.asarray(obs_traj_dict["state"], dtype=np.float32)
+            if self.action_space == "relative":
+                if states_normalized and precomputed_state is not None:
+                    relative_state = _denormalize_selected_dims(
+                        np.asarray(precomputed_state, dtype=np.float32),
+                        mins=state_min,
+                        maxs=state_max,
+                    )
+                else:
+                    relative_state = processed_state
+                relative_state_trajs.append(
+                    torch.from_numpy(relative_state).to(dtype=torch.float32)
+                )
             if include_depth:
                 obs_traj_dict["depth"] = torch.Tensor(
                     obs_traj_dict["depth"].astype(np.float32)
@@ -125,12 +273,25 @@ class FrankaBaselineDataset(baseline_mod.SmallDemoDataset_DiffusionPolicy):
                 raise ValueError(
                     f"traj_{traj_idx} actions must have shape (T, {self.action_dim}), got {action_np.shape}"
                 )
-            trajectories["actions"][traj_idx] = torch.from_numpy(action_np).to(dtype=torch.float32)
-        print(
-            f"[action_norm] using preprocessed normalized actions: {self.action_norm_path}"
-        )
-        print(f"[action_norm] min={self.action_min}")
-        print(f"[action_norm] max={self.action_max}")
+            if self.action_space == "relative":
+                action_np = _denormalize_selected_dims(
+                    action_np,
+                    mins=self.absolute_action_min,
+                    maxs=self.absolute_action_max,
+                )
+            trajectories["actions"][traj_idx] = torch.from_numpy(action_np).to(
+                dtype=torch.float32
+            )
+        if self.action_space == "relative":
+            print(
+                f"[action_norm] loaded absolute normalized actions from: {self.action_norm_path}"
+            )
+        else:
+            print(
+                f"[action_norm] using preprocessed normalized actions: {self.action_norm_path}"
+            )
+            print(f"[action_norm] min={self.action_min}")
+            print(f"[action_norm] max={self.action_max}")
 
         print("Obs/action pre-processing is done, start to pre-compute the slice indices...")
         print("Using fixed control mode pd_ee_pose, padding with final action.")
@@ -152,6 +313,156 @@ class FrankaBaselineDataset(baseline_mod.SmallDemoDataset_DiffusionPolicy):
             f"Total transitions: {total_transitions}, Total obs sequences: {len(self.slices)}"
         )
         self.trajectories = trajectories
+        if self.action_space == "relative":
+            self.relative_state_trajs = relative_state_trajs
+            if relative_action_stats is None:
+                self.action_min, self.action_max = self._compute_relative_action_stats()
+            else:
+                self.action_min = np.asarray(relative_action_stats[0], dtype=np.float32)
+                self.action_max = np.asarray(relative_action_stats[1], dtype=np.float32)
+            if self.action_min.shape[0] != self.relative_norm_dim:
+                raise ValueError(
+                    f"relative action_min dim ({self.action_min.shape[0]}) must match "
+                    f"relative_norm_dim={self.relative_norm_dim}"
+                )
+            self.relative_action_stats = (self.action_min.copy(), self.action_max.copy())
+            self.relative_action_min_tensor = torch.from_numpy(self.action_min).to(
+                dtype=torch.float32
+            )
+            self.relative_action_max_tensor = torch.from_numpy(self.action_max).to(
+                dtype=torch.float32
+            )
+            print(
+                "[action_space] relative: action chunk first "
+                f"{self.relative_norm_dim} dims subtract state tcp_pose dims "
+                f"{self.tcp_pose_slice.start}:{self.tcp_pose_slice.start + self.relative_norm_dim}"
+            )
+            print(f"[relative_action_norm] min={self.action_min}")
+            print(f"[relative_action_norm] max={self.action_max}")
+
+    def _slice_action_chunk(self, traj_idx: int, start: int, end: int) -> torch.Tensor:
+        actions = self.trajectories["actions"][traj_idx]
+        length = actions.shape[0]
+        act_seq = actions[max(0, start) : end]
+        if start < 0:
+            if act_seq.shape[0] >= 2:
+                delta = act_seq[1] - act_seq[0]
+            else:
+                delta = torch.zeros_like(act_seq[0])
+            pad_len = -start
+            pad_actions = [act_seq[0] - delta * k for k in range(pad_len, 0, -1)]
+            act_seq = torch.cat([torch.stack(pad_actions, dim=0), act_seq], dim=0)
+        if end > length:
+            pad_action = act_seq[-1]
+            act_seq = torch.cat([act_seq, pad_action.repeat(end - length, 1)], dim=0)
+        return act_seq
+
+    def _slice_state_sequence(self, traj_idx: int, start: int) -> torch.Tensor:
+        state = self.relative_state_trajs[traj_idx]
+        state_seq = state[max(0, start) : start + self.obs_horizon]
+        if start < 0:
+            if state_seq.shape[0] >= 2:
+                delta = state_seq[1] - state_seq[0]
+            else:
+                delta = torch.zeros_like(state_seq[0])
+            pad_len = -start
+            pad_states = [state_seq[0] - delta * n for n in range(pad_len, 0, -1)]
+            state_seq = torch.cat([torch.stack(pad_states, dim=0), state_seq], dim=0)
+        if state_seq.shape[0] != self.obs_horizon:
+            raise ValueError(
+                f"state sequence length mismatch: got {state_seq.shape[0]}, "
+                f"expected {self.obs_horizon}"
+            )
+        return state_seq
+
+    def _to_relative_action_chunk(
+        self,
+        traj_idx: int,
+        start: int,
+        absolute_action_chunk: torch.Tensor,
+        normalize: bool,
+    ) -> torch.Tensor:
+        tcp_pose = self._slice_state_sequence(traj_idx, start)[0, self.tcp_pose_slice]
+        if tcp_pose.shape[0] < self.relative_norm_dim:
+            raise ValueError(
+                f"tcp_pose dim ({tcp_pose.shape[0]}) is smaller than "
+                f"relative_norm_dim={self.relative_norm_dim}"
+            )
+        relative = absolute_action_chunk.clone()
+        relative[..., : self.relative_norm_dim] = (
+            relative[..., : self.relative_norm_dim]
+            - tcp_pose[: self.relative_norm_dim].to(dtype=relative.dtype)
+        )
+        if not normalize:
+            return relative
+        return _normalize_selected_dims_tensor(
+            relative,
+            mins=self.relative_action_min_tensor,
+            maxs=self.relative_action_max_tensor,
+        )
+
+    def _compute_relative_action_stats(self) -> tuple[np.ndarray, np.ndarray]:
+        mins = None
+        maxs = None
+        for traj_idx, start, end in self.slices:
+            absolute_chunk = self._slice_action_chunk(traj_idx, start, end)
+            relative_chunk = self._to_relative_action_chunk(
+                traj_idx,
+                start,
+                absolute_chunk,
+                normalize=False,
+            )
+            values = relative_chunk[:, : self.relative_norm_dim].numpy()
+            chunk_min = values.min(axis=0)
+            chunk_max = values.max(axis=0)
+            mins = chunk_min if mins is None else np.minimum(mins, chunk_min)
+            maxs = chunk_max if maxs is None else np.maximum(maxs, chunk_max)
+        if mins is None or maxs is None:
+            raise ValueError("cannot compute relative action stats from empty dataset")
+        return mins.astype(np.float32), maxs.astype(np.float32)
+
+    def __getitem__(self, index):
+        traj_idx, start, end = self.slices[index]
+
+        obs_traj = self.trajectories["observations"][traj_idx]
+        obs_seq = {}
+        for key, value in obs_traj.items():
+            obs_seq[key] = value[max(0, start) : start + self.obs_horizon]
+            if start < 0:
+                pad_len = -start
+                if key == "state":
+                    if obs_seq[key].shape[0] >= 2:
+                        delta = obs_seq[key][1] - obs_seq[key][0]
+                    else:
+                        delta = torch.zeros_like(obs_seq[key][0])
+                    pad_obs = [
+                        obs_seq[key][0] - delta * n for n in range(pad_len, 0, -1)
+                    ]
+                    obs_seq[key] = torch.cat(
+                        (torch.stack(pad_obs, dim=0), obs_seq[key]),
+                        dim=0,
+                    )
+                else:
+                    pad_obs_seq = torch.stack([obs_seq[key][0]] * pad_len, dim=0)
+                    obs_seq[key] = torch.cat((pad_obs_seq, obs_seq[key]), dim=0)
+
+        act_seq = self._slice_action_chunk(traj_idx, start, end)
+        if self.action_space == "relative":
+            act_seq = self._to_relative_action_chunk(
+                traj_idx,
+                start,
+                act_seq,
+                normalize=True,
+            )
+
+        assert (
+            obs_seq["state"].shape[0] == self.obs_horizon
+            and act_seq.shape[0] == self.pred_horizon
+        )
+        return {
+            "observations": obs_seq,
+            "actions": act_seq,
+        }
 
 
 @dataclass
@@ -170,6 +481,7 @@ class Args:
     num_demos: Optional[int] = None
     action_dim: Optional[int] = 7
     action_norm_path: Optional[str] = None
+    action_space: Literal["absolute", "relative"] = "absolute"
 
     total_iters: int = 100_000
     batch_size: int = 256
@@ -248,6 +560,7 @@ def main() -> None:
         action_dim=args.action_dim,
         action_norm_path=args.action_norm_path,
         traj_indices=train_traj_indices,
+        action_space=args.action_space,
     )
     dataset.debug_print_sample(0)
     val_dataset = None
@@ -266,6 +579,8 @@ def main() -> None:
             action_dim=args.action_dim,
             action_norm_path=args.action_norm_path,
             traj_indices=val_traj_indices,
+            action_space=args.action_space,
+            relative_action_stats=dataset.relative_action_stats,
         )
 
     agent = baseline_mod.Agent(env, args).to(device)

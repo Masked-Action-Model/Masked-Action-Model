@@ -41,6 +41,7 @@ NUM_DEMOS="${NUM_DEMOS:-}"
 # 3. Environment/action schema
 ENV_ID="${ENV_ID:-FrankaReal-v1}"
 ACTION_DIM="${ACTION_DIM:-${action_dim:-auto}}"
+ACTION_SPACE="${ACTION_SPACE:-${action_space:-absolute}}"
 CONTROL_MODE="${CONTROL_MODE:-pd_ee_pose}"
 OBS_MODE="${OBS_MODE:-rgb}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-}"
@@ -69,6 +70,13 @@ case "$ACTION_DIM" in
   6|7) ;;
   *)
     echo "ERROR: ACTION_DIM must be 6 or 7, got: ${ACTION_DIM}" >&2
+    exit 1
+    ;;
+esac
+case "$ACTION_SPACE" in
+  absolute|relative) ;;
+  *)
+    echo "ERROR: ACTION_SPACE must be absolute or relative, got: ${ACTION_SPACE}" >&2
     exit 1
     ;;
 esac
@@ -170,8 +178,12 @@ DEMO_TYPE="${DEMO_TYPE:-franka_real_baseline}"
 
 # 6. Logging/checkpointing. Eval args are accepted for script parity but no online eval runs.
 LOG_FREQ="${LOG_FREQ:-1000}"
+EVAL_FREQ="${EVAL_FREQ:-0}"
 VALID_FREQ="${VALID_FREQ:-5000}"
 NUM_VALIDATION_SET="${NUM_VALIDATION_SET:-10}"
+NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-0}"
+NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-0}"
+NUM_EVAL_DEMOS="${NUM_EVAL_DEMOS:-}"
 SAVE_START_ITER="${SAVE_START_ITER:-0}"
 SAVE_FREQ="${SAVE_FREQ:-5000}"
 
@@ -181,6 +193,7 @@ ARGS=(
   --wandb-project-name "$WANDB_PROJECT_NAME"
   --env-id "$ENV_ID"
   --action-dim "$ACTION_DIM"
+  --action-space "$ACTION_SPACE"
   --demo-path "$DEMO_PATH"
   --noise-model "$NOISE_MODEL"
   --vision-encoder "$VISION_ENCODER"
